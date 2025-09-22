@@ -1,6 +1,7 @@
-# extract_stage_turbo.py
+# extract_q5_stage_standalone.py
 from __future__ import annotations
-import argparse, re, sqlite3, time, zlib, pickle, os
+
+import argparse, os, re, sqlite3, time, zlib, pickle
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any
@@ -9,14 +10,18 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import pandas as pd
 from openpyxl import load_workbook
 
-# ----------------------------
-# Config (standalone)
-# ----------------------------
-CONFIG: Dict = {
+# ============================================================
+# Config (Q5 only) — easy to adapt for other questions later
+# ============================================================
+CONFIG: Dict[str, Any] = {
+    # If your files use different sheet names for data, add them here.
     "likely_data_sheet_names": [
         "Banking & DFI", "Banking & DFI ", "Insurance/Takaful", "Insurance & Takaful", "Data"
     ],
+    # These are the Cover sheet cells from the standard template
     "cover_cells": {"entity": "F6", "year": "F7", "quarter": "F8"},
+
+    # Q5 block identifiers (exact match on Column A text)
     "q5_blocks": [
         {"key": "New Hires and Recalls", "start": "New Hires and Recalls", "total": "TOTAL New Hires and Recalls"},
         {"key": "Separations", "start": "Separations = A + B + C", "total": "TOTAL Separations"},
@@ -25,17 +30,32 @@ CONFIG: Dict = {
         {"key": "Layoffs of which: VSS/MSS", "start": "B. (i) Layoffs and Discharges: of which; VSS/ MSS", "total": "TOTAL Layoffs and Discharges, of which; VSS/ MSS"},
         {"key": "Other Separations", "start": "C. Other Separations", "total": "TOTAL Other Separations"},
     ],
+    # Worker categories as laid out in the report template
     "worker_categories": [
-        "Managers","Professional","Technicians & Associate Professionals",
-        "Clerical Occupations","Operative Workers","Elementary Occupations","TOTAL",
+        "Managers",
+        "Professional",
+        "Technicians & Associate Professionals",
+        "Clerical Occupations",
+        "Operative Workers",
+        "Elementary Occupations",
+        "TOTAL",
     ],
+    # Month columns for the 3 months of a quarter in the submission template
     "month_cols": ["C", "D", "E"],
-    "entitytype_to_group": {
-        "CB": "Commercial Banks","IB": "Islamic Banks","INV": "Investment Banks",
-        "DFI": "DFI","INS": "Insurance","TO": "Takaful",
+
+    # Optional: map entity (Cover!F6 value) -> FI group; fill this with your master list
+    # If not found, we'll set group to "Unknown"
+    "entity_to_group": {
+        # "Bank A Berhad": "Commercial Banks",
+        # "Bank B Islamic": "Islamic Banks",
+        # "XYZ Investment Bank": "Investment Banks",
+        # "Development Finance Corp": "DFI",
+        # "ABC Insurance": "Insurance",
+        # "Takaful Nasional": "Takaful",
     },
 }
 
+# Month labels by quarter (for current-quarter extraction)
 MONTHS_BY_Q = {
     "Quarter 1": ["Jan", "Feb", "Mar"],
     "Quarter 2": ["Apr", "May", "Jun"],
@@ -43,27 +63,23 @@ MONTHS_BY_Q = {
     "Quarter 4": ["Oct", "Nov", "Dec"],
 }
 
-# ----------------------------
+# ------------------------------------------------------------
 # Helpers
-# ----------------------------
-_filename_entitytype_re = re.compile(r"(^|\b)LMS_([A-Z]{2,3})_", re.IGNORECASE)
-_filename_fiid_re       = re.compile(r"(^|_)LMS_[A-Z]{2,3}_(\d{2,4})", re.IGNORECASE)
+# ------------------------------------------------------------
+_filename_fiid_re = re.compile(r"(^|_)LMS_[A-Z]{2,3}_(\d{2,4})", re.IGNORECASE)
 
-def parse_entitytype_and_id(path: Path) -> Tuple[Optional[str], Optional[str]]:
-    m = _filename_entitytype_re.search(path.name)
-    et = m.group(2).upper() if m else None
-    mid = _filename_fiid_re.search(path.name)
-    fiid = mid.group(2) if mid else None
-    return et, fiid
+def parse_fiid_from_filename(path: Path) -> Optional[str]:
+    m = _filename_fiid_re.search(path.name)
+    return m.group(2) if m else None
 
 def norm(s: Optional[str]) -> str:
-    if s is None: return ""
+    if s is None: 
+        return ""
     s = str(s)
     s = s.replace("&", " and ")
     keep = "abcdefghijklmnopqrstuvwxyz0123456789:+().; "
     s2 = ''.join(ch.lower() if ch.lower() in keep else ' ' for ch in s)
-    s2 = re.sub(r"\s+", " ", s2).strip()
-    return s2
+    return re.sub(r"\s+", " ", s2).strip()
 
 @dataclass
 class CoverMeta:
@@ -73,23 +89,21 @@ class CoverMeta:
 
 @dataclass
 class Q5Row:
+    # Dimensions
     year: int
     quarter: str
     month: str
     entity_name: str
     fi_group: str
-    entitytype_token: str
     fi_id: Optional[str]
     employment_detail: str
     worker_category: str
+    # Value
     value: float
-    source_file: str
 
-# ----------------------------
-# Extractors
-# ----------------------------
 def read_cover_meta(wb) -> CoverMeta:
     entity = year = quarter = None
+    # Prefer explicit 'Cover' sheet and configured cells
     if 'Cover' in wb.sheetnames:
         ws = wb['Cover']
         try:
@@ -98,9 +112,11 @@ def read_cover_meta(wb) -> CoverMeta:
             quarter= ws[CONFIG['cover_cells']['quarter']].value
         except Exception:
             pass
+    # Fallback to first non-cover sheet cells C6:C8
     if entity in (None, "") or year in (None, "") or quarter in (None, ""):
         for s in wb.sheetnames:
-            if norm(s) == 'cover': continue
+            if norm(s) == 'cover': 
+                continue
             ws = wb[s]
             try:
                 entity  = entity  or ws['C6'].value
@@ -117,18 +133,22 @@ def read_cover_meta(wb) -> CoverMeta:
     return CoverMeta(entity_name=str(entity).strip() if entity else None, year=year, quarter_label=qlbl)
 
 def pick_data_sheet(wb) -> str:
+    # Try configured names
     for name in CONFIG['likely_data_sheet_names']:
         for s in wb.sheetnames:
             if norm(s) == norm(name):
                 return s
+    # Else first non-cover
     for s in wb.sheetnames:
-        if norm(s) != 'cover': return s
+        if norm(s) != 'cover': 
+            return s
+    # Else first sheet
     return wb.sheetnames[0]
 
 def find_row_by_text(ws, text: str) -> Optional[int]:
     target = norm(text)
     for r in range(1, ws.max_row + 1):
-        val = ws.cell(row=r, column=1).value  # col A
+        val = ws.cell(row=r, column=1).value  # col A has headings
         if norm(val) == target:
             return r
     return None
@@ -148,20 +168,26 @@ def read_number(ws, cell_addr: str) -> float:
         except Exception:
             return 0.0
 
-def extract_q5_from_sheet(ws, meta: CoverMeta, entity_name: str, entitytype_token: str, fi_id: Optional[str], src_name:str) -> List[Q5Row]:
+def extract_q5_from_sheet(ws, meta: CoverMeta, fi_id: Optional[str]) -> List[Q5Row]:
     rows: List[Q5Row] = []
-    if meta.quarter_label not in MONTHS_BY_Q: return rows
+    if meta.quarter_label not in MONTHS_BY_Q: 
+        return rows
+
     q_months = MONTHS_BY_Q[meta.quarter_label]
     mcols    = CONFIG['month_cols']
-    fi_group = CONFIG['entitytype_to_group'].get((entitytype_token or '').upper(), 'Unknown')
-
     wc_norms = [norm(x) for x in CONFIG['worker_categories'] if x != "TOTAL"]
+
+    # Use entity->group mapping; fallback Unknown
+    ent = (meta.entity_name or "").strip()
+    fi_group = CONFIG.get("entity_to_group", {}).get(ent, "Unknown")
 
     for block in CONFIG['q5_blocks']:
         start_r = find_row_by_text(ws, block['start'])
         total_r = find_row_by_text(ws, block['total'])
         if not start_r or not total_r:
             continue
+
+        # Detail rows between start and total
         r = start_r + 1
         while r < total_r:
             label = ws.cell(row=r, column=1).value
@@ -173,17 +199,16 @@ def extract_q5_from_sheet(ws, meta: CoverMeta, entity_name: str, entitytype_toke
                         year=meta.year or 0,
                         quarter=meta.quarter_label or "",
                         month=m,
-                        entity_name=entity_name,
+                        entity_name=ent,
                         fi_group=fi_group,
-                        entitytype_token=(entitytype_token or '').upper(),
                         fi_id=fi_id,
                         employment_detail=block['key'],
                         worker_category=str(label),
                         value=val,
-                        source_file=src_name,
                     ))
             r += 1
-        # TOTAL row
+
+        # TOTAL row captured as its own worker_category
         for i, m in enumerate(q_months):
             cell_addr = f"{mcols[i]}{total_r}"
             val = read_number(ws, cell_addr)
@@ -191,14 +216,12 @@ def extract_q5_from_sheet(ws, meta: CoverMeta, entity_name: str, entitytype_toke
                 year=meta.year or 0,
                 quarter=meta.quarter_label or "",
                 month=m,
-                entity_name=entity_name,
+                entity_name=ent,
                 fi_group=fi_group,
-                entitytype_token=(entitytype_token or '').upper(),
                 fi_id=fi_id,
                 employment_detail=block['key'],
                 worker_category='TOTAL',
                 value=val,
-                source_file=src_name,
             ))
     return rows
 
@@ -209,30 +232,29 @@ def extract_from_file(path: Path, verbose=False) -> List[dict]:
         if verbose:
             print(f"[ERROR] Cannot open {path.name}: {e}")
         return []
-    meta = read_cover_meta(wb)
-    if not meta.entity_name or not meta.quarter_label or not meta.year:
-        if verbose:
-            print(f"[WARN] Missing cover meta in {path.name}; skipping.")
+    try:
+        meta = read_cover_meta(wb)
+        if not meta.entity_name or not meta.quarter_label or not meta.year:
+            if verbose:
+                print(f"[WARN] Missing cover meta in {path.name}; skipping.")
+            return []
+        ws_name = pick_data_sheet(wb)
+        ws = wb[ws_name]
+        fi_id = parse_fiid_from_filename(path)  # optional; keep if useful
+        rows = extract_q5_from_sheet(ws, meta, fi_id)
+        return [r.__dict__ for r in rows]
+    finally:
         try:
             wb.close()
         except Exception:
             pass
-        return []
-    ws = wb[pick_data_sheet(wb)]
-    entitytype_token, fi_id = parse_entitytype_and_id(path)
-    rows = extract_q5_from_sheet(ws, meta, meta.entity_name, entitytype_token, fi_id, path.name)
-    try:
-        wb.close()
-    except Exception:
-        pass
-    return [r.__dict__ for r in rows]
 
-# ----------------------------
-# File listing & de-dup
-# ----------------------------
+# ------------------------------------------------------------
+# File listing & de-dup by (FI_ID, Year, Quarter)
+# ------------------------------------------------------------
 def list_excel_files(root: Path, limit: Optional[int]=None) -> List[Path]:
     files: List[Path] = []
-    for ext in ("*.xlsm","*.xlsx"):
+    for ext in ("*.xlsm", "*.xlsx"):
         files.extend([p for p in root.rglob(ext) if not p.name.startswith("~$")])
     files.sort()
     if limit:
@@ -243,19 +265,22 @@ def read_cover_year_quarter(path: Path) -> Tuple[Optional[int], Optional[str]]:
     try:
         wb = load_workbook(str(path), data_only=True, read_only=True)
         meta = read_cover_meta(wb)
-        try: wb.close()
-        except Exception: pass
+        try:
+            wb.close()
+        except Exception:
+            pass
         return meta.year, meta.quarter_label
     except Exception:
         return None, None
 
 def dedup_latest_by_fi_yq(files: List[Path]) -> List[Path]:
     """
-    Keep latest (by mtime) per (FI_ID, Year, Quarter). If FI_ID missing, use filename as key.
+    Keep latest (by mtime) per (FI_ID, Year, Quarter).
+    If FI_ID missing, use filename as key.
     """
     latest: Dict[Tuple[str, Optional[int], Optional[str]], Tuple[float, Path]] = {}
     for p in files:
-        _, fi_id = parse_entitytype_and_id(p)
+        fi_id = parse_fiid_from_filename(p)
         year, qlbl = read_cover_year_quarter(p)
         key_fi = fi_id or p.name
         key = (key_fi, year, qlbl)
@@ -270,9 +295,9 @@ def dedup_latest_by_fi_yq(files: List[Path]) -> List[Path]:
     out.sort()
     return out
 
-# ----------------------------
-# Incremental cache (SQLite)
-# ----------------------------
+# ------------------------------------------------------------
+# SQLite cache (incremental)
+# ------------------------------------------------------------
 def cache_connect(cache_path: Path) -> sqlite3.Connection:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(cache_path))
@@ -311,9 +336,9 @@ def cache_put(conn: sqlite3.Connection, file_path: Path, rows: List[dict]) -> No
     except Exception:
         pass
 
-# ----------------------------
-# Parallel worker wrapper
-# ----------------------------
+# ------------------------------------------------------------
+# Parallel worker
+# ------------------------------------------------------------
 def _worker_extract(path_str: str, verbose: bool) -> Tuple[str, Optional[List[dict]], Optional[str]]:
     p = Path(path_str)
     try:
@@ -322,17 +347,17 @@ def _worker_extract(path_str: str, verbose: bool) -> Tuple[str, Optional[List[di
     except Exception as e:
         return (path_str, None, str(e))
 
-# ----------------------------
-# MAIN
-# ----------------------------
+# ------------------------------------------------------------
+# MAIN (CLI)
+# ------------------------------------------------------------
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Turbo extract RLMS Q5 → staging (fast, cached, parallel)")
-    ap.add_argument("--inputs", type=str, required=True, help="Folder with submissions")
+    ap = argparse.ArgumentParser(description="Extract RLMS Q5 into staging (fast, parallel, cached).")
+    ap.add_argument("--inputs", type=str, required=True, help="Folder containing submissions (scan recursively)")
     ap.add_argument("--out-xlsx", type=str, default=None, help="Output staging workbook (.xlsx)")
     ap.add_argument("--out-parquet", type=str, default=None, help="Optional Parquet cache (.parquet)")
     ap.add_argument("--limit", type=int, default=None, help="Limit number of files (debug)")
-    ap.add_argument("--workers", type=int, default=0, help="Processes (0=cpu_count())")
-    ap.add_argument("--cache", type=str, default=None, help="SQLite cache file (e.g., D:/RLMS/staging/extract_cache.sqlite)")
+    ap.add_argument("--workers", type=int, default=0, help="Processes (0 = use os.cpu_count())")
+    ap.add_argument("--cache", type=str, default=None, help="SQLite cache path (e.g., D:/RLMS/staging/extract_cache.sqlite)")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -345,50 +370,50 @@ def main() -> int:
     files = list_excel_files(root, args.limit)
     print(f"[INFO] Found {len(files)} files under {root}")
 
-    # De-dup latest per FI/Year/Quarter (reduces work if multiple resubmissions)
+    # Keep only latest per FI/Year/Quarter
     files = dedup_latest_by_fi_yq(files)
-    print(f"[INFO] After de-dup by FI/Year/Quarter: {len(files)} files")
+    print(f"[INFO] After de-dup by FI/Year/Quarter: {len(files)} file(s)")
 
-    # Open cache
+    # Cache
     conn = cache_connect(Path(args.cache)) if args.cache else None
 
-    # Split into cached vs to_process
     cached_rows: List[dict] = []
     to_process: List[Path] = []
     if conn:
         for p in files:
-            rows = cache_get(conn, p)
-            if rows is not None:
-                cached_rows.extend(rows)
+            rs = cache_get(conn, p)
+            if rs is not None:
+                cached_rows.extend(rs)
             else:
                 to_process.append(p)
-        print(f"[CACHE] Hit: {len(files)-len(to_process)}  |  Miss: {len(to_process)}")
+        print(f"[CACHE] Hit={len(files)-len(to_process)}  Miss={len(to_process)}")
     else:
         to_process = files
 
-    # Parallel extract
+    # Parallel extraction
     all_rows: List[dict] = []
     if cached_rows:
         all_rows.extend(cached_rows)
 
     if to_process:
         workers = None if args.workers in (0, None) else args.workers
-        print(f"[RUN] Extracting {len(to_process)} files with workers={workers or os.cpu_count()}")
+        if workers is None or workers <= 0:
+            workers = os.cpu_count() or 4
+        print(f"[RUN] Extracting {len(to_process)} file(s) with workers={workers}")
         with ProcessPoolExecutor(max_workers=workers) as ex:
             futs = {ex.submit(_worker_extract, str(p), args.verbose): p for p in to_process}
             for i, fut in enumerate(as_completed(futs), 1):
                 path_str, rows, err = fut.result()
                 if err:
                     print(f"[WARN] {Path(path_str).name} failed: {err}")
-                    continue
-                if rows:
-                    all_rows.extend(rows)
-                    if conn:
-                        cache_put(conn, Path(path_str), rows)
-                if args.verbose and i % 25 == 0:
+                else:
+                    if rows:
+                        all_rows.extend(rows)
+                        if conn:
+                            cache_put(conn, Path(path_str), rows)
+                if args.verbose and (i % 25 == 0):
                     print(f"  progress: {i}/{len(to_process)}")
 
-    # Close cache
     if conn:
         conn.commit()
         conn.close()
@@ -398,15 +423,26 @@ def main() -> int:
         return 1
 
     df = pd.DataFrame(all_rows)
-    sort_cols = [c for c in ["year","quarter","entity_name","fi_group","employment_detail","worker_category","month"] if c in df.columns]
-    if sort_cols:
-        df = df.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
 
+    # Column order for staging
+    cols = [
+        "year","quarter","month","entity_name","fi_group","fi_id",
+        "employment_detail","worker_category","value"
+    ]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = ""
+    df = df[cols].sort_values(
+        ["year","quarter","entity_name","fi_group","employment_detail","worker_category","month"],
+        kind="mergesort"
+    ).reset_index(drop=True)
+
+    # Write outputs
     if args.out_xlsx:
         out_x = Path(args.out_xlsx)
         out_x.parent.mkdir(parents=True, exist_ok=True)
         with pd.ExcelWriter(out_x, engine="openpyxl") as xw:
-            df.to_excel(xw, index=False, sheet_name="staging")
+            df.to_excel(xw, sheet_name="staging", index=False)
         print(f"[DONE] Staging workbook: {out_x}  (rows={len(df):,})")
 
     if args.out_parquet:
@@ -420,3 +456,13 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
+python extract_q5_stage_standalone.py ^
+  --inputs "C:\Users\you\OneDrive - Bank Negara Malaysia\RLMS\Submission\2026" ^
+  --out-xlsx "C:\Users\you\OneDrive - Bank Negara Malaysia\RLMS\staging\q5_stage_2026.xlsx" ^
+  --out-parquet "C:\Users\you\OneDrive - Bank Negara Malaysia\RLMS\staging\q5_stage_2026.parquet" ^
+  --cache "C:\Users\you\OneDrive - Bank Negara Malaysia\RLMS\staging\extract_cache.sqlite" ^
+  --workers 8
+
