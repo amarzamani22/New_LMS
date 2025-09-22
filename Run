@@ -1,0 +1,7 @@
+python extract_stage_turbo.py ^
+  --inputs "D:\RLMS\Submission\2026" ^
+  --out-xlsx "D:\RLMS\staging\staging_2026.xlsx" ^
+  --out-parquet "D:\RLMS\staging\staging_2026.parquet" ^
+  --cache "D:\RLMS\staging\extract_cache.sqlite" ^
+  --workers 8 ^
+  --verbose
