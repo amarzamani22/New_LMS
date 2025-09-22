@@ -1,0 +1,71 @@
+from pathlib import Path
+import pandas as pd
+from openpyxl import Workbook
+from datetime import datetime
+
+from extractors import extract_from_file   # reuse your existing extractor
+from aggregations import months_up_to_quarter, pivot_for_qc, build_rollups
+
+def main(inputs: str, out: str = None):
+    in_root = Path(inputs)
+    files = list(in_root.rglob("*.xlsx"))
+    all_rows = []
+
+    # 1) Extract raw rows
+    for p in files:
+        rows = extract_from_file(p, verbose=False)
+        if rows:
+            all_rows.extend(r.__dict__ for r in rows)
+
+    if not all_rows:
+        print("No rows extracted.")
+        return
+
+    df = pd.DataFrame(all_rows)
+
+    # 2) Determine current year/quarter
+    year = int(df["year"].mode().iat[0])
+    q_order = ["Quarter 1", "Quarter 2", "Quarter 3", "Quarter 4"]
+    df["q_index"] = df["quarter"].map({q: i for i, q in enumerate(q_order)})
+    current_q = df.loc[df["q_index"].idxmax(), "quarter"]
+
+    # 3) Pivot into QC shape (like your current QC but no styling)
+    big = build_rollups(df)
+    qc_df = pivot_for_qc(big, current_q=current_q, year=year)
+
+    # 4) Save to Excel (very plain, just values)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "QC_Data"
+
+    # Write headers
+    ws.append(qc_df.columns.tolist())
+
+    # Write rows
+    for row in qc_df.itertuples(index=False, name=None):
+        ws.append(row)
+
+    # About sheet
+    about = wb.create_sheet("About")
+    about["A1"] = "RLMS Q5 – Labour Turnover STAGING"
+    about["A2"] = "Year"; about["B2"] = year
+    about["A3"] = "Up to Quarter"; about["B3"] = current_q
+    about["A5"] = f"Extracted at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+
+    # Output path
+    if out:
+        out_path = Path(out)
+    else:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = in_root / f"QC_Stage_{year}_up_to_{current_q.replace(' ','')}_{ts}.xlsx"
+
+    wb.save(out_path)
+    print(f"[DONE] Staging workbook written: {out_path}")
+
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--inputs", required=True, help="Folder of raw submissions")
+    ap.add_argument("--out", default=None, help="Optional path for output workbook")
+    args = ap.parse_args()
+    main(args.inputs, args.out)
