@@ -1,7 +1,342 @@
-python extract_stage_turbo.py ^
-  --inputs "D:\RLMS\Submission\2026" ^
-  --out-xlsx "D:\RLMS\staging\staging_2026.xlsx" ^
-  --out-parquet "D:\RLMS\staging\staging_2026.parquet" ^
-  --cache "D:\RLMS\staging\extract_cache.sqlite" ^
-  --workers 8 ^
-  --verbose
+from __future__ import annotations
+
+import argparse
+import re
+import time
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import pandas as pd
+
+# ---- You need openpyxl installed (pip install openpyxl) ----
+from openpyxl import load_workbook
+
+
+# ========================== Config ==========================
+
+# Sheet names (or patterns) to search for each Question block.
+# If your workbook uses slightly different names, add them here.
+QUESTION_SHEETS: Dict[str, Sequence[str]] = {
+    "Q1": ("Q1", "Q1_", "Question 1", "Q1 Data"),
+    "Q2": ("Q2", "Q2_", "Question 2", "Q2 Data"),
+    "Q3": ("Q3", "Q3_", "Question 3", "Q3 Data"),
+    "Q4": ("Q4", "Q4_", "Question 4", "Q4 Data"),
+    "Q5": ("Q5", "Q5_", "Question 5", "Q5 Data"),
+}
+
+# Required “dimension” headers we expect in each question table.
+# If your labels differ slightly, add aliases in HEADER_ALIASES.
+DIM_HEADERS = [
+    "entity", "employment detail", "worker category", "institution"
+]
+
+HEADER_ALIASES = {
+    "entity / group": "entity",
+    "entity": "entity",
+    "entity/group": "entity",
+    "employment": "employment detail",
+    "employment detail": "employment detail",
+    "worker category": "worker category",
+    "institution": "institution",
+}
+
+# Month & quarter labels we will capture if present
+MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+QUARTERS = ["Q1","Q2","Q3","Q4"]
+
+# Extra columns to attempt if they exist (e.g., totals by month type)
+OPTIONAL_VALUE_COLS = []  # keep empty; add names if your files have stable extra value cols
+
+
+# ======================== Data Models =======================
+
+@dataclass
+class CoverMeta:
+    year: Optional[int]
+    quarter_label: Optional[str]  # "Quarter 1".."Quarter 4" (if available)
+    reporting_entity: Optional[str] = None
+
+
+@dataclass
+class StagedRow:
+    file_name: str
+    question: str
+    entity_group: str
+    employment_detail: str
+    worker_category: str
+    institution: str
+    # Values (months/quarters; missing ones become 0)
+    Jan: float = 0.0; Feb: float = 0.0; Mar: float = 0.0
+    Apr: float = 0.0; May: float = 0.0; Jun: float = 0.0
+    Jul: float = 0.0; Aug: float = 0.0; Sep: float = 0.0
+    Oct: float = 0.0; Nov: float = 0.0; Dec: float = 0.0
+    Q1: float = 0.0; Q2: float = 0.0; Q3: float = 0.0; Q4: float = 0.0
+    year: Optional[int] = None
+    quarter: Optional[str] = None  # "Quarter 1".."Quarter 4"
+
+
+# ====================== Helper Functions ====================
+
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+def _map_header(name: str) -> str:
+    k = _norm(name)
+    return HEADER_ALIASES.get(k, name)
+
+def _looks_like_question(target: str, sheet_name: str) -> bool:
+    s = sheet_name.strip().lower()
+    for pat in QUESTION_SHEETS.get(target, ()):
+        if pat.lower() in s:
+            return True
+    return False
+
+def _is_temp_or_hidden(name: str) -> bool:
+    return name.startswith("~$") or name.lower().endswith(".tmp")
+
+def _find_cover_sheet(wb) -> Optional[str]:
+    # Prefer obvious cover names
+    for nm in wb.sheetnames:
+        if _norm(nm) in ("cover", "metadata", "meta", "front", "summary"):
+            return nm
+    # else fallback to first sheet
+    return wb.sheetnames[0] if wb.sheetnames else None
+
+def _read_cover_meta(wb) -> CoverMeta:
+    """Best-effort cover meta. Customize as needed."""
+    try:
+        cover = _find_cover_sheet(wb)
+        if not cover:
+            return CoverMeta(None, None, None)
+        ws = wb[cover]
+
+        # naive scan of top-left cells to find strings like "Year", "Quarter"
+        year = None
+        quarter_label = None
+        entity_name = None
+
+        for r in ws.iter_rows(min_row=1, max_row=30, min_col=1, max_col=6, values_only=True):
+            for c in r:
+                if isinstance(c, str):
+                    n = _norm(c)
+                    if "year" == n or n.startswith("year"):
+                        # take the right cell if numeric in same row
+                        # (assumes label in col A and value in B; adjust if needed)
+                        pass
+        # Specific fallbacks:
+        # Try common cells (adjust if your template uses exact cells)
+        try:
+            txt_year = ws["B2"].value if "B2" in ws else None
+            y = int(txt_year) if txt_year is not None and str(txt_year).strip().isdigit() else None
+            year = year or y
+        except Exception:
+            pass
+
+        try:
+            quarter_label = quarter_label or (ws["B3"].value if "B3" in ws else None)
+        except Exception:
+            pass
+
+        try:
+            entity_name = entity_name or (ws["B1"].value if "B1" in ws else None)
+        except Exception:
+            pass
+
+        return CoverMeta(year, quarter_label, entity_name)
+    except Exception:
+        return CoverMeta(None, None, None)
+
+
+def _first_header_row(df: pd.DataFrame) -> Optional[int]:
+    """
+    Find a row index in df that contains our 4 dimension columns (loosely matched).
+    """
+    for i, row in df.iterrows():
+        labels = [_map_header(str(x)) for x in row.tolist()]
+        hits = sum(1 for h in DIM_HEADERS if any(h == _norm(lbl) for lbl in labels))
+        if hits >= 3:  # tolerate one missing/alias
+            return i
+    return None
+
+
+def _extract_table_from_sheet(
+    book_path: Path,
+    sheet_name: str,
+    question_label: str,
+    meta: CoverMeta,
+) -> List[StagedRow]:
+    """
+    Read a worksheet into a DataFrame, find the header row that matches our dimension columns,
+    then extract all rows below it.
+    """
+    try:
+        # Read a generous block (pandas is much faster than cell-by-cell)
+        df = pd.read_excel(
+            book_path, sheet_name=sheet_name, header=None, engine="openpyxl"
+        )
+    except Exception:
+        return []
+
+    hdr_row = _first_header_row(df)
+    if hdr_row is None:
+        return []
+
+    # Build header names
+    headers = [str(x) for x in df.iloc[hdr_row].tolist()]
+    headers = [_map_header(h) for h in headers]
+    data = df.iloc[hdr_row + 1:].copy()
+    data.columns = headers
+
+    # Keep only columns we know/use
+    keep_cols = [
+        "entity", "employment detail", "worker category", "institution",
+        *MONTHS, *QUARTERS, *OPTIONAL_VALUE_COLS,
+    ]
+    # Filter to existing ones
+    existing = [c for c in keep_cols if c in data.columns]
+
+    if not {"entity", "employment detail", "worker category", "institution"}.issubset(set(existing)):
+        # header didn’t match enough—skip
+        return []
+
+    # Coerce numeric data
+    for col in MONTHS + QUARTERS + OPTIONAL_VALUE_COLS:
+        if col in data.columns:
+            data[col] = pd.to_numeric(data[col], errors="coerce").fillna(0)
+
+    rows: List[StagedRow] = []
+    for _, r in data.iterrows():
+        if pd.isna(r.get("entity", None)):
+            # assume end-of-table or blank row
+            continue
+
+        row = StagedRow(
+            file_name=book_path.name,
+            question=question_label,
+            entity_group=str(r.get("entity", "")).strip(),
+            employment_detail=str(r.get("employment detail", "")).strip(),
+            worker_category=str(r.get("worker category", "")).strip(),
+            institution=str(r.get("institution", "")).strip(),
+            year=meta.year,
+            quarter=meta.quarter_label,
+        )
+        # fill values
+        for m in MONTHS:
+            if m in data.columns:
+                setattr(row, m, float(r.get(m, 0) or 0))
+        for q in QUARTERS:
+            if q in data.columns:
+                setattr(row, q, float(r.get(q, 0) or 0))
+
+        rows.append(row)
+
+    return rows
+
+
+def _extract_from_file_all(path: Path, verbose: bool = False) -> List[StagedRow]:
+    if _is_temp_or_hidden(path.name):
+        return []
+    try:
+        wb = load_workbook(str(path), data_only=True, read_only=True)
+    except Exception:
+        return []
+
+    try:
+        meta = _read_cover_meta(wb)
+        out: List[StagedRow] = []
+
+        # For each question, find matching sheet names and extract.
+        for q_label, patterns in QUESTION_SHEETS.items():
+            # Gather sheets that look like this question
+            candidate_sheets = [s for s in wb.sheetnames if any(pat.lower() in s.lower() for pat in patterns)]
+            if not candidate_sheets:
+                continue
+
+            # Avoid “Cover/About” etc.
+            candidate_sheets = [s for s in candidate_sheets if _norm(s) not in ("cover","about","metadata","meta")]
+
+            for s in candidate_sheets:
+                if verbose:
+                    print(f"    [{path.name}] {q_label} <- {s}")
+                out.extend(_extract_table_from_sheet(path, s, q_label, meta))
+
+        return out
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+
+def _collect_excel_files(root: Path, limit: Optional[int] = None) -> List[Path]:
+    files: List[Path] = []
+    for ext in ("*.xlsx", "*.xlsm"):
+        files.extend([p for p in root.rglob(ext) if not p.name.startswith("~$")])
+    files.sort()
+    if limit:
+        files = files[:limit]
+    return files
+
+
+# ============================ CLI ===========================
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Extract Q1–Q5 raw rows from RLMS submissions into one staging workbook (no calculations)."
+    )
+    ap.add_argument("--inputs", required=True, help="Folder to scan recursively for submissions")
+    ap.add_argument("--out", default=None, help="Output Excel path (.xlsx). If omitted, writes to <inputs>/stage_all_questions_<ts>.xlsx")
+    ap.add_argument("--limit", type=int, default=None, help="Limit number of files (debug)")
+    ap.add_argument("--verbose", action="store_true", help="Verbose logs")
+    args = ap.parse_args()
+
+    in_root = Path(args.inputs)
+    if not in_root.exists():
+        print(f"[ERROR] Inputs folder not found: {in_root}")
+        return 2
+
+    t0 = time.perf_counter()
+    files = _collect_excel_files(in_root, limit=args.limit)
+    if args.verbose:
+        print(f"[INFO] Files to scan: {len(files)}")
+
+    all_rows: List[StagedRow] = []
+    for i, p in enumerate(files, start=1):
+        if args.verbose:
+            print(f"[{i}/{len(files)}] {p.name}")
+        try:
+            rs = _extract_from_file_all(p, verbose=args.verbose)
+            if rs:
+                all_rows.extend(rs)
+        except Exception as e:
+            if args.verbose:
+                print(f"  [WARN] {p.name}: {e}")
+
+    if not all_rows:
+        print("[WARN] No rows extracted.")
+        return 1
+
+    # Build DataFrame (consistent column order)
+    cols = [
+        "file_name","question",
+        "entity_group","employment_detail","worker_category","institution",
+        *MONTHS, *QUARTERS,
+        "year","quarter",
+    ]
+    df = pd.DataFrame([asdict(r) for r in all_rows], columns=cols)
+
+    # Output
+    out_path = Path(args.out) if args.out else (in_root / f"stage_all_questions_{time.strftime('%Y%m%d_%H%M%S')}.xlsx")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
+        df.to_excel(xw, sheet_name="Stage", index=False)
+
+    t1 = time.perf_counter()
+    print(f"[DONE] Wrote {len(df):,} staging rows to: {out_path}")
+    print(f"[TIMER] Total: {t1 - t0:0.2f}s")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
