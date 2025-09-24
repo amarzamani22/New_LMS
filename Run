@@ -1,86 +1,88 @@
-# ---------------- YoY %Diff (vs same quarter last year) — INDEX/MATCH (no XLOOKUP/LET) ----------------
+# ---------------- YoY block with PRIOR values + YoY% (INDEX/MATCH; no XLOOKUP/LET) ----------------
 if prior_qc_df is not None and not prior_qc_df.empty:
-    # 1) Hidden prior-year sheet for lookups by a stable KEY
+    # 1) Hidden prior-year sheet
     prior_sheet = "_PRIOR_YOY"
     if prior_sheet in wb.sheetnames:
         del wb[prior_sheet]
     ws_prior = wb.create_sheet(title=prior_sheet)
 
-    # quarters available in the prior pivot
+    # Which quarters exist in the prior pivot?
     prior_q_cols = [c for c in ["Q1","Q2","Q3","Q4"] if c in prior_qc_df.columns]
 
-    # header row
+    # Header row on prior sheet
     ws_prior.cell(1, 1, "KEY").font = Font(bold=True)
     prior_col_letter: Dict[str, str] = {}
     for j, qh in enumerate(prior_q_cols, start=2):
         ws_prior.cell(1, j, qh).font = Font(bold=True)
-        prior_col_letter[qh] = ws_prior.cell(1, j).column_letter  # map e.g. Q1 -> 'B'
+        prior_col_letter[qh] = ws_prior.cell(1, j).column_letter  # e.g., Q1 -> 'B'
 
-    # rows: KEY + prior Q totals
-    # KEY must match how we build it on QC sheet (A|B|C|D)
+    # Rows: KEY + prior Q totals
     for i, prow in prior_qc_df.iterrows():
         key = f"{prow['entity_group']}|{prow['employment_detail']}|{prow['worker_category']}|{prow['institution']}"
         ws_prior.cell(i + 2, 1, key)
         for j, qh in enumerate(prior_q_cols, start=2):
             ws_prior.cell(i + 2, j, prow.get(qh, 0))
 
-    # hide helper sheet
+    # Hide helper sheet
     ws_prior.sheet_state = "hidden"
 
-    # 2) Ensure a hidden KEY column on QC sheet (if not already present)
+    # 2) Ensure hidden KEY column on QC sheet
     if "_KEY" not in col_index:
-        key_col_idx = len(headers) + 1
+        key_col_idx = len(header_row) + 1
         col_index["_KEY"] = key_col_idx
-        ws.cell(header_row, key_col_idx, "_KEY").font = Font(bold=True)
+        ws.cell(start_row, key_col_idx, "_KEY").font = Font(bold=True)
         for r in range(first_data_row, last_data_row + 1):
-            # A|B|C|D as your row key
             ws.cell(r, key_col_idx).value = f'=A{r}&"|"&B{r}&"|"&C{r}&"|"&D{r}'
-        # hide the KEY column
-        ws.column_dimensions[ws.cell(header_row, key_col_idx).column_letter].hidden = True
+        ws.column_dimensions[ws.cell(start_row, key_col_idx).column_letter].hidden = True
 
-    # 3) Fill YoY formulas using INDEX/MATCH (no XLOOKUP/LET)
-    # Rules:
-    #   - If prior is blank → "N/A"
-    #   - If prior=0 & current=0 → 0
-    #   - If prior=0 & current>0 → "N/A"
-    #   - Else (curr - prior) / prior
-    A_col_letter = "A"  # column A on prior sheet holds KEY
+    # 3) Fill PRIOR and YoY columns using INDEX/MATCH
+    A_col_letter = "A"  # _PRIOR_YOY column A holds KEY
     for qh in ["Q1","Q2","Q3","Q4"]:
-        yoy_hdr = f"YoY {qh}"
-        if yoy_hdr not in col_index or qh not in col_index:
+        prior_hdr = f"Prior {qh}"
+        yoy_hdr   = f"YoY {qh}"
+
+        # Need the quarter sum in the current sheet and the headers present
+        if qh not in col_index or prior_hdr not in col_index or yoy_hdr not in col_index:
             continue
+        # Need this quarter in the prior sheet mapping
         if qh not in prior_col_letter:
-            # prior year has no such quarter → skip
             continue
 
-        yoy_col = col_index[yoy_hdr]
-        curr_col = col_index[qh]
-        prior_letter = prior_col_letter[qh]  # e.g. 'B' for Q1 on prior sheet
-
-        # Build the INDEX/MATCH expression once per cell
-        # prior_val = INDEX(_PRIOR_YOY!$<prior_letter>:$<prior_letter>, MATCH(_KEY, _PRIOR_YOY!$A:$A, 0))
-        prior_range = f"{prior_sheet}!${prior_letter}:${prior_letter}"
-        key_range   = f"{prior_sheet}!${A_col_letter}:${A_col_letter}"
+        curr_col       = col_index[qh]
+        prior_val_col  = col_index[prior_hdr]
+        yoy_col        = col_index[yoy_hdr]
+        prior_letter   = prior_col_letter[qh]                  # e.g., 'B'
+        prior_range    = f"{prior_sheet}!${prior_letter}:${prior_letter}"
+        key_range      = f"{prior_sheet}!${A_col_letter}:${A_col_letter}"
 
         for r in range(first_data_row, last_data_row + 1):
-            key_addr  = ws.cell(r, col_index["_KEY"]).coordinate
-            curr_addr = ws.cell(r, curr_col).coordinate
-            prior_val = f"INDEX({prior_range},MATCH({key_addr},{key_range},0))"
+            key_addr   = ws.cell(r, col_index["_KEY"]).coordinate
+            curr_addr  = ws.cell(r, curr_col).coordinate
 
-            # Wrap with IFERROR to handle no match → "N/A"
-            # Then apply division-by-zero rules
-            formula = (
+            # PRIOR value via INDEX/MATCH
+            prior_expr = f"INDEX({prior_range},MATCH({key_addr},{key_range},0))"
+            ws.cell(r, prior_val_col).value = f"=IFERROR({prior_expr},\"\")"  # blank if no match
+
+            # YoY% using PRIOR and CURR with divide-by-zero rules
+            # - if prior blank -> "N/A"
+            # - if prior=0 & curr=0 -> 0
+            # - if prior=0 & curr>0 -> "N/A"
+            # - else (curr - prior)/prior
+            yoy_formula = (
                 f'=IFERROR('
-                f'IF({prior_val}="","N/A",'
-                f'IF(AND({prior_val}=0,{curr_addr}=0),0,'
-                f'IF(AND({prior_val}=0,{curr_addr}>0),"N/A",'
-                f'({curr_addr}-{prior_val})/{prior_val}))),'
+                f'IF({prior_expr}="","N/A",'
+                f'IF(AND({prior_expr}=0,{curr_addr}=0),0,'
+                f'IF(AND({prior_expr}=0,{curr_addr}>0),"N/A",'
+                f'({curr_addr}-{prior_expr})/{prior_expr}))),'
                 f'"N/A")'
             )
-            ws.cell(r, yoy_col).value = formula
+            ws.cell(r, yoy_col).value = yoy_formula
 
-    # percent format for YoY columns
+    # Formats
     for h, c in col_index.items():
         if h.startswith("YoY "):
             for r in range(first_data_row, last_data_row + 1):
                 ws.cell(r, c).number_format = "0.0%"
+        if h.startswith("Prior "):
+            for r in range(first_data_row, last_data_row + 1):
+                ws.cell(r, c).number_format = "#,##0"
