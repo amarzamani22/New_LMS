@@ -1,0 +1,286 @@
+from __future__ import annotations
+import argparse, random, re
+from pathlib import Path
+from typing import List, Optional, Tuple, Iterable
+import openpyxl
+from openpyxl.workbook.workbook import Workbook
+
+# -----------------------------
+# Settings you may tweak
+# -----------------------------
+# Where we’ll write on the Cover
+COVER_PRIMARY  = ("F6", "F7", "F8")   # (Entity, Year, Quarter)
+COVER_FALLBACK = ("C6", "C7", "C8")
+
+# Heuristics to locate numeric tables (only if you want jitter/scale)
+LIKELY_DATA_SHEETS = [
+    "Banking & DFI", "Banking & DFI ", "Insurance/Takaful", "Insurance & Takaful", "Data"
+]
+MONTH_COLS = ["C","D","E","F","G","H","I","J","K","L","M","N"]  # Jan..Dec across tables
+ROW_RANGE  = (10, 1000)
+
+# Quarter name normalization
+Q_MAP_NORM = {"Q1":"Quarter 1", "Q2":"Quarter 2", "Q3":"Quarter 3", "Q4":"Quarter 4"}
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def _safe_name(s: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in s)
+
+def _set_cover(wb: Workbook, entity: str, year: int, quarter_label_raw: str) -> None:
+    """Write Entity/Year/Quarter to the Cover sheet."""
+    qlbl = Q_MAP_NORM.get(quarter_label_raw.strip().upper(), quarter_label_raw)
+    if "Cover" not in wb.sheetnames:
+        ws = wb.create_sheet("Cover", 0)
+        ws["A1"] = "Cover"
+    ws = wb["Cover"]
+
+    def write(cells: Tuple[str, str, str]) -> bool:
+        try:
+            ws[cells[0]] = entity
+            ws[cells[1]] = int(year)
+            ws[cells[2]] = qlbl
+            return True
+        except Exception:
+            return False
+
+    if not write(COVER_PRIMARY):
+        write(COVER_FALLBACK)
+
+def _iter_candidate_sheets(wb: Workbook) -> Iterable[str]:
+    """Yield likely data sheets first, then everything except Cover."""
+    seen = set()
+    for cand in LIKELY_DATA_SHEETS:
+        for s in wb.sheetnames:
+            if s.lower().strip() == cand.lower().strip():
+                if s not in seen:
+                    seen.add(s); yield s
+    for s in wb.sheetnames:
+        if s == "Cover":
+            continue
+        if s not in seen:
+            yield s
+
+def _scale_numeric_tables(wb: Workbook, scale: float, jitter_pct: float, round_to_int: bool) -> None:
+    """Multiply numeric cells in MONTH_COLS by 'scale' and add jitter (± jitter_pct)."""
+    r0, r1 = ROW_RANGE
+    if abs(scale - 1.0) < 1e-9 and jitter_pct == 0.0:
+        return
+    for s in _iter_candidate_sheets(wb):
+        ws = wb[s]
+        for col in MONTH_COLS:
+            for r in range(r0, r1+1):
+                cell = ws[f"{col}{r}"]
+                v = cell.value
+                if isinstance(v, (int, float)):
+                    jitter = 1.0 + random.uniform(-jitter_pct, jitter_pct)
+                    new_v = v * scale * jitter
+                    if round_to_int:
+                        new_v = int(round(new_v))
+                    if new_v < 0:
+                        new_v = 0
+                    cell.value = new_v
+
+# -----------------------------
+# Entity list discovery
+# -----------------------------
+def _get_named_range_cells(wb: Workbook, name: str) -> List[openpyxl.cell.cell.Cell]:
+    """Return cells referenced by a named range (single-area)."""
+    try:
+        dn = wb.defined_names[name]
+    except KeyError:
+        return []
+    cells: List[openpyxl.cell.cell.Cell] = []
+    for title, coord in dn.destinations:
+        ws = wb[title]
+        for rng in coord.split(","):
+            for row in ws[rng]:
+                for c in row:
+                    cells.append(c)
+    return cells
+
+def _extract_entities_from_cover(wb: Workbook) -> List[str]:
+    """
+    Priority:
+      1) Named range 'EntityList'
+      2) Cover: find any cell whose value contains 'Entity' & 'List' (case-insensitive),
+         and then read the vertical block below it (same column) until blanks.
+      3) Fallback: Cover column A, rows 15..500 until a blank stretch.
+    """
+    if "Cover" not in wb.sheetnames:
+        return []
+
+    # 1) Named range
+    cells = _get_named_range_cells(wb, "EntityList")
+    names = [str(c.value).strip() for c in cells if (c.value is not None and str(c.value).strip())]
+    if names:
+        return names
+
+    ws = wb["Cover"]
+    # 2) Scan for a header like "List of Reporting Entities"
+    pat = re.compile(r"(entity|entities).*(list)|list.*(entity|entities)", re.IGNORECASE)
+    header_cell = None
+    for row in ws.iter_rows(min_row=1, max_row=200, min_col=1, max_col=20):
+        for c in row:
+            v = c.value
+            if isinstance(v, str) and pat.search(v):
+                header_cell = c
+                break
+        if header_cell:
+            break
+    if header_cell:
+        col = header_cell.column
+        start = header_cell.row + 1
+        out = []
+        # read down until 2 consecutive blanks
+        blanks = 0
+        for r in range(start, start+1000):
+            v = ws.cell(r, col).value
+            if v is None or str(v).strip() == "":
+                blanks += 1
+                if blanks >= 2 and out:
+                    break
+                continue
+            blanks = 0
+            out.append(str(v).strip())
+        if out:
+            return out
+
+    # 3) Fallback: Column A from row 15 onward
+    out = []
+    blanks = 0
+    for r in range(15, 501):
+        v = ws.cell(r, 1).value
+        if v is None or str(v).strip() == "":
+            blanks += 1
+            if blanks >= 2 and out:
+                break
+            continue
+        blanks = 0
+        out.append(str(v).strip())
+    return out
+
+# -----------------------------
+# Token guesser (filename tag)
+# -----------------------------
+def guess_token(entity: str) -> str:
+    s = entity.lower()
+    # Order matters (more specific first)
+    if "international" in s and "islam" in s:
+        return "IIB"
+    if "digital" in s:
+        return "DB"
+    if "takaful" in s:
+        return "TO"
+    if "insur" in s:
+        return "INS"
+    if "investment bank" in s:
+        return "INV"
+    if "agro" in s or "exim" in s or "development" in s:
+        return "DFI"
+    if "islam" in s:
+        return "IB"
+    # crude "foreign banks" detection could be added if you maintain a list
+    return "CB"
+
+# -----------------------------
+# Core duplicator
+# -----------------------------
+def duplicate_report(
+    template_path: Path,
+    out_dir: Path,
+    entity: str,
+    year: int,
+    quarter: str,        # Q1..Q4 or "Quarter 1"
+    token: Optional[str] = None,
+    scale: float = 1.0,
+    jitter_pct: float = 0.0,
+    round_to_int: bool = True,
+) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    keep_vba = template_path.suffix.lower() == ".xlsm"
+    wb = openpyxl.load_workbook(str(template_path), data_only=False, keep_vba=keep_vba)
+
+    # Stamp Cover
+    _set_cover(wb, entity=entity, year=year, quarter_label_raw=quarter)
+
+    # Optional synthetic variation
+    _scale_numeric_tables(wb, scale=scale, jitter_pct=jitter_pct, round_to_int=round_to_int)
+
+    # Save
+    q_tag = quarter.replace(" ", "")
+    token = token or guess_token(entity)
+    base = f"LMS_{token}_{year}_{q_tag}_{_safe_name(entity)}"
+    dest = out_dir / f"{base}{template_path.suffix}"
+    wb.save(str(dest))
+    return dest
+
+# -----------------------------
+# CLI
+# -----------------------------
+def expand_years(spec: str) -> List[int]:
+    spec = spec.strip()
+    if "-" in spec:
+        a, b = spec.split("-", 1)
+        return list(range(int(a), int(b) + 1))
+    return [int(x.strip()) for x in spec.split(",") if x.strip()]
+
+def expand_quarters(q: str) -> List[str]:
+    q = q.strip().upper()
+    if q == "ALL":
+        return ["Q1","Q2","Q3","Q4"]
+    parts = [p.strip().upper() for p in q.split(",") if p.strip()]
+    valid = {"Q1","Q2","Q3","Q4"}
+    out = [p for p in parts if p in valid]
+    if not out:
+        raise SystemExit("Invalid quarters; use ALL or comma list like Q1,Q2")
+    return out
+
+def main():
+    ap = argparse.ArgumentParser(description="Generate RLMS submissions from a template using entity list on the Cover sheet (no CSV needed).")
+    ap.add_argument("--template", required=True, help="Path to template submission (.xlsx or .xlsm)")
+    ap.add_argument("--outdir",   required=True, help="Output root folder")
+    ap.add_argument("--years",    required=True, help="Year range/list, e.g. 2025-2027 or '2025,2026'")
+    ap.add_argument("--quarters", default="ALL", help="Quarters: ALL or comma list (Q1,Q2,...)")
+    ap.add_argument("--global-scale", type=float, default=1.0, help="Global scale for numeric tables")
+    ap.add_argument("--jitter",       type=float, default=0.05, help="± jitter (0.05 = ±5%) for numeric tables")
+    ap.add_argument("--no-round",     action="store_true", help="Do not round numeric jittered values")
+    args = ap.parse_args()
+
+    template = Path(args.template)
+    outroot  = Path(args.outdir)
+    years    = expand_years(args.years)
+    quarters = expand_quarters(args.quarters)
+
+    wb_preview = openpyxl.load_workbook(str(template), data_only=True, keep_vba=(template.suffix.lower()==".xlsm"))
+    entities = _extract_entities_from_cover(wb_preview)
+    if not entities:
+        raise SystemExit("Could not find any entity names on the Cover sheet. "
+                         "Tip: add a named range 'EntityList' or a visible list under a header containing 'Entity' and 'List'.")
+    print(f"[INFO] Found {len(entities)} entities on Cover.")
+
+    total = 0
+    for year in years:
+        for q in quarters:
+            outdir = outroot / str(year) / q
+            outdir.mkdir(parents=True, exist_ok=True)
+            for ent in entities:
+                token = guess_token(ent)
+                dest = duplicate_report(
+                    template_path=template,
+                    out_dir=outdir,
+                    entity=ent,
+                    year=year,
+                    quarter=q,
+                    token=token,
+                    scale=float(args.global_scale),
+                    jitter_pct=float(args.jitter),
+                    round_to_int=(not args.no_round),
+                )
+                print(f"[OK] {dest}")
+                total += 1
+    print(f"[DONE] Generated {total} files → {outroot}")
+
+if __name__ == "__main__":
+    main()
