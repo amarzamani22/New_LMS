@@ -1,12 +1,13 @@
 from pathlib import Path
 from typing import List, Dict, Any
+import argparse
 import pandas as pd
 from openpyxl import load_workbook
 
 # ----------------------------
 # Config
 # ----------------------------
-Q1_MONTH_COLS = ["C", "D", "E"]  # adjust if needed (Oct, Nov, Dec are C, D, E for Q4)
+Q1_MONTH_COLS = ["C", "D", "E"]
 MONTHS_BY_Q = {
     "Quarter 1": ["Jan", "Feb", "Mar"],
     "Quarter 2": ["Apr", "May", "Jun"],
@@ -18,7 +19,6 @@ MONTHS_BY_Q = {
     "Q4": ["Oct", "Nov", "Dec"],
 }
 
-# Map row numbers → worker categories (example, adjust as per template)
 WORKER_ROWS = {
     15: "Managers",
     17: "Professional",
@@ -29,7 +29,6 @@ WORKER_ROWS = {
     27: "TOTAL Employment",
 }
 
-# Subquestion blocks for Q1A/Q1B
 SUBQUESTIONS_Q1A = {
     "Employment = A + B(i) + B(ii)": list(WORKER_ROWS.keys()),
     "A. Malaysian": [29, 30, 31, 32, 33, 34],
@@ -59,7 +58,6 @@ def read_number(ws, addr: str) -> float:
     return float(v) if isinstance(v, (int, float)) else 0.0
 
 def col_letter(idx: int) -> str:
-    """1-based index → Excel column letter"""
     letters = ""
     while idx > 0:
         idx, rem = divmod(idx - 1, 26)
@@ -78,20 +76,18 @@ def extract_q1(path: Path) -> Dict[str, pd.DataFrame]:
     has_q4 = quarter in ("Q4", "Quarter 4")
     months = MONTHS_BY_Q.get(quarter, [])
 
-    # Build output schema
     base_cols = ["entity_name", "year", "quarter", "question", "Subquestion", "worker_category"]
     if has_q4:
         base_cols += ["job_function"]
     cols = base_cols + months
 
-    # ---- Extract Q1A
+    # ---- Q1A
     rows = []
     for subq_label, row_nums in SUBQUESTIONS_Q1A.items():
         for r in row_nums:
             wc_label = ws[f"A{r}"].value
             if not wc_label:
                 continue
-
             row = {
                 "entity_name": meta["entity"],
                 "year": meta["year"],
@@ -102,36 +98,18 @@ def extract_q1(path: Path) -> Dict[str, pd.DataFrame]:
             }
             if has_q4:
                 row["job_function"] = ""
-
             for m, col in zip(months, Q1_MONTH_COLS):
                 row[m] = read_number(ws, f"{col}{r}")
-
             rows.append(row)
-
-            # Job-function breakdown (Q4 only)
-            if has_q4:
-                last_month = months[-1]
-                for col_idx in range(9, 25):  # I → Y approx
-                    jf_name = ws[f"{col_letter(col_idx)}11"].value
-                    jf_val = ws[f"{col_letter(col_idx)}{r}"].value
-                    if not jf_name or jf_val in (None, "-"):
-                        continue
-                    jf_row = row.copy()
-                    jf_row["job_function"] = jf_name
-                    for m in months:
-                        jf_row[m] = jf_val if m == last_month else 0
-                    rows.append(jf_row)
-
     df_q1a = pd.DataFrame(rows, columns=cols)
 
-    # ---- Extract Q1B (same structure, different rows)
+    # ---- Q1B
     rows = []
     for subq_label, row_nums in SUBQUESTIONS_Q1B.items():
         for r in row_nums:
             wc_label = ws[f"A{r}"].value
             if not wc_label:
                 continue
-
             row = {
                 "entity_name": meta["entity"],
                 "year": meta["year"],
@@ -142,45 +120,28 @@ def extract_q1(path: Path) -> Dict[str, pd.DataFrame]:
             }
             if has_q4:
                 row["job_function"] = ""
-
             for m, col in zip(months, Q1_MONTH_COLS):
                 row[m] = read_number(ws, f"{col}{r}")
-
             rows.append(row)
-
-            if has_q4:
-                last_month = months[-1]
-                for col_idx in range(9, 25):
-                    jf_name = ws[f"{col_letter(col_idx)}55"].value
-                    jf_val = ws[f"{col_letter(col_idx)}{r}"].value
-                    if not jf_name or jf_val in (None, "-"):
-                        continue
-                    jf_row = row.copy()
-                    jf_row["job_function"] = jf_name
-                    for m in months:
-                        jf_row[m] = jf_val if m == last_month else 0
-                    rows.append(jf_row)
-
     df_q1b = pd.DataFrame(rows, columns=cols)
 
     return {"Q1A": df_q1a, "Q1B": df_q1b}
 
-
 # ----------------------------
-# Runner
+# Runner (CLI)
 # ----------------------------
 def main():
-    input_path = Path("sample_submission.xlsx")  # change
-    out_path = Path("staging_q1.xlsx")
+    ap = argparse.ArgumentParser(description="Extract Q1A & Q1B into staging Excel")
+    ap.add_argument("--input", required=True, help="Input submission .xlsx file")
+    ap.add_argument("--output", required=True, help="Output staging .xlsx file")
+    args = ap.parse_args()
 
-    dfs = extract_q1(input_path)
-
-    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+    dfs = extract_q1(Path(args.input))
+    with pd.ExcelWriter(args.output, engine="openpyxl") as writer:
         for sheet, df in dfs.items():
             df.to_excel(writer, index=False, sheet_name=sheet)
 
-    print(f"[DONE] Extracted Q1 → {out_path}")
-
+    print(f"[DONE] Extracted Q1A & Q1B → {args.output}")
 
 if __name__ == "__main__":
     main()
