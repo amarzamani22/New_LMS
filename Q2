@@ -1,365 +1,329 @@
-# extract_q2_staging_turbo.py
+# extract_q2_staging_fast.py
 from __future__ import annotations
-import argparse, re, time, os
+import argparse, re, time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import pandas as pd
 from openpyxl import load_workbook
 
-# ===================== Config =====================
+# ---------------- Config (fast, anchor-based) ----------------
+
 LIKELY_DATA_SHEETS = [
     "Banking & DFI", "Banking & DFI ", "Banking & DFI  ",
     "Insurance/Takaful", "Insurance & Takaful", "Data"
 ]
 COVER_CELLS = {"entity": "F6", "year": "F7", "quarter": "F8"}
 
-MONTHS_BY_Q = {
-    "Quarter 1":["Jan","Feb","Mar"],
-    "Quarter 2":["Apr","May","Jun"],
-    "Quarter 3":["Jul","Aug","Sep"],
-    "Quarter 4":["Oct","Nov","Dec"],
-    "Q1":["Jan","Feb","Mar"], "Q2":["Apr","May","Jun"],
-    "Q3":["Jul","Aug","Sep"], "Q4":["Oct","Nov","Dec"],
-}
-MONTH_COLS = ["C","D","E"]  # physical columns for the active quarter
-
-WORKER_CATEGORIES = [
+# Worker categories/rows in every Q2 table
+WORKER_CATS = [
     "Managers",
     "Professional",
     "Technicians & Associate Professionals",
     "Clerical Occupations",
     "Operative Workers",
     "Elementary Occupations",
-    "TOTAL Salary & Wages",
-    "TOTAL Basic Salary & Wages",
-    "TOTAL Arrears to Basic Salary & Wages",
-    "TOTAL Bonus",
+    "TOTAL Salary & Wages",            # appears in both A (Q2A main head) and Q2B(A)
+    "TOTAL Bonus",                     # Q2A(C)
     "TOTAL Others (overtime, COLA, allowance, etc.)",
     "TOTAL Commissions Paid At Least Once a Month (RM)",
 ]
 
+# Q2A main block heads (A..E) in order; we’ll tag them as subquestion
 Q2A_BLOCKS = [
-    ("Salary & Wages = A + B + C + D + E", "Salary & Wages = A+B+C+D+E"),
-    ("A. Basic Salary & Wages", "A. Basic Salary & Wages"),
-    ("B. Arrears to Basic Salary & Wages", "B. Arrears to Basic Salary & Wages"),
-    ("C. Bonus", "C. Bonus"),
-    ("D. Others (overtime, COLA, allowance, etc.)", "D. Others (overtime, COLA, allowance, etc.)"),
-    ("E. Commissions Paid At Least Once a Month (RM)", "E. Commissions Paid At Least Once a Month (RM)"),
+    "Salary & Wages = A + B + C + D + E",
+    "A. Basic Salary & Wages",
+    "B. Arrears to Basic Salary & Wages",
+    "C. Bonus",
+    "D. Others (overtime, COLA, allowance, etc.)",
+    "E. Commissions Paid At Least Once a Month (RM)",
 ]
 
+# Q2B block heads (A..B)
 Q2B_BLOCKS = [
-    ("A. Salary & Wages", "A. Salary & Wages"),
-    ("B. Commissions Paid At Least Once a Month (RM)", "B. Commissions Paid At Least Once a Month (RM)"),
+    "A. Salary & Wages",
+    "B. Commissions Paid At Least Once a Month (RM)",
 ]
 
-JOB_FUNCTIONS = [
-    "Banking Operations","Compliance","Corporate Banking","Credit Management",
-    "Digital Banking & Innovation","Finance","Human Resources","Information Technology",
-    "Internal Audit","Investment Banking","Legal","Retail Banking","Risk Management",
-    "Sales and Marketing","Shariah","Treasury","Other functions"
+# Job functions (Q4 only)
+JOB_FUNCS = [
+    "Banking Operations", "Compliance", "Corporate Banking", "Credit Management",
+    "Digital Banking & Innovation", "Finance", "Human Resources", "Information Technology",
+    "Internal Audit", "Investment Banking", "Legal", "Retail Banking", "Risk Management",
+    "Sales and Marketing", "Shariah", "Treasury", "Other functions"
 ]
 
-# Wider “fast windows”, plus we fall back to full-sheet if anchors not found
-FAST_WINDOWS = {
-    "Q2A": (90, 175),
-    "Q2B": (146, 180),
-    "Q2A_JF_Q4": (90, 210),
+MONTHS_BY_Q = {
+    "Quarter 1": ["Jan","Feb","Mar"],
+    "Quarter 2": ["Apr","May","Jun"],
+    "Quarter 3": ["Jul","Aug","Sep"],
+    "Quarter 4": ["Oct","Nov","Dec"],
+    "Q1": ["Jan","Feb","Mar"], "Q2": ["Apr","May","Jun"], "Q3": ["Jul","Aug","Sep"], "Q4": ["Oct","Nov","Dec"],
 }
+# Fixed input columns for the 3 months (like Q1)
+Q_MONTH_COLS = ["C","D","E"]
 
-# ===================== Helpers =====================
-def _norm(s: object) -> str:
-    if s is None: return ""
-    s = str(s).replace("&", " and ")
+# ---------------- Helpers ----------------
+
+def _norm(x: object) -> str:
+    if x is None: return ""
+    s = str(x).replace("&"," and ")
     keep = "abcdefghijklmnopqrstuvwxyz0123456789()+/.:; -"
-    return re.sub(r"\s+", " ", "".join(ch.lower() if ch.lower() in keep else " " for ch in s)).strip()
+    s = "".join(ch.lower() if ch.lower() in keep else " " for ch in s)
+    return re.sub(r"\s+"," ",s).strip()
 
-def _equals(a: object, b: str) -> bool:
-    return _norm(a) == _norm(b)
+def _eq(a: object, b: str) -> bool: return _norm(a) == _norm(b)
 
 @dataclass
 class CoverMeta:
     entity: Optional[str]
     year: Optional[int]
-    quarter_label: Optional[str]
+    quarter: Optional[str]
 
 def read_cover_meta(wb) -> CoverMeta:
     ent = yr = ql = None
     if "Cover" in wb.sheetnames:
         ws = wb["Cover"]
-        try:
-            ent = ws[COVER_CELLS["entity"]].value
-            yr  = ws[COVER_CELLS["year"]].value
-            ql  = ws[COVER_CELLS["quarter"]].value
-        except Exception:
-            pass
+        ent = ws[COVER_CELLS["entity"]].value if COVER_CELLS["entity"] in ws else None
+        yr  = ws[COVER_CELLS["year"]].value   if COVER_CELLS["year"]   in ws else None
+        ql  = ws[COVER_CELLS["quarter"]].value if COVER_CELLS["quarter"] in ws else None
     if not ent or not yr or not ql:
         for s in wb.sheetnames[:3]:
             if s == "Cover": continue
             ws = wb[s]
-            try:
-                ent = ent or ws["C6"].value
-                yr  = yr or ws["C7"].value
-                ql  = ql or ws["C8"].value
-            except Exception:
-                pass
-    try:
-        yr = int(str(yr).strip()) if yr is not None else None
-    except Exception:
-        yr = None
-    ent = str(ent).strip() if ent else None
-    ql  = str(ql).strip() if ql else None
-    return CoverMeta(ent, yr, ql)
+            ent = ent or ws["C6"].value
+            yr  = yr  or ws["C7"].value
+            ql  = ql  or ws["C8"].value
+    try: yr = int(str(yr).strip()) if yr is not None else None
+    except: yr = None
+    return CoverMeta(str(ent).strip() if ent else None, yr, str(ql).strip() if ql else None)
 
 def pick_data_sheet(wb) -> str:
-    names_norm = {_norm(s): s for s in wb.sheetnames}
+    names = {_norm(n): n for n in wb.sheetnames}
     for want in LIKELY_DATA_SHEETS:
-        key = _norm(want)
-        if key in names_norm: return names_norm[key]
+        if _norm(want) in names: return names[_norm(want)]
     for s in wb.sheetnames:
         if s != "Cover": return s
     return wb.sheetnames[0]
 
-def read_number(ws, addr: str) -> float:
+def read_num(ws, addr: str) -> float:
     try: v = ws[addr].value
-    except Exception: return 0.0
-    if v in (None, "", "-"): return 0.0
+    except: return 0.0
+    if v in (None,"","-"): return 0.0
     try: return float(v)
-    except Exception:
-        try: return float(str(v).replace(",", ""))
-        except Exception: return 0.0
+    except:
+        try: return float(str(v).replace(",",""))
+        except: return 0.0
 
-def build_colA_index(ws, start_row: int, end_row: int) -> Dict[str, List[int]]:
-    idx: Dict[str, List[int]] = {}
-    start = max(1, start_row)
-    end   = min(ws.max_row, end_row)
-    for r in range(start, end + 1):
-        k = _norm(ws.cell(r, 1).value)
-        if k:
-            idx.setdefault(k, []).append(r)
-    return idx
+def find_row(ws, text: str, col: int=1) -> Optional[int]:
+    tgt = _norm(text)
+    for r in range(1, ws.max_row+1):
+        if _norm(ws.cell(r,col).value) == tgt:
+            return r
+    return None
 
-def find_first(idx: Dict[str, List[int]], label: str) -> Optional[int]:
-    rows = idx.get(_norm(label))
-    return rows[0] if rows else None
+def find_first_after(ws, anchor_text: str, probe_text: str, col: int=1) -> Optional[int]:
+    a = find_row(ws, anchor_text, col)
+    if a is None: return None
+    tgt = _norm(probe_text)
+    for r in range(a+1, ws.max_row+1):
+        if _norm(ws.cell(r,col).value) == tgt: return r
+    return None
 
-def find_anchors(ws, blocks, win) -> List[Tuple[str,int]]:
-    """Find anchors in window; if any missing, fall back to full-sheet to pick them up."""
-    idx_win = build_colA_index(ws, *win)
-    anchors: List[Tuple[str,int]] = []
-    missing = []
-    for label, alias in blocks:
-        r = find_first(idx_win, label)
-        if r: anchors.append((alias, r))
-        else: missing.append((label, alias))
-    if missing:
-        # full-sheet fallback
-        idx_all = build_colA_index(ws, 1, ws.max_row)
-        for label, alias in missing:
-            r = find_first(idx_all, label)
-            if r: anchors.append((alias, r))
-    anchors.sort(key=lambda t: t[1])
-    return anchors
+# ---------------- Q2A main (fast) ----------------
 
-# ===================== Extraction =====================
-def extract_q2a_main(ws, meta: CoverMeta, fast=True) -> pd.DataFrame:
-    months = MONTHS_BY_Q.get(meta.quarter_label or "", [])
+def extract_q2a_main(ws, meta: CoverMeta) -> pd.DataFrame:
+    months = MONTHS_BY_Q.get(meta.quarter or "", [])
     if len(months) != 3: return pd.DataFrame()
-    win = FAST_WINDOWS["Q2A"] if fast else (1, ws.max_row)
 
-    anchors = find_anchors(ws, Q2A_BLOCKS, win)
-    if not anchors: return pd.DataFrame()
+    # Anchor: the big combined header line must exist
+    head_r = find_row(ws, "Salary & Wages = A + B + C + D + E")
+    if head_r is None: return pd.DataFrame()
 
-    wanted = {_norm(w) for w in WORKER_CATEGORIES}
     out: List[Dict] = []
-    seen: set = set()
 
-    for i, (subq, start_r) in enumerate(anchors):
-        end_r = anchors[i + 1][1] if i + 1 < len(anchors) else min(ws.max_row, start_r + 220)
-        r = start_r + 1
-        while r < end_r:
-            a = ws.cell(r, 1).value
-            an = _norm(a)
-            if not an:
-                r += 1; continue
-            if an.startswith("period ("):
-                r += 1; continue
-            if an in wanted:
-                wc = str(a).strip()
-                v1 = read_number(ws, f"{MONTH_COLS[0]}{r}")
-                v2 = read_number(ws, f"{MONTH_COLS[1]}{r}")
-                v3 = read_number(ws, f"{MONTH_COLS[2]}{r}")
-                key = (subq, wc, r)
-                if key not in seen:
-                    seen.add(key)
-                    out.append({
-                        "entity_name": meta.entity,
-                        "year": meta.year,
-                        "quarter": meta.quarter_label,
-                        "question": "Q2A",
-                        "subquestion": subq,
-                        "worker_category": wc,
-                        months[0]: v1, months[1]: v2, months[2]: v3,
-                    })
+    # For every block head (A..E + the combined equation), we read the 6 categories+TOTAL where present
+    block_starts: List[Tuple[str,int]] = []
+    for blk in Q2A_BLOCKS:
+        r = find_first_after(ws, "Question 2A:", blk) or find_row(ws, blk)
+        if r: block_starts.append((blk, r))
+
+    # If we failed to find “Question 2A:” anchor, still proceed with any hits we got
+    wc_norms = [_norm(x) for x in WORKER_CATS[:6]] + [_norm("TOTAL Salary & Wages")]
+
+    for blk, r0 in block_starts:
+        r = r0 + 1
+        found = 0
+        while r <= ws.max_row and found < 7:
+            label = ws.cell(r,1).value
+            if _norm(label) in wc_norms:
+                # read 3 month columns C/D/E (physical)
+                v1 = read_num(ws, f"{Q_MONTH_COLS[0]}{r}")
+                v2 = read_num(ws, f"{Q_MONTH_COLS[1]}{r}")
+                v3 = read_num(ws, f"{Q_MONTH_COLS[2]}{r}")
+                out.append({
+                    "entity_name": meta.entity,
+                    "year": meta.year,
+                    "quarter": meta.quarter,
+                    "subquestion": blk,
+                    "worker_category": str(label).strip(),
+                    months[0]: v1, months[1]: v2, months[2]: v3,
+                })
+                found += 1
             r += 1
 
     return pd.DataFrame(out)
 
-def extract_q2a_jobfunc_q4(ws, meta: CoverMeta, fast=True) -> pd.DataFrame:
-    q = (meta.quarter_label or "").upper()
-    if q not in ("Q4", "QUARTER 4"): return pd.DataFrame()
+# ---------------- Q2A Job Function (Q4 only) ----------------
 
-    win = FAST_WINDOWS["Q2A_JF_Q4"] if fast else (1, ws.max_row)
+def extract_q2a_jobfunc_q4(ws, meta: CoverMeta) -> pd.DataFrame:
+    q = (meta.quarter or "").upper()
+    if q not in ("Q4","QUARTER 4"): return pd.DataFrame()
 
-    # find header row with many job functions; fallback if needed
-    header_row = None; best = 0
-    start, end = win
-    for r in range(start, min(ws.max_row, end) + 1):
-        row_vals = {_norm(ws.cell(r, c).value) for c in range(1, ws.max_column + 1)}
-        hits = sum(1 for jf in JOB_FUNCTIONS if _norm(jf) in row_vals)
-        if hits > best:
-            best = hits; header_row = r
-        if hits >= 8:
+    # Find the header row containing job function names
+    header_row = None
+    best_hits = 0
+    for r in range(1, ws.max_row+1):
+        row_vals = [_norm(ws.cell(r,c).value) for c in range(1, ws.max_column+1)]
+        hits = sum(1 for jf in JOB_FUNCS if _norm(jf) in row_vals)
+        if hits > best_hits:
+            best_hits, header_row = hits, r
+        if hits >= max(6, len(JOB_FUNCS)//2):
             break
-    if not header_row:
-        # full-sheet sweep
-        for r in range(1, ws.max_row + 1):
-            row_vals = {_norm(ws.cell(r, c).value) for c in range(1, ws.max_column + 1)}
-            hits = sum(1 for jf in JOB_FUNCTIONS if _norm(jf) in row_vals)
-            if hits > best:
-                best = hits; header_row = r
-            if hits >= 8:
-                break
-    if not header_row:
-        return pd.DataFrame()
+    if not header_row: return pd.DataFrame()
 
-    jf_cols: Dict[str, int] = {}
-    for c in range(1, ws.max_column + 1):
-        txt = ws.cell(header_row, c).value
-        for jf in JOB_FUNCTIONS:
-            if _equals(txt, jf) and jf not in jf_cols:
+    # Map job func -> column index
+    jf_cols: Dict[str,int] = {}
+    for c in range(1, ws.max_column+1):
+        txt = ws.cell(header_row,c).value
+        for jf in JOB_FUNCS:
+            if _eq(txt, jf) and jf not in jf_cols:
                 jf_cols[jf] = c
-    if not jf_cols:
-        return pd.DataFrame()
+    if not jf_cols: return pd.DataFrame()
 
-    # Know which Q2A subquestion we're in when reading rows
-    section_labels = { _norm(src): alias for src, alias in Q2A_BLOCKS }
-    wc_norm = {_norm(w) for w in WORKER_CATEGORIES}
-
+    # Below that header row we expect worker categories; grab until categories exhausted
+    wcn = [_norm(x) for x in WORKER_CATS[:6]]  # 6 rows
     out: List[Dict] = []
-    end_scan = min(ws.max_row, header_row + 260)
-    current_subq: Optional[str] = None
-    for r in range(header_row + 1, end_scan + 1):
-        a = ws.cell(r, 1).value
-        an = _norm(a)
-        if not an:
-            continue
-        if an in section_labels:
-            current_subq = section_labels[an]; continue
-        if an.startswith("period ("):
-            continue
-        if an in wc_norm:
-            wc = str(a).strip()
+    r = header_row + 1
+    while r <= ws.max_row:
+        label = ws.cell(r,1).value
+        if _norm(label) in wcn:
+            wc = str(label).strip()
             for jf, cidx in jf_cols.items():
-                raw = ws.cell(r, cidx).value
-                try:
-                    v = 0.0 if raw in (None, "", "-") else float(str(raw).replace(",", ""))
-                except Exception:
-                    v = 0.0
+                val = ws.cell(r,cidx).value
+                try: v = 0.0 if val in (None,"","-") else float(str(val).replace(",",""))
+                except: v = 0.0
                 out.append({
                     "entity_name": meta.entity,
                     "year": meta.year,
-                    "quarter": meta.quarter_label,
-                    "subquestion": current_subq or "",
+                    "quarter": meta.quarter,
                     "worker_category": wc,
                     "job_function": jf,
                     "value": v,
                 })
+            r += 1
+        else:
+            # stop when categories finished
+            if len(out)>0 and _norm(label) not in wcn:
+                break
+            r += 1
     return pd.DataFrame(out)
 
-def extract_q2b(ws, meta: CoverMeta, fast=True) -> pd.DataFrame:
-    q = (meta.quarter_label or "").strip()
+# ---------------- Q2B (always emit rows if block exists) ----------------
+
+def extract_q2b(ws, meta: CoverMeta) -> Tuple[pd.DataFrame, bool]:
+    """
+    Return (df, saw_block). We produce rows (zeros if blank) whenever the 2B block exists
+    and the quarter is Q2 or Q4. This guarantees the Q2B tab will appear if any file had the block.
+    """
+    q = (meta.quarter or "").strip()
     if q not in ("Quarter 2","Quarter 4","Q2","Q4"):
-        return pd.DataFrame()
+        return pd.DataFrame(), False
+
+    # Must find the "Question 2B:" anchor; otherwise no block present in this file
+    q2b_anchor = find_row(ws, "Question 2B:")
+    if q2b_anchor is None:
+        return pd.DataFrame(), False
+
     months = MONTHS_BY_Q.get(q, [])
-    if not months:
-        return pd.DataFrame()
+    if len(months) != 3:
+        return pd.DataFrame(), True  # saw block, but can't map months
 
-    win = FAST_WINDOWS["Q2B"] if fast else (1, ws.max_row)
-    anchors = find_anchors(ws, Q2B_BLOCKS, win)
-    if not anchors:
-        return pd.DataFrame()
-
-    wanted = {_norm(w) for w in WORKER_CATEGORIES}
     out: List[Dict] = []
-    for i, (subq, start_r) in enumerate(anchors):
-        end_r = anchors[i+1][1] if i + 1 < len(anchors) else min(ws.max_row, start_r + 140)
+    # For each sub-block A / B, capture the 6 worker categories + TOTAL
+    for blk in Q2B_BLOCKS:
+        start_r = find_first_after(ws, "Question 2B:", blk)
+        if start_r is None:
+            # block label not found; still emit nothing for this block
+            continue
         r = start_r + 1
-        while r < end_r:
-            a = ws.cell(r, 1).value
-            an = _norm(a)
-            if not an:
-                r += 1; continue
-            if an.startswith("period ("):
-                r += 1; continue
-            if an in wanted:
-                wc = str(a).strip()
-                v1 = read_number(ws, f"{MONTH_COLS[0]}{r}")
-                v2 = read_number(ws, f"{MONTH_COLS[1]}{r}")
-                v3 = read_number(ws, f"{MONTH_COLS[2]}{r}")
+        found = 0
+        while r <= ws.max_row and found < 7:
+            label = ws.cell(r,1).value
+            if _norm(label) in [_norm(w) for w in WORKER_CATS[:6]] + [_norm("TOTAL Salary & Wages")] + [_norm("TOTAL Commissions Paid At Least Once a Month (RM)")]:
+                v1 = read_num(ws, f"{Q_MONTH_COLS[0]}{r}")
+                v2 = read_num(ws, f"{Q_MONTH_COLS[1]}{r}")
+                v3 = read_num(ws, f"{Q_MONTH_COLS[2]}{r}")
                 out.append({
                     "entity_name": meta.entity,
                     "year": meta.year,
-                    "quarter": meta.quarter_label,
-                    "question": "Q2B",
-                    "subquestion": subq,
-                    "worker_category": wc,
-                    months[0]: v1 if len(months) > 0 else 0.0,
-                    months[1]: v2 if len(months) > 1 else 0.0,
-                    months[2]: v3 if len(months) > 2 else 0.0,
+                    "quarter": meta.quarter,
+                    "subquestion": blk,
+                    "worker_category": str(label).strip(),
+                    months[0]: v1, months[1]: v2, months[2]: v3,
                 })
+                found += 1
             r += 1
 
-    if not out:
-        return pd.DataFrame()
-    df = pd.DataFrame(out)
-    month_cols = [c for c in months if c in df.columns]
-    return df if not df.empty and (df[month_cols].abs().sum(axis=1) > 0).any() else pd.DataFrame()
+        # If we didn’t find any rows (layout odd), still emit a zero-frame with the 6 worker categories for visibility
+        if found == 0:
+            for wc in WORKER_CATS[:6]:
+                out.append({
+                    "entity_name": meta.entity,
+                    "year": meta.year,
+                    "quarter": meta.quarter,
+                    "subquestion": blk,
+                    "worker_category": wc,
+                    months[0]: 0.0, months[1]: 0.0, months[2]: 0.0,
+                })
 
-# ============== File driver ==============
-def _extract_file(path: Path, fast: bool, verbose: bool) -> Tuple[str, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    return pd.DataFrame(out), True
+
+# ---------------- File driver ----------------
+
+def extract_q2_from_file(path: Path, verbose=False) -> Tuple[pd.DataFrame,pd.DataFrame,pd.DataFrame,bool]:
     try:
         wb = load_workbook(str(path), data_only=True, read_only=True)
     except Exception as e:
         if verbose: print(f"[ERROR] open {path.name}: {e}")
-        return (path.name, pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), False
 
     meta = read_cover_meta(wb)
-    if not meta.entity or not meta.year or not meta.quarter_label:
-        if verbose: print(f"[WARN] {path.name}: missing cover meta; skipping.")
+    if not meta.entity or not meta.year or not meta.quarter:
+        if verbose: print(f"[WARN] {path.name}: missing cover meta; skip")
         try: wb.close()
-        except Exception: pass
-        return (path.name, pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
+        except: pass
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), False
 
     ws = wb[pick_data_sheet(wb)]
-    df_a  = extract_q2a_main(ws, meta, fast=fast)
-    df_jf = extract_q2a_jobfunc_q4(ws, meta, fast=fast)
-    df_b  = extract_q2b(ws, meta, fast=fast)
+
+    a = extract_q2a_main(ws, meta)
+    jf = extract_q2a_jobfunc_q4(ws, meta)
+    b, saw_q2b = extract_q2b(ws, meta)
 
     try: wb.close()
-    except Exception: pass
-    return (path.name, df_a, df_jf, df_b)
+    except: pass
+    # add file name for trace/debug if you like
+    return a, jf, b, saw_q2b
 
-# ===================== CLI =====================
+# ---------------- CLI ----------------
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Turbo extract RLMS Question 2 (2A + 2B) → staging workbook")
+    ap = argparse.ArgumentParser(description="Extract RLMS Question 2 (A main, A JobFunc Q4, B) into staging workbook.")
     ap.add_argument("--inputs", required=True, help="Folder with submissions (.xlsx/.xlsm)")
     ap.add_argument("--out",    required=True, help="Output staging workbook (.xlsx)")
-    ap.add_argument("--limit",  type=int, default=None, help="Limit files (debug)")
-    ap.add_argument("--workers", type=int, default=0, help="Parallel processes (0 = cpu_count())")
-    ap.add_argument("--no-fast", action="store_true", help="Disable narrow row windows (scan full sheet)")
+    ap.add_argument("--limit",  type=int, default=None)
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -368,58 +332,50 @@ def main() -> int:
         print(f"[ERROR] Folder not found: {root}")
         return 2
 
+    # Gather files
     files: List[Path] = []
     for ext in ("*.xlsx","*.xlsm"):
-        files.extend(p for p in root.rglob(ext) if not p.name.startswith("~$"))
+        files.extend([p for p in root.rglob(ext) if not p.name.startswith("~$")])
     files.sort()
     if args.limit: files = files[:args.limit]
+    print(f"[INFO] Files: {len(files)}")
 
-    print(f"[INFO] Files to scan: {len(files)}")
     t0 = time.perf_counter()
-    fast = not args.no_fast
-    workers = None if args.workers in (0, None) else args.workers
-
     rows_a, rows_jf, rows_b = [], [], []
-    if workers is None or workers > 1:
-        w = workers or os.cpu_count()
-        print(f"[RUN] Parallel extraction with {w} workers")
-        with ProcessPoolExecutor(max_workers=w) as ex:
-            futs = {ex.submit(_extract_file, p, fast, args.verbose): p for p in files}
-            for i, fut in enumerate(as_completed(futs), 1):
-                _, a, jf, b = fut.result()
-                if not a.empty:  rows_a.append(a)
-                if not jf.empty: rows_jf.append(jf)
-                if not b.empty:  rows_b.append(b)
-                if args.verbose and i % 25 == 0:
-                    print(f"  processed {i}/{len(files)}")
-    else:
-        for i, p in enumerate(files, 1):
-            _, a, jf, b = _extract_file(p, fast, args.verbose)
-            if not a.empty:  rows_a.append(a)
-            if not jf.empty: rows_jf.append(jf)
-            if not b.empty:  rows_b.append(b)
-            if args.verbose and i % 25 == 0:
-                print(f"  processed {i}/{len(files)}")
+    saw_any_q2b = False
 
+    for i,p in enumerate(files,1):
+        a, jf, b, saw_q2b = extract_q2_from_file(p, verbose=args.verbose)
+        if not a.empty:  rows_a.append(a)
+        if not jf.empty: rows_jf.append(jf)
+        if not b.empty:  rows_b.append(b)
+        saw_any_q2b = saw_any_q2b or saw_q2b
+        if args.verbose and i % 25 == 0:
+            print(f"  processed {i}/{len(files)}")
+
+    df_a  = pd.concat(rows_a,  ignore_index=True) if rows_a  else pd.DataFrame()
+    df_jf = pd.concat(rows_jf, ignore_index=True) if rows_jf else pd.DataFrame()
+    df_b  = pd.concat(rows_b,  ignore_index=True) if rows_b  else pd.DataFrame()
+
+    # Sorts
     def _sort(df: pd.DataFrame) -> pd.DataFrame:
         if df.empty: return df
-        order = [c for c in ["entity_name","year","quarter","question","subquestion","worker_category","job_function"] if c in df.columns]
-        months = [c for c in ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"] if c in df.columns]
-        return df.sort_values(order + months, kind="mergesort").reset_index(drop=True)
+        order = [c for c in ["entity_name","year","quarter","subquestion","worker_category","job_function"] if c in df.columns]
+        month_cols = [c for c in ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"] if c in df.columns]
+        return df.sort_values(order + month_cols, kind="mergesort").reset_index(drop=True)
 
-    df_a  = _sort(pd.concat(rows_a,  ignore_index=True) if rows_a  else pd.DataFrame())
-    df_jf = _sort(pd.concat(rows_jf, ignore_index=True) if rows_jf else pd.DataFrame())
-    if "question" in df_jf.columns:  # per your preference
-        df_jf = df_jf.drop(columns=["question"])
-    df_b  = _sort(pd.concat(rows_b,  ignore_index=True) if rows_b  else pd.DataFrame())
+    df_a, df_jf, df_b = _sort(df_a), _sort(df_jf), _sort(df_b)
 
-    out = Path(args.out); out.parent.mkdir(parents=True, exist_ok=True)
-    with pd.ExcelWriter(out, engine="openpyxl") as xw:
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
         if not df_a.empty:  df_a.to_excel(xw, index=False, sheet_name="Q2A_Main")
-        if not df_jf.empty: df_jf.to_excel(xw, index=False, sheet_name="Q2A_JobFunc_Q4")  # second tab
-        if not df_b.empty:  df_b.to_excel(xw, index=False, sheet_name="Q2B")
-    print(f"[DONE] Wrote staging → {out}")
-    print(f"[TIMER] {time.perf_counter() - t0:0.2f}s")
+        if not df_jf.empty: df_jf.to_excel(xw, index=False, sheet_name="Q2A_JobFunc_Q4")
+        # Write Q2B if we saw the block in ANY file, even if all rows were zeros
+        if saw_any_q2b:
+            df_b.to_excel(xw, index=False, sheet_name="Q2B")
+    print(f"[DONE] Wrote → {out_path}")
+    print(f"[TIMER] {time.perf_counter()-t0:0.2f}s")
     return 0
 
 if __name__ == "__main__":
