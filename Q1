@@ -2,14 +2,10 @@
 from __future__ import annotations
 import argparse, time
 from pathlib import Path
-from typing import List, Tuple
 import pandas as pd
 from openpyxl import load_workbook
 
-# =========================
-# Helpers
-# =========================
-
+# ========== Helper ==========
 def read_num(ws, addr: str) -> float:
     v = ws[addr].value
     if v in (None, "", "-", "–"):
@@ -19,14 +15,11 @@ def read_num(ws, addr: str) -> float:
     except Exception:
         return 0.0
 
-# =========================
-# Q1A MAIN
-# =========================
-
+# ========== Q1A MAIN ==========
 def extract_q1a_main(ws, ent: str, yr: int, q: str) -> pd.DataFrame:
-    months = ["Oct", "Nov", "Dec"] if q in ("Q4","Quarter 4") else \
-             ["Jul", "Aug", "Sep"] if q in ("Q3","Quarter 3") else \
-             ["Apr", "May", "Jun"] if q in ("Q2","Quarter 2") else \
+    months = ["Oct", "Nov", "Dec"] if "4" in str(q) else \
+             ["Jul", "Aug", "Sep"] if "3" in str(q) else \
+             ["Apr", "May", "Jun"] if "2" in str(q) else \
              ["Jan", "Feb", "Mar"]
 
     blocks = {
@@ -41,10 +34,10 @@ def extract_q1a_main(ws, ent: str, yr: int, q: str) -> pd.DataFrame:
     ]
 
     rows = []
-    for subq, (r1, r2) in blocks.items():
+    for subq, (r1, _) in blocks.items():
         for i, wc in enumerate(worker_categories):
             r = r1 + i
-            rec = {
+            rows.append({
                 "entity_name": ent,
                 "year": yr,
                 "quarter": q,
@@ -53,16 +46,12 @@ def extract_q1a_main(ws, ent: str, yr: int, q: str) -> pd.DataFrame:
                 months[0]: read_num(ws, f"C{r}"),
                 months[1]: read_num(ws, f"D{r}"),
                 months[2]: read_num(ws, f"E{r}"),
-            }
-            rows.append(rec)
+            })
     return pd.DataFrame(rows)
 
-# =========================
-# Q1A JOB FUNCTION (Q4 only)
-# =========================
-
+# ========== Q1A JOB FUNCTION ==========
 def extract_q1a_jobfunc_q4(ws, ent: str, yr: int, q: str) -> pd.DataFrame:
-    if q not in ("Q4","Quarter 4"):
+    if "4" not in str(q):
         return pd.DataFrame()
 
     worker_rows = {
@@ -80,29 +69,24 @@ def extract_q1a_jobfunc_q4(ws, ent: str, yr: int, q: str) -> pd.DataFrame:
         "Internal Audit","Investment Banking","Legal","Retail Banking","Risk Management",
         "Sales and Marketing","Shariah","Treasury","Other functions"
     ]
-
-    cols = [chr(c) for c in range(ord("K"), ord("A")+27)]  # K..AA
+    cols = [chr(c) for c in range(ord("K"), ord("K")+len(job_funcs))]
 
     rows = []
     for wc, r in worker_rows.items():
         for jf, col in zip(job_funcs, cols):
-            rec = {
+            rows.append({
                 "entity_name": ent,
                 "year": yr,
                 "quarter": q,
                 "worker_category": wc,
                 "job_function": jf,
                 "value": read_num(ws, f"{col}{r}"),
-            }
-            rows.append(rec)
+            })
     return pd.DataFrame(rows)
 
-# =========================
-# Q1B (Islamic ops)
-# =========================
-
+# ========== Q1B ==========
 def extract_q1b(ws, ent: str, yr: int, q: str) -> pd.DataFrame:
-    if q not in ("Q2","Quarter 2","Q4","Quarter 4"):
+    if str(q) not in ("Q2","Quarter 2","Q4","Quarter 4"):
         return pd.DataFrame()
 
     blocks = {
@@ -115,51 +99,36 @@ def extract_q1b(ws, ent: str, yr: int, q: str) -> pd.DataFrame:
         "Managers","Professional","Technicians & Associate Professionals",
         "Clerical Occupations","Operative Workers","Elementary Occupations"
     ]
-
-    # Only one month (Jun for Q2, Dec for Q4)
-    month = "Jun" if q in ("Q2","Quarter 2") else "Dec"
+    month = "Jun" if "2" in str(q) else "Dec"
 
     rows = []
-    for subq, (r1, r2) in blocks.items():
+    for subq, (r1, _) in blocks.items():
         for i, wc in enumerate(worker_categories):
             r = r1 + i
-            rec = {
+            rows.append({
                 "entity_name": ent,
                 "year": yr,
                 "quarter": q,
                 "subquestion": subq,
                 "worker_category": wc,
                 month: read_num(ws, f"E{r}"),
-            }
-            rows.append(rec)
+            })
     return pd.DataFrame(rows)
 
-# =========================
-# FILE DRIVER
-# =========================
-
-def extract_from_file(path: Path) -> Tuple[pd.DataFrame,pd.DataFrame,pd.DataFrame]:
-    try:
-        wb = load_workbook(path, data_only=True)
-    except Exception:
-        return (pd.DataFrame(),pd.DataFrame(),pd.DataFrame())
-
+# ========== FILE DRIVER ==========
+def extract_from_file(path: Path):
+    wb = load_workbook(path, data_only=True)
     ws = wb.active
     ent = ws["C6"].value
     yr  = ws["C7"].value
     q   = ws["C8"].value
-
     a = extract_q1a_main(ws, ent, yr, q)
     jf = extract_q1a_jobfunc_q4(ws, ent, yr, q)
     b = extract_q1b(ws, ent, yr, q)
-
     wb.close()
     return a,jf,b
 
-# =========================
-# CLI
-# =========================
-
+# ========== MAIN ==========
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
@@ -168,23 +137,30 @@ def main() -> int:
 
     root = Path(args.input)
     files = list(root.glob("*.xlsx"))
-    rows_a, rows_jf, rows_b = [],[],[]
 
+    rows_a, rows_jf, rows_b = [],[],[]
     t0 = time.time()
+
     for p in files:
-        a,jf,b = extract_from_file(p)
-        if not a.empty: rows_a.append(a)
-        if not jf.empty: rows_jf.append(jf)
-        if not b.empty: rows_b.append(b)
+        try:
+            a,jf,b = extract_from_file(p)
+            if not a.empty: rows_a.append(a)
+            if not jf.empty: rows_jf.append(jf)
+            if not b.empty: rows_b.append(b)
+        except Exception as e:
+            print(f"[ERROR] {p}: {e}")
 
     df_a = pd.concat(rows_a, ignore_index=True) if rows_a else pd.DataFrame()
     df_jf = pd.concat(rows_jf, ignore_index=True) if rows_jf else pd.DataFrame()
     df_b = pd.concat(rows_b, ignore_index=True) if rows_b else pd.DataFrame()
 
+    # Always create at least one sheet
     with pd.ExcelWriter(args.out, engine="openpyxl") as xw:
         if not df_a.empty: df_a.to_excel(xw, index=False, sheet_name="Q1A_Main")
         if not df_jf.empty: df_jf.to_excel(xw, index=False, sheet_name="Q1A_JobFunc_Q4")
         if not df_b.empty: df_b.to_excel(xw, index=False, sheet_name="Q1B")
+        if df_a.empty and df_jf.empty and df_b.empty:
+            pd.DataFrame([{"msg":"no data"}]).to_excel(xw, index=False, sheet_name="EMPTY")
 
     print(f"[DONE] {args.out} in {time.time()-t0:.2f}s")
     return 0
