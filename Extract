@@ -1,204 +1,180 @@
 from __future__ import annotations
-import argparse, re
+import argparse, time
 from pathlib import Path
-from typing import Optional, List, Dict
-from dataclasses import dataclass
-
+from typing import List, Tuple
 import pandas as pd
-from openpyxl import load_workbook
 
-# ---------- Config ----------
-COVER_CELLS = {"entity": "F6", "year": "F7", "quarter": "F8"}
-FALLBACK_CELLS = {"entity": "C6", "year": "C7", "quarter": "C8"}
-MONTH_COLS = ["C", "D", "E"]   # M1..M3
-TOTAL_COL  = "F"               # optional quarter total
-MONTHS_BY_Q = {
-    "Quarter 1": ["Jan","Feb","Mar"],
-    "Quarter 2": ["Apr","May","Jun"],
-    "Quarter 3": ["Jul","Aug","Sep"],
-    "Quarter 4": ["Oct","Nov","Dec"],
-}
-FILENAME_ET_RE  = re.compile(r"(^|\b)LMS_([A-Z]{2,3})_", re.IGNORECASE)
-FILENAME_FIID_RE= re.compile(r"(^|_)LMS_[A-Z]{2,3}_(\d{2,4})", re.IGNORECASE)
-
-def norm_sheet(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "")).strip()
-
-def read_cell(ws, addr: str):
+# Optional imports: skip gracefully if a module isn’t available
+def _try_imports():
+    mods = {}
     try:
-        return ws[addr].value
+        from extract_q1 import extract_q1_from_file
+        mods["q1"] = extract_q1_from_file
     except Exception:
-        return None
-
-def to_int_safe(x):
+        mods["q1"] = None
     try:
-        return int(str(x).strip())
+        from extract_q2 import extract_q2_from_file
+        mods["q2"] = extract_q2_from_file
     except Exception:
-        return None
-
-def to_float_zero(x) -> float:
-    if x is None: return 0.0
-    if isinstance(x, str) and x.strip()=="":
-        return 0.0
+        mods["q2"] = None
     try:
-        return float(x)
+        from extract_q3 import extract_q3_from_file
+        mods["q3"] = extract_q3_from_file
     except Exception:
-        try:
-            return float(str(x).replace(",",""))
-        except Exception:
-            return 0.0
-
-def parse_filename_tokens(path: Path):
-    et = None; fiid = None
-    m = FILENAME_ET_RE.search(path.name)
-    if m: et = m.group(2).upper()
-    n = FILENAME_FIID_RE.search(path.name)
-    if n: fiid = n.group(2)
-    return et, fiid
-
-@dataclass
-class Meta:
-    entity: Optional[str]
-    year:   Optional[int]
-    quarter_label: Optional[str]
-
-def read_cover_meta(wb) -> Meta:
-    ent = yr = qlbl = None
-    if "Cover" in wb.sheetnames:
-        ws = wb["Cover"]
-        ent = read_cell(ws, COVER_CELLS["entity"])
-        yr  = read_cell(ws, COVER_CELLS["year"])
-        qlbl= read_cell(ws, COVER_CELLS["quarter"])
-    if ent in (None,"") or yr in (None,"") or qlbl in (None,""):
-        # fallback: look at first non-cover sheet
-        for sn in wb.sheetnames:
-            if sn.lower().strip() == "cover": continue
-            ws = wb[sn]
-            ent = ent or read_cell(ws, FALLBACK_CELLS["entity"])
-            yr  = yr  or read_cell(ws, FALLBACK_CELLS["year"])
-            qlbl= qlbl or read_cell(ws, FALLBACK_CELLS["quarter"])
-            if ent and yr and qlbl: break
-    yr = to_int_safe(yr)
-    qlbl = str(qlbl).strip() if qlbl else None
-    ent = str(ent).strip() if ent else None
-    return Meta(ent, yr, qlbl)
-
-def harvest_sheet(ws, meta: Meta, file: Path, sheet_name: str, fi_type: Optional[str], fi_id: Optional[str]) -> List[Dict]:
-    rows: List[Dict] = []
-    # Figure month names for this file's quarter (optional; fall back to M1..M3)
-    mnames = MONTHS_BY_Q.get(meta.quarter_label or "", None)
-    # Iterate all rows; take Column A as "row_label"
-    max_r = ws.max_row
-    for r in range(1, max_r+1):
-        row_label = ws.cell(row=r, column=1).value  # Column A
-        if row_label is None or str(row_label).strip()=="":
-            continue  # skip fully blank row labels; keeps output compact
-        # Capture Month 1..3 and optional Quarter Total
-        for i, col in enumerate(MONTH_COLS, start=1):
-            val = to_float_zero(read_cell(ws, f"{col}{r}"))
-            rows.append({
-                "file_name": file.name,
-                "sheet":     norm_sheet(sheet_name),
-                "row_label": str(row_label).strip(),
-                "month_index": i,                 # 1,2,3
-                "month_name": mnames[i-1] if mnames else f"M{i}",  # Jan/Feb/Mar or M1..
-                "value":     val,
-                "quarter_total": None,            # filled below
-                "entity_name": meta.entity,
-                "year":       meta.year,
-                "quarter":    meta.quarter_label,
-                "fi_type_token": fi_type,
-                "fi_id":      fi_id,
-            })
-        # Quarter total in F (optional)
-        qtot = to_float_zero(read_cell(ws, f"{TOTAL_COL}{r}"))
-        # record it as a separate helper row (month_index=0)
-        rows.append({
-            "file_name": file.name,
-            "sheet":     norm_sheet(sheet_name),
-            "row_label": str(row_label).strip(),
-            "month_index": 0,
-            "month_name": "Q_total",
-            "value":     qtot,
-            "quarter_total": qtot,
-            "entity_name": meta.entity,
-            "year":       meta.year,
-            "quarter":    meta.quarter_label,
-            "fi_type_token": fi_type,
-            "fi_id":      fi_id,
-        })
-    return rows
-
-def extract_file(path: Path, verbose=False) -> List[Dict]:
+        mods["q3"] = None
     try:
-        wb = load_workbook(str(path), data_only=True, read_only=True)
-    except Exception as e:
-        if verbose: print(f"[ERROR] open {path.name}: {e}")
-        return []
-    meta = read_cover_meta(wb)
-    if verbose:
-        print(f"  · {path.name} → entity={meta.entity}, year={meta.year}, quarter={meta.quarter_label}")
-    fi_type, fi_id = parse_filename_tokens(path)
-    out: List[Dict] = []
-    for sn in wb.sheetnames:
-        if sn.lower().strip() == "cover":
-            continue
-        try:
-            ws = wb[sn]
-        except KeyError:
-            continue
-        out.extend(harvest_sheet(ws, meta, path, sn, fi_type, fi_id))
-    return out
+        from extract_q4 import extract_q4_from_file
+        mods["q4"] = extract_q4_from_file
+    except Exception:
+        mods["q4"] = None
+    try:
+        from extract_q5 import extract_q5_from_file
+        mods["q5"] = extract_q5_from_file
+    except Exception:
+        mods["q5"] = None
+    return mods
 
-def main():
-    ap = argparse.ArgumentParser(description="RLMS raw extractor (fast harvester)")
-    ap.add_argument("--inputs", required=True, help="Folder to scan (e.g., OneDrive/RLMS/Submission)")
-    ap.add_argument("--out-csv", default=None, help="Output CSV path (long table)")
-    ap.add_argument("--out-parquet", default=None, help="Optional Parquet path")
-    ap.add_argument("--limit", type=int, default=None, help="Limit number of files for a quick test")
-    ap.add_argument("--verbose", action="store_true")
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Extract RLMS Q1–Q5 in one pass into a single staging workbook.")
+    ap.add_argument("--input", required=True, help="Folder with submissions (.xlsx/.xlsm)")
+    ap.add_argument("--out",   required=True, help="Output staging workbook (.xlsx)")
+    ap.add_argument("--limit", type=int, default=None, help="Limit number of files (debug)")
     args = ap.parse_args()
 
-    root = Path(args.inputs)
+    root = Path(args.input)
     if not root.exists():
-        print(f"[ERROR] Inputs folder not found: {root}")
+        print(f"[ERROR] Folder not found: {root}")
         return 2
 
     files: List[Path] = []
-    for ext in ("*.xlsm","*.xlsx"):
-        files.extend([p for p in root.rglob(ext) if not p.name.startswith("~$")])
+    for ext in ("*.xlsx", "*.xlsm"):
+        files.extend(p for p in root.rglob(ext) if not p.name.startswith("~$"))
     files.sort()
-    if args.limit: files = files[:args.limit]
-    if args.verbose: print(f"Found {len(files)} files")
+    if args.limit:
+        files = files[:args.limit]
 
-    all_rows: List[Dict] = []
-    for p in files:
-        if args.verbose: print(f"- {p.name}")
-        all_rows.extend(extract_file(p, verbose=args.verbose))
+    print(f"[INFO] Files: {len(files)}")
+    mods = _try_imports()
+    t0 = time.perf_counter()
 
-    if not all_rows:
-        print("[WARN] No rows harvested.")
-        return 1
+    # Collect per-question frames
+    q1a_main_acc: List[pd.DataFrame] = []
+    q1a_jf_q4_acc: List[pd.DataFrame] = []
+    q1b_acc: List[pd.DataFrame] = []
 
-    df = pd.DataFrame(all_rows)
-    # Ensure types
-    num_cols = ["value","quarter_total","year","month_index"]
-    for c in num_cols:
-        if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    q2a_main_acc: List[pd.DataFrame] = []
+    q2a_jf_q4_acc: List[pd.DataFrame] = []
+    q2b_acc: List[pd.DataFrame] = []
 
-    # Default outputs
-    ts = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
-    out_csv = Path(args.out_csv) if args.out_csv else root / f"RLMS_raw_harvest_{ts}.csv"
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(out_csv, index=False)
-    print(f"[OK] CSV written: {out_csv}")
+    q3_acc: List[pd.DataFrame] = []
+    q4_acc: List[pd.DataFrame] = []
+    q5_acc: List[pd.DataFrame] = []
 
-    if args.out_parquet:
-        out_pq = Path(args.out_parquet)
-        out_pq.parent.mkdir(parents=True, exist_ok=True)
-        df.to_parquet(out_pq, index=False)
-        print(f"[OK] Parquet written: {out_pq}")
+    for i, p in enumerate(files, 1):
+        # Q1
+        if mods["q1"] is not None:
+            try:
+                a, jf, b = mods["q1"](p)
+                if a is not None and not a.empty:   q1a_main_acc.append(a)
+                if jf is not None and not jf.empty: q1a_jf_q4_acc.append(jf)
+                if b is not None and not b.empty:   q1b_acc.append(b)
+            except Exception as e:
+                print(f"[WARN] Q1 skip {p.name}: {e}")
 
+        # Q2
+        if mods["q2"] is not None:
+            try:
+                a, jf, b = mods["q2"](p)
+                if a is not None and not a.empty:   q2a_main_acc.append(a)
+                if jf is not None and not jf.empty: q2a_jf_q4_acc.append(jf)
+                if b is not None and not b.empty:   q2b_acc.append(b)
+            except Exception as e:
+                print(f"[WARN] Q2 skip {p.name}: {e}")
+
+        # Q3
+        if mods["q3"] is not None:
+            try:
+                df = mods["q3"](p)
+                if df is not None and not df.empty: q3_acc.append(df)
+            except Exception as e:
+                print(f"[WARN] Q3 skip {p.name}: {e}")
+
+        # Q4
+        if mods["q4"] is not None:
+            try:
+                df = mods["q4"](p)
+                if df is not None and not df.empty: q4_acc.append(df)
+            except Exception as e:
+                print(f"[WARN] Q4 skip {p.name}: {e}")
+
+        # Q5
+        if mods["q5"] is not None:
+            try:
+                df = mods["q5"](p)
+                if df is not None and not df.empty: q5_acc.append(df)
+            except Exception as e:
+                print(f"[WARN] Q5 skip {p.name}: {e}")
+
+        if i % 25 == 0:
+            print(f"  processed {i}/{len(files)}")
+
+    # Concatenate (or create empty with sensible columns)
+    def _cat(frames: List[pd.DataFrame], cols: List[str]) -> pd.DataFrame:
+        return (pd.concat(frames, ignore_index=True)
+                if frames else pd.DataFrame(columns=cols))
+
+    out_q1a_main    = _cat(q1a_main_acc,    ["entity_name","year","quarter","question","subquestion","worker_category","Jan","Feb","Mar"])
+    out_q1a_jf_q4   = _cat(q1a_jf_q4_acc,   ["entity_name","year","quarter","worker_category","job_function","value"])
+    out_q1b         = _cat(q1b_acc,         ["entity_name","year","quarter","question","subquestion","worker_category","Jan","Feb","Mar"])
+
+    out_q2a_main    = _cat(q2a_main_acc,    ["entity_name","year","quarter","question","subsection","worker_category","Jan","Feb","Mar"])
+    out_q2a_jf_q4   = _cat(q2a_jf_q4_acc,   ["entity_name","year","quarter","subsection","worker_category","job_function","value"])
+    out_q2b         = _cat(q2b_acc,         ["entity_name","year","quarter","question","subsection","worker_category","M"])
+
+    out_q3          = _cat(q3_acc,          ["entity_name","year","quarter","question","worker_category","Jan","Feb","Mar"])
+    out_q4          = _cat(q4_acc,          ["entity_name","year","quarter","question","subquestion","worker_category","Jan","Feb","Mar"])
+    out_q5          = _cat(q5_acc,          ["entity_name","year","quarter","question","subquestion","worker_category","Jan","Feb","Mar"])
+
+    # Sort for readability where month columns exist
+    def _sort(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty: return df
+        month_cols = [c for c in ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec","M"] if c in df.columns]
+        base_cols  = [c for c in ["entity_name","year","quarter","question","subquestion","subsection","worker_category","job_function"] if c in df.columns]
+        return df.sort_values(base_cols + month_cols, kind="mergesort")
+
+    out_q1a_main  = _sort(out_q1a_main)
+    out_q1a_jf_q4 = _sort(out_q1a_jf_q4)
+    out_q1b       = _sort(out_q1b)
+
+    out_q2a_main  = _sort(out_q2a_main)
+    out_q2a_jf_q4 = _sort(out_q2a_jf_q4)
+    out_q2b       = _sort(out_q2b)
+
+    out_q3        = _sort(out_q3)
+    out_q4        = _sort(out_q4)
+    out_q5        = _sort(out_q5)
+
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
+        if not out_q1a_main.empty:  out_q1a_main.to_excel(xw, index=False, sheet_name="Q1A_Main")
+        if not out_q1a_jf_q4.empty: out_q1a_jf_q4.to_excel(xw, index=False, sheet_name="Q1A_JobFunc_Q4")
+        if not out_q1b.empty:       out_q1b.to_excel(xw, index=False, sheet_name="Q1B")
+
+        if not out_q2a_main.empty:  out_q2a_main.to_excel(xw, index=False, sheet_name="Q2A_Main")
+        if not out_q2a_jf_q4.empty: out_q2a_jf_q4.to_excel(xw, index=False, sheet_name="Q2A_JobFunc_Q4")
+        if not out_q2b.empty:       out_q2b.to_excel(xw, index=False, sheet_name="Q2B")
+
+        if not out_q3.empty:        out_q3.to_excel(xw, index=False, sheet_name="Q3")
+        if not out_q4.empty:        out_q4.to_excel(xw, index=False, sheet_name="Q4")
+        if not out_q5.empty:        out_q5.to_excel(xw, index=False, sheet_name="Q5")
+
+        # In case all frames are empty, keep at least one sheet so Excel can open it
+        if all(df.empty for df in [out_q1a_main,out_q1a_jf_q4,out_q1b,out_q2a_main,out_q2a_jf_q4,out_q2b,out_q3,out_q4,out_q5]):
+            pd.DataFrame({"message":["No data extracted"]}).to_excel(xw, index=False, sheet_name="EMPTY")
+
+    print(f"[DONE] Wrote → {out_path}")
+    print(f"[TIMER] {time.perf_counter() - t0:0.2f}s")
     return 0
 
 if __name__ == "__main__":
