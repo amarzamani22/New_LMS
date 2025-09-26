@@ -1,58 +1,60 @@
-# extract_q3.py
 from __future__ import annotations
 import argparse, time
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
-
 import pandas as pd
 from openpyxl import load_workbook
 
-# ---- Config ----
-LIKELY_DATA_SHEETS = [
-    "Banking & DFI", "Banking & DFI ", "Banking & DFI  ",
-    "Insurance/Takaful", "Insurance & Takaful", "Data"
+# ---- Fixed layout for Q3 (rows & columns) ----
+# Worker categories appear in these exact rows for Q3
+Q3_ROWS = [
+    (169, "Managers"),
+    (170, "Professional"),
+    (171, "Technicians & Associate Professionals"),
+    (172, "Clerical Occupations"),
+    (173, "Operative Workers"),
+    (174, "Elementary Occupations"),
+    (175, "TOTAL Hours Worked During the Month, Including Overtime"),
 ]
-COVER = {"entity": "F6", "year": "F7", "quarter": "F8"}
 
-# Quarter → month labels used in the staging
-MONTHS_BY_Q: Dict[str, List[str]] = {
-    "Quarter 1": ["Jan", "Feb", "Mar"],
-    "Quarter 2": ["Apr", "May", "Jun"],
-    "Quarter 3": ["Jul", "Aug", "Sep"],
-    "Quarter 4": ["Oct", "Nov", "Dec"],
-    "Q1": ["Jan", "Feb", "Mar"],
-    "Q2": ["Apr", "May", "Jun"],
-    "Q3": ["Jul", "Aug", "Sep"],
-    "Q4": ["Oct", "Nov", "Dec"],
+# Values are always in C, D, E for the active quarter
+VAL_COLS = ["C", "D", "E"]
+
+# Preferred data sheet name; we’ll fall back to first non-Cover if missing
+PREFERRED_SHEET = "Banking & DFI"
+
+# Map the various quarter labels on Cover!F8 to month names
+Q_TO_MONTHS: Dict[str, Tuple[str, str, str]] = {
+    "Q1": ("Jan","Feb","Mar"),
+    "QUARTER 1": ("Jan","Feb","Mar"),
+    "Q2": ("Apr","May","Jun"),
+    "QUARTER 2": ("Apr","May","Jun"),
+    "Q3": ("Jul","Aug","Sep"),
+    "QUARTER 3": ("Jul","Aug","Sep"),
+    "Q4": ("Oct","Nov","Dec"),
+    "QUARTER 4": ("Oct","Nov","Dec"),
 }
 
-# Fixed cell map for Q3
-WC_ROWS = [169, 170, 171, 172, 173, 174, 175]   # A169..A175
-VAL_COLS = ["C", "D", "E"]                      # months within the quarter
-
-
-# ---- Helpers ----
-def read_cover_meta(wb) -> Tuple[Optional[str], Optional[int], Optional[str]]:
+def read_cover(wb) -> Tuple[Optional[str], Optional[int], Optional[str]]:
+    """Return (entity, year, quarter_label) from Cover sheet cells F6/F7/F8."""
     ent = yr = q = None
     if "Cover" in wb.sheetnames:
         ws = wb["Cover"]
-        ent = ws[COVER["entity"]].value if COVER["entity"] in ws else None
-        yr  = ws[COVER["year"]].value if COVER["year"] in ws else None
-        q   = ws[COVER["quarter"]].value if COVER["quarter"] in ws else None
+        ent = ws["F6"].value
+        yr  = ws["F7"].value
+        q   = ws["F8"].value
+    # normalize
+    ent = str(ent).strip() if ent not in (None, "") else None
     try:
-        yr = int(str(yr).strip()) if yr is not None else None
+        yr = int(str(yr).strip()) if yr not in (None, "") else None
     except Exception:
         yr = None
-    ent = str(ent).strip() if ent else None
-    q   = str(q).strip() if q else None
+    q = str(q).strip() if q not in (None, "") else None
     return ent, yr, q
 
 def pick_data_sheet(wb) -> str:
-    names_norm = {s.strip().lower(): s for s in wb.sheetnames}
-    for want in LIKELY_DATA_SHEETS:
-        key = want.strip().lower()
-        if key in names_norm:
-            return names_norm[key]
+    if PREFERRED_SHEET in wb.sheetnames:
+        return PREFERRED_SHEET
     for s in wb.sheetnames:
         if s != "Cover":
             return s
@@ -70,95 +72,86 @@ def read_num(ws, addr: str) -> float:
         except Exception:
             return 0.0
 
-
-# ---- Core extraction ----
 def extract_q3_from_file(path: Path) -> pd.DataFrame:
     try:
         wb = load_workbook(str(path), data_only=True, read_only=True)
     except Exception:
         return pd.DataFrame()
 
-    ent, yr, qlabel = read_cover_meta(wb)
-    if not ent or not yr or not qlabel:
+    ent, yr, q = read_cover(wb)
+    if not (ent and yr and q):
         try: wb.close()
         except Exception: pass
         return pd.DataFrame()
 
-    months = MONTHS_BY_Q.get(qlabel, [])
-    if len(months) != 3:
+    months = Q_TO_MONTHS.get(q.upper())
+    if not months:  # unrecognized quarter label
         try: wb.close()
         except Exception: pass
         return pd.DataFrame()
 
     ws = wb[pick_data_sheet(wb)]
-    records: List[Dict] = []
 
-    for r in WC_ROWS:
-        wc = str(ws[f"A{r}"].value).strip() if ws[f"A{r}"].value is not None else ""
-        if not wc:  # skip fully blank label rows
-            continue
-        vals = [read_num(ws, f"{c}{r}") for c in VAL_COLS]
-        records.append({
+    rows: List[Dict] = []
+    m1, m2, m3 = months
+    for r, wc in Q3_ROWS:
+        v1 = read_num(ws, f"{VAL_COLS[0]}{r}")
+        v2 = read_num(ws, f"{VAL_COLS[1]}{r}")
+        v3 = read_num(ws, f"{VAL_COLS[2]}{r}")
+        rows.append({
             "entity_name": ent,
             "year": yr,
-            "quarter": qlabel,
+            "quarter": q,
             "question": "Q3",
             "worker_category": wc,
-            months[0]: vals[0],
-            months[1]: vals[1],
-            months[2]: vals[2],
+            m1: v1,
+            m2: v2,
+            m3: v3,
         })
 
     try: wb.close()
     except Exception: pass
-    return pd.DataFrame(records)
 
+    return pd.DataFrame(rows)
 
-# ---- CLI ----
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Extract RLMS Question 3 into a staging workbook (fixed cells, fast).")
-    ap.add_argument("--input", required=True, help="Folder containing submissions (.xlsx/.xlsm)")
+    ap = argparse.ArgumentParser(description="Extract Question 3 (fixed cells, fast).")
+    ap.add_argument("--input", required=True, help="Folder with submissions (.xlsx/.xlsm)")
     ap.add_argument("--out",   required=True, help="Output staging workbook (.xlsx)")
-    ap.add_argument("--limit", type=int, default=None, help="Limit number of files (debug)")
+    ap.add_argument("--limit", type=int, default=None, help="Limit files (debug)")
     args = ap.parse_args()
 
     root = Path(args.input)
-    if not root.exists():
-        print(f"[ERROR] Folder not found: {root}")
-        return 2
-
-    files: List[Path] = []
-    for ext in ("*.xlsx", "*.xlsm"):
+    files = []
+    for ext in ("*.xlsx","*.xlsm"):
         files.extend(p for p in root.rglob(ext) if not p.name.startswith("~$"))
     files.sort()
     if args.limit:
         files = files[:args.limit]
-    print(f"[INFO] Files to scan: {len(files)}")
+    print(f"[INFO] Files: {len(files)}")
 
     t0 = time.perf_counter()
-    rows: List[pd.DataFrame] = []
-    for i, p in enumerate(files, 1):
+    frames: List[pd.DataFrame] = []
+    for p in files:
         df = extract_q3_from_file(p)
         if not df.empty:
-            rows.append(df)
-    out = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+            frames.append(df)
 
-    # Sort for readability
-    if not out.empty:
-        month_cols = [c for c in ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"] if c in out.columns]
-        out = out.sort_values(["entity_name","year","quarter","worker_category"] + month_cols, kind="mergesort").reset_index(drop=True)
+    out_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
+        columns=["entity_name","year","quarter","question","worker_category","Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    )
+
+    # Keep only month columns that actually appear
+    base = ["entity_name","year","quarter","question","worker_category"]
+    month_cols = [c for c in ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"] if c in out_df.columns]
+    out_df = out_df[base + month_cols] if not out_df.empty else out_df
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
-        if not out.empty:
-            out.to_excel(xw, index=False, sheet_name="Q3")
-        else:
-            # keep a minimal sheet to avoid "at least one sheet must be visible" error
-            pd.DataFrame(columns=["entity_name","year","quarter","question","worker_category","M1","M2","M3"]).to_excel(
-                xw, index=False, sheet_name="Q3"
-            )
-    print(f"[DONE] Wrote staging → {out_path}  ({time.perf_counter()-t0:0.2f}s)")
+        out_df.to_excel(xw, index=False, sheet_name="Q3")
+
+    print(f"[DONE] Wrote → {out_path} in {time.perf_counter()-t0:0.2f}s")
     return 0
 
 if __name__ == "__main__":
