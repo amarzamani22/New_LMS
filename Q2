@@ -37,10 +37,10 @@ WORKER_ROWS = [
     "Clerical Occupations",
     "Operative Workers",
     "Elementary Occupations",
-    "TOTAL",   # we will map section-specific TOTAL row text to this
+    "TOTAL",   # we keep the on-sheet TOTAL text (e.g., "TOTAL Bonus")
 ]
 
-# Section headers (exact text in column A)
+# Q2A section headers (exact text in col A)
 Q2A_SECTIONS: List[Tuple[str, str]] = [
     ("Salary & Wages = A + B + C + D + E", "Salary & Wages = A+B+C+D+E"),
     ("A. Basic Salary & Wages",            "A. Basic Salary & Wages"),
@@ -50,6 +50,15 @@ Q2A_SECTIONS: List[Tuple[str, str]] = [
     ("E. Commissions Paid At Least Once a Month (RM)", "E. Commissions Paid At Least Once a Month (RM)"),
 ]
 
+# Job-function headers used in Q4
+JOB_FUNCTIONS = [
+    "Banking Operations", "Compliance", "Corporate Banking", "Credit Management",
+    "Digital Banking & Innovation", "Finance", "Human Resources", "Information Technology",
+    "Internal Audit", "Investment Banking", "Legal", "Retail Banking", "Risk Management",
+    "Sales and Marketing", "Shariah", "Treasury", "Other functions"
+]
+
+# Q2B blocks
 Q2B_BLOCKS: List[Tuple[str, str]] = [
     ("A. Salary & Wages",  "A. Salary & Wages"),
     ("B. Commissions Paid At Least Once a Month (RM)", "B. Commissions Paid At Least Once a Month (RM)"),
@@ -117,13 +126,11 @@ def read_number(ws, addr: str) -> float:
     try:
         return float(v)
     except:
-        try:
-            return float(str(v).replace(",", ""))
-        except:
-            return 0.0
+        try: return float(str(v).replace(",", ""))
+        except: return 0.0
 
 # ----------------------------
-# Q2A – fixed section reads
+# Q2A – main (fixed rows under each section)
 # ----------------------------
 def extract_q2a(ws, meta: CoverMeta) -> pd.DataFrame:
     months = MONTHS_BY_Q.get(meta.quarter or "", [])
@@ -131,29 +138,18 @@ def extract_q2a(ws, meta: CoverMeta) -> pd.DataFrame:
         return pd.DataFrame()
 
     rows: List[Dict] = []
-
     for section_text, section_label in Q2A_SECTIONS:
         hdr = find_row(ws, section_text, col=1)
         if hdr is None:
-            # quietly skip missing section
             continue
-
-        # Read the next 7 logical rows (6 categories + TOTAL)
-        # We rely on the template being fixed.
-        for i, wc_label in enumerate(WORKER_ROWS, start=1):
+        # next 7 logical rows: 6 categories + TOTAL (keep the on-sheet TOTAL label)
+        for i, wc in enumerate(WORKER_ROWS, start=1):
             r = hdr + i
-            # Capture the display worker label from sheet to retain exact "TOTAL ..." phrases:
             a_text = str(ws.cell(r, 1).value or "").strip()
-            if wc_label == "TOTAL":
-                # keep the visible TOTAL row label (e.g. "TOTAL Bonus")
-                worker = a_text if a_text else "TOTAL"
-            else:
-                worker = wc_label
-
+            worker = a_text if wc == "TOTAL" else wc
             v1 = read_number(ws, f"{M_COLS[0]}{r}")
             v2 = read_number(ws, f"{M_COLS[1]}{r}")
             v3 = read_number(ws, f"{M_COLS[2]}{r}")
-
             rows.append({
                 "entity_name": meta.entity,
                 "year": meta.year,
@@ -162,11 +158,72 @@ def extract_q2a(ws, meta: CoverMeta) -> pd.DataFrame:
                 "worker_category": worker,
                 months[0]: v1, months[1]: v2, months[2]: v3,
             })
-
     return pd.DataFrame(rows)
 
 # ----------------------------
-# Q2B – Islamic ops (Q2 & Q4), fixed reads
+# Q2A – Job function (Q4 only)
+# ----------------------------
+def find_jobfunc_header_row(ws) -> Optional[int]:
+    best_r, best_hits = None, 0
+    for r in range(1, ws.max_row + 1):
+        row_vals = [_norm(ws.cell(r, c).value) for c in range(1, ws.max_column + 1)]
+        hits = sum(1 for jf in JOB_FUNCTIONS if _norm(jf) in row_vals)
+        if hits > best_hits:
+            best_hits, best_r = hits, r
+            if hits >= max(8, len(JOB_FUNCTIONS)//2):
+                break
+    return best_r
+
+def map_jobfunc_cols(ws, header_r: int) -> Dict[str, int]:
+    m: Dict[str,int] = {}
+    for c in range(1, ws.max_column + 1):
+        txt = ws.cell(header_r, c).value
+        for jf in JOB_FUNCTIONS:
+            if _norm(txt) == _norm(jf) and jf not in m:
+                m[jf] = c
+    return m
+
+def extract_q2a_jobfunc_q4(ws, meta: CoverMeta) -> pd.DataFrame:
+    q = (meta.quarter or "").upper()
+    if q not in ("Q4", "QUARTER 4"):
+        return pd.DataFrame()
+
+    header_r = find_jobfunc_header_row(ws)
+    if not header_r:
+        return pd.DataFrame()
+    jf_cols = map_jobfunc_cols(ws, header_r)
+    if not jf_cols:
+        return pd.DataFrame()
+
+    out: List[Dict] = []
+    # For every Q2A section we already know the worker rows: read same 7 lines under each
+    for section_text, section_label in Q2A_SECTIONS:
+        hdr = find_row(ws, section_text, col=1)
+        if hdr is None:
+            continue
+        for i, wc in enumerate(WORKER_ROWS, start=1):
+            r = hdr + i
+            a_text = str(ws.cell(r, 1).value or "").strip()
+            worker = a_text if wc == "TOTAL" else wc
+            for jf, col_idx in jf_cols.items():
+                val = ws.cell(r, col_idx).value
+                try:
+                    v = 0.0 if val in (None, "", "-") else float(str(val).replace(",", ""))
+                except:
+                    v = 0.0
+                out.append({
+                    "entity_name": meta.entity,
+                    "year": meta.year,
+                    "quarter": meta.quarter,
+                    "subsection": section_label,
+                    "worker_category": worker,
+                    "job_function": jf,
+                    "value": v,
+                })
+    return pd.DataFrame(out)
+
+# ----------------------------
+# Q2B – Islamic ops (Q2 & Q4), fixed anchors, values in column C
 # ----------------------------
 def extract_q2b(ws, meta: CoverMeta) -> pd.DataFrame:
     q = (meta.quarter or "").strip()
@@ -177,7 +234,7 @@ def extract_q2b(ws, meta: CoverMeta) -> pd.DataFrame:
     if len(months) != 3:
         return pd.DataFrame()
 
-    # Anchor specifically to "Question 2B:" then read the two blocks by fixed headers
+    # Anchor to "Question 2B:" then find the two block headers under it
     q2b_anchor = find_row(ws, "Question 2B:", col=1)
     if q2b_anchor is None:
         return pd.DataFrame()
@@ -186,17 +243,19 @@ def extract_q2b(ws, meta: CoverMeta) -> pd.DataFrame:
     for block_text, block_label in Q2B_BLOCKS:
         hdr = find_row(ws, block_text, col=1)
         if hdr is None or hdr < q2b_anchor:
-            # ensure we found the block within the 2B area
             continue
 
-        for i, wc_label in enumerate(WORKER_ROWS, start=1):
+        # EXACT: worker rows are the next 7 lines, values in column C only
+        for i, wc in enumerate(WORKER_ROWS, start=1):
             r = hdr + i
-            worker_shown = str(ws.cell(r, 1).value or "").strip()
-            worker = worker_shown if wc_label == "TOTAL" else wc_label
+            a_text = str(ws.cell(r, 1).value or "").strip()
+            worker = a_text if wc == "TOTAL" else wc
 
-            v1 = read_number(ws, f"{M_COLS[0]}{r}")
-            v2 = read_number(ws, f"{M_COLS[1]}{r}")
-            v3 = read_number(ws, f"{M_COLS[2]}{r}")
+            v_last = read_number(ws, f"C{r}")  # only the quarter's last month lives in column C
+            # Fill only the last month, others 0 (Q2->Jun, Q4->Dec)
+            v1, v2, v3 = 0.0, 0.0, 0.0
+            # last month index = 2
+            v3 = v_last
 
             out.append({
                 "entity_name": meta.entity,
@@ -210,47 +269,44 @@ def extract_q2b(ws, meta: CoverMeta) -> pd.DataFrame:
     df = pd.DataFrame(out)
     if df.empty:
         return df
-    # Keep only entities that actually have any non-zero in 2B
-    month_cols = [m for m in ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"] if m in df.columns]
-    sums = df[month_cols].sum(axis=1)
-    if (sums != 0).any():
-        # filter per-entity basis: drop entities whose whole 2B block is zero
-        df = df.groupby("entity_name", group_keys=False).filter(lambda g: (g[month_cols].sum(axis=1) != 0).any())
-        return df
-    return pd.DataFrame()
+
+    # Keep only entities that truly have any non-zero across their 2B block
+    month_cols = [m for m in months if m in df.columns]
+    df = df.groupby("entity_name", group_keys=False).filter(lambda g: (g[month_cols].sum(axis=1) != 0).any())
+    return df
 
 # ----------------------------
 # File driver
 # ----------------------------
-def extract_q2_from_file(path: Path, verbose=False) -> Tuple[pd.DataFrame,pd.DataFrame]:
+def extract_q2_from_file(path: Path, verbose=False) -> Tuple[pd.DataFrame,pd.DataFrame,pd.DataFrame]:
     try:
         wb = load_workbook(str(path), data_only=True, read_only=True)
     except Exception as e:
         if verbose: print(f"[ERR] open {path.name}: {e}")
-        return (pd.DataFrame(), pd.DataFrame())
+        return (pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
 
     meta = read_cover_meta(wb)
     if not meta.entity or not meta.year or not meta.quarter:
         if verbose: print(f"[WARN] {path.name}: missing Cover meta; skipped")
         try: wb.close()
         except: pass
-        return (pd.DataFrame(), pd.DataFrame())
+        return (pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
 
     ws = wb[pick_data_sheet(wb)]
     q2a = extract_q2a(ws, meta)
+    q2a_jf = extract_q2a_jobfunc_q4(ws, meta)
     q2b = extract_q2b(ws, meta)
 
     try: wb.close()
     except: pass
 
-    # No source_file column (per your request)
-    return (q2a, q2b)
+    return (q2a, q2a_jf, q2b)
 
 # ----------------------------
 # CLI
 # ----------------------------
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Extract RLMS Question 2 (A & B) into staging workbook (fast, fixed cells).")
+    ap = argparse.ArgumentParser(description="Extract RLMS Question 2 (A & B) into staging workbook (fixed cells; fast).")
     ap.add_argument("--inputs", required=True, help="Folder with submissions (.xlsx/.xlsm)")
     ap.add_argument("--out", required=True, help="Output staging workbook (.xlsx)")
     ap.add_argument("--limit", type=int, default=None)
@@ -270,32 +326,34 @@ def main() -> int:
     print(f"[INFO] Files: {len(files)}")
 
     t0 = time.perf_counter()
-    q2a_all, q2b_all = [], []
+    q2a_all, q2a_jf_all, q2b_all = [], [], []
 
     for i, p in enumerate(files, 1):
-        a, b = extract_q2_from_file(p, verbose=args.verbose)
-        if not a.empty: q2a_all.append(a)
-        if not b.empty: q2b_all.append(b)
+        a, jf, b = extract_q2_from_file(p, verbose=args.verbose)
+        if not a.empty:  q2a_all.append(a)
+        if not jf.empty: q2a_jf_all.append(jf)
+        if not b.empty:  q2b_all.append(b)
         if args.verbose and i % 25 == 0:
             print(f"  processed {i}/{len(files)}")
 
-    df_q2a = pd.concat(q2a_all, ignore_index=True) if q2a_all else pd.DataFrame()
-    df_q2b = pd.concat(q2b_all, ignore_index=True) if q2b_all else pd.DataFrame()
-
-    # Sort nicely
-    def _sort(df: pd.DataFrame) -> pd.DataFrame:
+    def _sort(df: pd.DataFrame, extra_cols: List[str] = None) -> pd.DataFrame:
         if df.empty: return df
+        cols = ["entity_name","year","quarter","subsection","worker_category"]
+        if extra_cols: cols += extra_cols
         month_cols = [c for c in ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"] if c in df.columns]
-        return df.sort_values(["entity_name","year","quarter","subsection","worker_category"] + month_cols, kind="mergesort").reset_index(drop=True)
+        return df.sort_values(cols + (["job_function"] if "job_function" in df.columns else []) + month_cols,
+                              kind="mergesort").reset_index(drop=True)
 
-    df_q2a = _sort(df_q2a)
-    df_q2b = _sort(df_q2b)
+    df_q2a   = _sort(pd.concat(q2a_all,   ignore_index=True) if q2a_all   else pd.DataFrame())
+    df_q2a_jf= _sort(pd.concat(q2a_jf_all,ignore_index=True) if q2a_jf_all else pd.DataFrame(), extra_cols=["job_function"])
+    df_q2b   = _sort(pd.concat(q2b_all,   ignore_index=True) if q2b_all   else pd.DataFrame())
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
-        if not df_q2a.empty: df_q2a.to_excel(xw, index=False, sheet_name="Q2A_Main")
-        if not df_q2b.empty: df_q2b.to_excel(xw, index=False, sheet_name="Q2B")
+        if not df_q2a.empty:    df_q2a.to_excel(xw, index=False, sheet_name="Q2A_Main")
+        if not df_q2a_jf.empty: df_q2a_jf.to_excel(xw, index=False, sheet_name="Q2A_JobFunc_Q4")
+        if not df_q2b.empty:    df_q2b.to_excel(xw, index=False, sheet_name="Q2B")
     print(f"[DONE] Wrote: {out_path}")
     print(f"[TIMER] {time.perf_counter()-t0:0.2f}s")
     return 0
