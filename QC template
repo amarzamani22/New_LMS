@@ -1,533 +1,835 @@
-# qc_build_all.py
 from __future__ import annotations
-import argparse
-from pathlib import Path
-from typing import Dict, List, Tuple, Iterable
-import numpy as np
-import pandas as pd
 
-MONTHS_BY_Q = {
-    "Quarter 1": ["Jan","Feb","Mar"],
-    "Quarter 2": ["Apr","May","Jun"],
-    "Quarter 3": ["Jul","Aug","Sep"],
-    "Quarter 4": ["Oct","Nov","Dec"],
-    "Q1": ["Jan","Feb","Mar"],
-    "Q2": ["Apr","May","Jun"],
-    "Q3": ["Jul","Aug","Sep"],
-    "Q4": ["Oct","Nov","Dec"],
+import argparse
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.worksheet.table import Table, TableStyleInfo
+from openpyxl.formatting.rule import DataBarRule, FormulaRule
+
+# ----------------------------
+# Config you can tweak
+# ----------------------------
+ROLLUPS_PRESETS: Dict[str, List[str]] = {
+    # You can override/extend via --fi-map; if no map is given, we'll still add an "All Financial Institutions" rollup.
+    # Example keys (when you provide an FI map):
+    # "Islamic Banks": [...list of institution names...],
+    # "DFI": [...],
 }
 
-# Core helpers ---------------------------------------------------------------
+ROLLUP_ORDER_DEFAULT = [
+    "All Financial Institutions",
+]
 
-def _num(s: pd.Series) -> pd.Series:
-    # Robust numeric coercion
-    return pd.to_numeric(s, errors="coerce").fillna(0.0)
+Q_TO_MONTHS = {"Q1":["Jan","Feb","Mar"], "Q2":["Apr","May","Jun"], "Q3":["Jul","Aug","Sep"], "Q4":["Oct","Nov","Dec"]}
+MONTHS_FULL = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
 
-def _month_cols_present(df: pd.DataFrame) -> List[str]:
-    return [c for c in ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec","M"] if c in df.columns]
+# Palette
+FILL_Q1 = PatternFill(start_color="E8F3FF", end_color="E8F3FF", fill_type="solid")  # blue
+FILL_Q2 = PatternFill(start_color="E8F8E8", end_color="E8F8E8", fill_type="solid")  # green
+FILL_Q3 = PatternFill(start_color="FFF3E0", end_color="FFF3E0", fill_type="solid")  # orange
+FILL_Q4 = PatternFill(start_color="F3E5F5", end_color="F3E5F5", fill_type="solid")  # purple
+FILL_RAW = PatternFill(start_color="E6EEF7", end_color="E6EEF7", fill_type="solid")
+FILL_TOTAL_ROW = PatternFill(start_color="F7F7F7", end_color="F7F7F7", fill_type="solid")
+FILL_RED = PatternFill(start_color="FFE5E5", end_color="FFE5E5", fill_type="solid")
+FILL_YELLOW = PatternFill(start_color="FFF7CC", end_color="FFF7CC", fill_type="solid")
 
-def _mcols_for_row(q: str) -> Tuple[str,str,str]:
-    ms = MONTHS_BY_Q.get(str(q), [])
-    return (ms[0], ms[1], ms[2]) if len(ms) == 3 else (None, None, None)
+QFILL = {"Q1": FILL_Q1, "Q2": FILL_Q2, "Q3": FILL_Q3, "Q4": FILL_Q4}
 
-def _add_Q_total(df: pd.DataFrame, mon_cols: Iterable[str]) -> pd.DataFrame:
-    cols = [c for c in mon_cols if c in df.columns]
-    if cols:
-        df = df.copy()
-        df["Q_total"] = _num(df[cols[0]])
-        for c in cols[1:]:
-            df["Q_total"] = df["Q_total"] + _num(df[c])
-    return df
+# ----------------------------
+# Helpers
+# ----------------------------
+def months_up_to_quarter(q_label: str) -> List[str]:
+    order = ["Q1","Q2","Q3","Q4"]
+    months: List[str] = []
+    for q in order:
+        months += Q_TO_MONTHS[q]
+        if q == q_label:
+            break
+    return months
 
-def _finalize(ex_list: List[Dict]) -> pd.DataFrame:
-    if not ex_list:
-        return pd.DataFrame(columns=["entity_name","year","quarter","where","key","check","expected","actual","severity"])
-    out = pd.DataFrame(ex_list)
-    # Make sorting stable/readable
-    sort_cols = [c for c in ["entity_name","year","quarter","where","key","check","severity"] if c in out.columns]
-    return out.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
+def pick_current_quarter_from_staging(stag: pd.DataFrame) -> str:
+    mapping = {"Quarter 1":"Q1","Quarter 2":"Q2","Quarter 3":"Q3","Quarter 4":"Q4","Q1":"Q1","Q2":"Q2","Q3":"Q3","Q4":"Q4"}
+    q = stag["quarter"].map(mapping).fillna(stag["quarter"])
+    q_order = {"Q1":1,"Q2":2,"Q3":3,"Q4":4}
+    idx = q.map(q_order).idxmax()
+    return str(q.loc[idx])
 
-# QC builders ----------------------------------------------------------------
+def load_stage_excel(path: Path) -> Dict[str, pd.DataFrame]:
+    xl = pd.ExcelFile(path, engine="openpyxl")
+    sheets = {}
+    for name in xl.sheet_names:
+        try:
+            sheets[name] = xl.parse(name)
+        except Exception:
+            pass
+    return sheets
 
-def qc_q1a_main(stg: pd.DataFrame) -> pd.DataFrame:
-    if stg.empty:
-        return _finalize([])
-    df = stg.copy()
-    # Month set is by quarter; we already have months labelled by name in staging.
-    # Compute Q_total per row using the correct 3 months for each row’s quarter.
-    # Fast path: precompute per quarter
-    ex: List[Dict] = []
+def ensure_columns(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=cols)
+    for c in cols:
+        if c not in df.columns:
+            df[c] = pd.NA
+    return df[cols]
 
-    # 1) Totals rows vs sum of categories, per subquestion & month
-    # Identify total labels
-    total_labels = {
-        "Employment = A + B(i) + B(ii)": "TOTAL Employment",
-        "A. Malaysian": "TOTAL Malaysian",
-        "B (i) Non-Malaysian: Permanent Resident": "TOTAL Non-Malaysian: Permanent Resident",
-        "B (ii) Non-Malaysian: Non-Permanent Resident": "TOTAL Non-Malaysian: Non-Permanent Resident",
-    }
-    # Six base categories (same across Q1)
-    cats = [
-        "Managers","Professional","Technicians & Associate Professionals",
-        "Clerical Occupations","Operative Workers","Elementary Occupations"
-    ]
-    month_cols_all = _month_cols_present(df)
+def build_fi_groups(fi_map: Optional[pd.DataFrame]) -> Dict[str, List[str]]:
+    """
+    fi_map optional CSV columns required: entity_name, fi_group
+    Returns dict: group -> list of entity_names
+    """
+    if fi_map is None or fi_map.empty:
+        return {}
+    fi_map = fi_map.dropna(subset=["entity_name","fi_group"])
+    grp = {}
+    for g, sub in fi_map.groupby("fi_group"):
+        grp[g] = sorted(sub["entity_name"].astype(str).unique().tolist())
+    return grp
 
-    for (ent, yr, q, subq), g in df.groupby(["entity_name","year","quarter","subquestion"]):
-        m1, m2, m3 = _mcols_for_row(q)
-        if not m1:  # quarter label unknown
+def add_rollups(stage: pd.DataFrame, fi_groups: Dict[str, List[str]]) -> pd.DataFrame:
+    """
+    stage must have: entity_name, year, quarter, [subquestion?], [worker_category?], [job_function?], months/Value columns
+    Returns a DF with extra rows for:
+      - each FI group in fi_groups
+      - "All Financial Institutions"
+      - institution rows (institution == entity_name)
+    Adds columns: entity_group, institution
+    """
+    base_dims = ["year","quarter"]
+    facet_dims = [c for c in ["question","subquestion","worker_category","job_function"] if c in stage.columns]
+    value_cols = [c for c in MONTHS_FULL + ["M","value"] if c in stage.columns]
+
+    # institution rows
+    inst = stage.copy()
+    inst["entity_group"] = inst["entity_name"]
+    inst["institution"] = inst["entity_name"]
+    inst = inst.drop(columns=["entity_name"])
+    # rollup all FI
+    all_fi = stage.copy()
+    all_fi["entity_group"] = "All Financial Institutions"
+    all_fi["institution"] = ""
+    all_fi = all_fi.drop(columns=["entity_name"])
+    # group by dimensions and sum value-cols
+    def _sum(df: pd.DataFrame) -> pd.DataFrame:
+        by = base_dims + facet_dims + ["entity_group","institution"]
+        agg = {c:"sum" for c in value_cols}
+        g = df.groupby(by, dropna=False).agg(agg).reset_index()
+        # keep column order
+        return g[by + value_cols + ["entity_group","institution"]] if "value" not in value_cols else g
+
+    out_frames = [_sum(inst), _sum(all_fi)]
+
+    # FI group rollups if provided
+    for gname, insts in fi_groups.items():
+        sub = stage[stage["entity_name"].isin(insts)]
+        if sub.empty:
             continue
-        # Sum of categories
-        cat_sum = pd.Series({
-            m1: _num(g.loc[g["worker_category"].isin(cats), m1]).sum(),
-            m2: _num(g.loc[g["worker_category"].isin(cats), m2]).sum(),
-            m3: _num(g.loc[g["worker_category"].isin(cats), m3]).sum(),
-        })
-        # Find total row expected label
-        tlabel = total_labels.get(subq)
-        if not tlabel:
-            continue
-        trow = g[g["worker_category"]==tlabel]
-        if trow.empty:
-            ex.append({
-                "entity_name": ent, "year": yr, "quarter": q, "where": "Q1A_Main",
-                "key": f"{subq}", "check": "Missing total row",
-                "expected": tlabel, "actual": "—", "severity": "FAIL"
-            })
-            continue
-        # Compare each month
-        for col in [m1,m2,m3]:
-            tv = _num(trow[col]).sum()
-            ev = float(cat_sum[col])
-            if abs(tv - ev) > 0.5:
-                ex.append({
-                    "entity_name": ent, "year": yr, "quarter": q, "where": "Q1A_Main",
-                    "key": f"{subq} | {col}",
-                    "check": "Total row equals sum of categories",
-                    "expected": ev, "actual": tv, "severity": "FAIL"
-                })
-    return _finalize(ex)
+        block = sub.copy()
+        block["entity_group"] = gname
+        block["institution"] = ""
+        block = block.drop(columns=["entity_name"])
+        out_frames.append(_sum(block))
 
-def qc_q1a_jobfunc_q4(stg_jf: pd.DataFrame, stg_main: pd.DataFrame) -> pd.DataFrame:
-    if stg_jf.empty or stg_main.empty:
-        return _finalize([])
-    ex: List[Dict] = []
-    # Dec = M3 for Q4
-    main_q4 = stg_main[stg_main["quarter"].astype(str).str.upper().isin(["Q4","QUARTER 4"])].copy()
-    if "Dec" not in main_q4.columns:
-        return _finalize([])
+    out = pd.concat(out_frames, ignore_index=True) if out_frames else pd.DataFrame()
+    # reorder columns (entity_group, institution first)
+    lead = ["entity_group","institution"] + [c for c in ["question","subquestion","worker_category","job_function"] if c in out.columns]
+    mid  = base_dims
+    tails = [c for c in MONTHS_FULL + ["M","value"] if c in out.columns]
+    cols = [c for c in lead + mid + tails if c in out.columns]
+    return out[cols]
 
-    # Sum job functions by entity/year/quarter/subsection/worker_category
-    jf_sum = (stg_jf[stg_jf["quarter"].astype(str).str.upper().isin(["Q4","QUARTER 4"])]
-                .groupby(["entity_name","year","quarter","subsection","worker_category"], as_index=False)["value"].sum()
-             ).rename(columns={"value":"jf_total"})
+def pivot_monthly(big: pd.DataFrame, year: int, current_q: str) -> pd.DataFrame:
+    """
+    For monthly tables (Q1A_Main, Q2A_Main, Q3, Q4, Q5):
+    Assumes big already has rows per (entity_group,institution, …) and month columns present.
+    """
+    months = months_up_to_quarter(current_q)
+    cols_keep = ["entity_group","institution"] + [c for c in ["question","subquestion","worker_category","job_function"] if c in big.columns]
+    sub = big[big["year"] == year].copy()
+    # keep only months up to current_q
+    for m in MONTHS_FULL:
+        if m not in sub.columns:
+            sub[m] = 0
+    keep_months = months
+    base = sub[cols_keep + keep_months]
+    # Quarter sums
+    def qsum(df: pd.DataFrame, months3: List[str]) -> pd.Series:
+        ok = [c for c in months3 if c in df.columns]
+        return df[ok].sum(axis=1) if ok else 0
+    base["Q1"] = qsum(base, Q_TO_MONTHS["Q1"]) if set(Q_TO_MONTHS["Q1"]).issubset(base.columns) else 0
+    base["Q2"] = qsum(base, Q_TO_MONTHS["Q2"]) if set(Q_TO_MONTHS["Q2"]).issubset(base.columns) else 0
+    base["Q3"] = qsum(base, Q_TO_MONTHS["Q3"]) if set(Q_TO_MONTHS["Q3"]).issubset(base.columns) else 0
+    base["Q4"] = qsum(base, Q_TO_MONTHS["Q4"]) if set(Q_TO_MONTHS["Q4"]).issubset(base.columns) else 0
+    return base
 
-    # Map to main Dec value for the same keys (use subsection name to align)
-    key = ["entity_name","year","quarter","subsection","worker_category"]
-    merged = jf_sum.merge(
-        main_q4[key+["Dec"]].rename(columns={"Dec":"dec_main"}),
-        on=key, how="left"
-    )
-    merged["dec_main"] = _num(merged["dec_main"])
-    merged["jf_total"] = _num(merged["jf_total"])
+def pivot_single_month(big: pd.DataFrame, year: int, month_name: str) -> pd.DataFrame:
+    """
+    For Q1B & Q2B (single month per quarter: Jun or Dec).
+    """
+    cols_keep = ["entity_group","institution"] + [c for c in ["question","subquestion","worker_category"] if c in big.columns]
+    sub = big[big["year"] == year].copy()
+    if month_name not in sub.columns:
+        sub[month_name] = 0
+    return sub[cols_keep + [month_name]]
 
-    bad = merged[np.abs(merged["jf_total"] - merged["dec_main"]) > 0.5]
-    for _, r in bad.iterrows():
-        ex.append({
-            "entity_name": r["entity_name"], "year": r["year"], "quarter": r["quarter"], "where": "Q1A_JobFunc_Q4",
-            "key": f'{r["subsection"]} | {r["worker_category"]}',
-            "check": "Sum(job_function) equals Dec in Q1A Main",
-            "expected": float(r["dec_main"]), "actual": float(r["jf_total"]), "severity": "FAIL"
-        })
-    return _finalize(ex)
+# ----------------------------
+# Excel writer (styled, fast)
+# ----------------------------
+def write_qc_sheet(
+    wb: Workbook,
+    ws_title: str,
+    df: pd.DataFrame,
+    year: int,
+    current_q: str,
+    *,
+    monthly_mode: bool,
+    single_month: Optional[str] = None,
+    prior_df: Optional[pd.DataFrame] = None,
+    mom_pct_threshold: float = 0.25,
+    abs_cutoff: float = 50,
+    qoq_pct_threshold: float = 0.25,
+):
+    ws = wb.create_sheet(ws_title)
 
-def qc_q1b(stg: pd.DataFrame) -> pd.DataFrame:
-    if stg.empty:
-        return _finalize([])
-    df = stg.copy()
-    ex: List[Dict] = []
+    # Header rows
+    banner_row = 7
+    header_row = 8
+    bold = Font(bold=True)
+    center = Alignment(horizontal="center", vertical="center")
 
-    cats = [
-        "Managers","Professional","Technicians & Associate Professionals",
-        "Clerical Occupations","Operative Workers","Elementary Occupations"
-    ]
-    totals = {
-        "Employment = A + B(i) + B(ii)": "TOTAL Employment",
-        "A. Malaysian": "TOTAL Malaysian",
-        "B (i) Non-Malaysian: Permanent Resident": "TOTAL Non-Malaysian: Permanent Resident",
-        "B (ii) Non-Malaysian: Non-Permanent Resident": "TOTAL Non-Malaysian: Non-Permanent Resident",
-    }
+    dims = ["Entity / Group","Institution"]
+    if "question" in df.columns: dims.append("Question")
+    if "subquestion" in df.columns: dims.append("Subquestion")
+    if "worker_category" in df.columns: dims.append("Worker Category")
+    if "job_function" in df.columns: dims.append("Job Function")
 
-    for (ent, yr, q, subq), g in df.groupby(["entity_name","year","quarter","subquestion"]):
-        m1, m2, m3 = _mcols_for_row(q)
-        if not m1:
-            continue
-        tlabel = totals.get(subq)
-        if not tlabel:
-            continue
-        trow = g[g["worker_category"]==tlabel]
-        if trow.empty:
-            ex.append({
-                "entity_name": ent, "year": yr, "quarter": q, "where": "Q1B",
-                "key": subq, "check": "Missing total row",
-                "expected": tlabel, "actual": "—", "severity": "FAIL"
-            })
-            continue
-        for col in [m1,m2,m3]:
-            s = _num(g.loc[g["worker_category"].isin(cats), col]).sum()
-            t = _num(trow[col]).sum()
-            if abs(t - s) > 0.5:
-                ex.append({
-                    "entity_name": ent, "year": yr, "quarter": q, "where": "Q1B",
-                    "key": f"{subq} | {col}",
-                    "check": "Total row equals sum of categories",
-                    "expected": s, "actual": t, "severity": "FAIL"
-                })
-    return _finalize(ex)
+    if monthly_mode:
+        months = months_up_to_quarter(current_q)
+        q_sums = ["Q1","Q2","Q3","Q4"]
+        # monthly diff/mom
+        month_diff_headers: List[str] = []
+        month_mom_headers: List[str] = []
+        for m in months:
+            i = MONTHS_FULL.index(m)
+            prev = MONTHS_FULL[i-1] if i > 0 else None
+            if prev and prev in months:
+                month_diff_headers.append(f"Diff {m}")
+                month_mom_headers.append(f"MoM {m}")
+        q_diff_headers: List[str] = []
+        for i, q in enumerate(q_sums):
+            if i == 0: continue
+            q_diff_headers += [f"Diff {q}", f"%Diff {q}"]
+        yoy_headers = [f"YoY {q}" for q in q_sums]
+        prior_headers = [f"Prior {q}" for q in q_sums]
 
-def qc_q2a_main(stg: pd.DataFrame) -> pd.DataFrame:
-    if stg.empty:
-        return _finalize([])
-    df = stg.copy()
-    ex: List[Dict] = []
+        s1,s2,s3,s4 = " ", "  ", "   ", "    "
+        headers = dims + months + [s1] + month_diff_headers + [s2] + month_mom_headers + [s3] + q_sums + q_diff_headers + [s4] + yoy_headers + prior_headers
 
-    # Identity: Salary & Wages = sum(A..E) by worker_category & month
-    sw_label = "Salary & Wages = A+B+C+D+E"
-    parts = [
-        "A. Basic Salary & Wages",
-        "B. Arrears to Basic Salary & Wages",
-        "C. Bonus",
-        "D. Others (overtime, COLA, allowance, etc.)",
-        "E. Commissions Paid At Least Once a Month (RM)"
-    ]
+    else:
+        # single month sheet (Q1B / Q2B)
+        m = single_month or "M"
+        headers = dims + [m, "Diff "+m, "YoY "+m, "Prior "+m]
 
-    for (ent, yr, q, wc), g_wc in df.groupby(["entity_name","year","quarter","worker_category"]):
-        m1, m2, m3 = _mcols_for_row(q)
-        if not m1:
-            continue
+    # Banner blanks
+    for c in range(1, len(headers)+1):
+        ws.cell(banner_row, c, None)
 
-        lhs = g_wc[g_wc["subsection"]==sw_label]
-        if lhs.empty:
-            continue
-        lhs_m = [_num(lhs[m1]).sum(), _num(lhs[m2]).sum(), _num(lhs[m3]).sum()]
+    # Headers
+    for idx, h in enumerate(headers, start=1):
+        ws.cell(header_row, idx, h).font = bold
+        if monthly_mode and h in months_up_to_quarter(current_q):
+            ws.cell(header_row, idx).fill = FILL_RAW
 
-        rhs = g_wc[g_wc["subsection"].isin(parts)]
-        rhs_m = [_num(rhs[m1]).sum(), _num(rhs[m2]).sum(), _num(rhs[m3]).sum()]
+    # Banners (monthly)
+    def _cols_for(names: List[str], col_index: Dict[str,int]) -> List[int]:
+        return [col_index[n] for n in names if n in col_index]
+    col_index = {h: i+1 for i, h in enumerate(headers)}
 
-        for col, l, r in zip([m1,m2,m3], lhs_m, rhs_m):
-            if abs(l - r) > 0.5:
-                ex.append({
-                    "entity_name": ent, "year": yr, "quarter": q, "where": "Q2A_Main",
-                    "key": f"{wc} | {col}",
-                    "check": "Salary & Wages = A+B+C+D+E (by month)",
-                    "expected": r, "actual": l, "severity": "FAIL"
-                })
+    ws.merge_cells(start_row=banner_row, start_column=1, end_row=banner_row, end_column=len(dims))
+    ws.cell(banner_row, 1, "Dimensions").font = bold
+    ws.cell(banner_row, 1).alignment = center
 
-    # Subsection totals vs sum of their categories (Managers..Elementary)
-    cats = [
-        "Managers","Professional","Technicians & Associate Professionals",
-        "Clerical Occupations","Operative Workers","Elementary Occupations"
-    ]
-    total_row_name = {
-        "A. Basic Salary & Wages": "TOTAL Basic Salary & Wages",
-        "B. Arrears to Basic Salary & Wages": "TOTAL Arrears to Basic Salary & Wages",
-        "C. Bonus": "TOTAL Bonus",
-        "D. Others (overtime, COLA, allowance, etc.)": "TOTAL Others (overtime, COLA, allowance, etc.)",
-        "E. Commissions Paid At Least Once a Month (RM)": "TOTAL Commissions Paid At Least Once a Month (RM)",
-        sw_label: "TOTAL Salary & Wages",
-    }
-    for (ent, yr, q, sub), g in df.groupby(["entity_name","year","quarter","subsection"]):
-        m1,m2,m3 = _mcols_for_row(q)
-        if not m1:
-            continue
-        tlabel = total_row_name.get(sub)
-        if not tlabel: 
-            continue
-        trow = g[g["worker_category"]==tlabel]
-        if trow.empty:
-            continue
-        for col in [m1,m2,m3]:
-            s = _num(g.loc[g["worker_category"].isin(cats), col]).sum()
-            t = _num(trow[col]).sum()
-            if abs(t - s) > 0.5:
-                ex.append({
-                    "entity_name": ent, "year": yr, "quarter": q, "where": "Q2A_Main",
-                    "key": f"{sub} | {col}",
-                    "check": "TOTAL row equals sum of 6 categories",
-                    "expected": s, "actual": t, "severity": "FAIL"
-                })
-    return _finalize(ex)
+    if monthly_mode:
+        months = months_up_to_quarter(current_q)
+        for qlbl, q_months in Q_TO_MONTHS.items():
+            include = [m for m in months if m in q_months]
+            if include:
+                cols = _cols_for(include, col_index)
+                ws.merge_cells(start_row=banner_row, start_column=cols[0], end_row=banner_row, end_column=cols[-1])
+                ws.cell(banner_row, cols[0], f"{qlbl} {year}").font = bold
+                ws.cell(banner_row, cols[0]).alignment = center
+                for c in cols:
+                    ws.cell(header_row, c).fill = QFILL[qlbl]
+                    ws.cell(banner_row, c).fill = QFILL[qlbl]
 
-def qc_q2a_jobfunc_q4(stg_jf: pd.DataFrame, stg_main: pd.DataFrame) -> pd.DataFrame:
-    if stg_jf.empty or stg_main.empty:
-        return _finalize([])
-    ex: List[Dict] = []
-    main_q4 = stg_main[stg_main["quarter"].astype(str).str.upper().isin(["Q4","QUARTER 4"])].copy()
-    if "Dec" not in main_q4.columns:
-        return _finalize([])
+        # diff & mom banners
+        by_q_diff = {q:[h for h in headers if h.startswith("Diff ") and any(h.endswith(m) for m in Q_TO_MONTHS[q])] for q in ["Q1","Q2","Q3","Q4"]}
+        by_q_mom  = {q:[h for h in headers if h.startswith("MoM ")  and any(h.endswith(m) for m in Q_TO_MONTHS[q])] for q in ["Q1","Q2","Q3","Q4"]}
+        for q in ["Q1","Q2","Q3","Q4"]:
+            cols = _cols_for(by_q_diff[q], col_index)
+            if cols:
+                ws.merge_cells(start_row=banner_row, start_column=cols[0], end_row=banner_row, end_column=cols[-1])
+                ws.cell(banner_row, cols[0], f"{q} – Differences").font = bold
+                ws.cell(banner_row, cols[0]).alignment = center
+                for c in cols:
+                    ws.cell(header_row, c).fill = QFILL[q]
+                    ws.cell(banner_row, c).fill = QFILL[q]
+            cols = _cols_for(by_q_mom[q], col_index)
+            if cols:
+                ws.merge_cells(start_row=banner_row, start_column=cols[0], end_row=banner_row, end_column=cols[-1])
+                ws.cell(banner_row, cols[0], f"{q} – MoM%").font = bold
+                ws.cell(banner_row, cols[0]).alignment = center
+                for c in cols:
+                    ws.cell(header_row, c).fill = QFILL[q]
+                    ws.cell(banner_row, c).fill = QFILL[q]
 
-    jf_q4 = stg_jf[stg_jf["quarter"].astype(str).str.upper().isin(["Q4","QUARTER 4"])].copy()
-    jf_sum = (jf_q4
-        .groupby(["entity_name","year","quarter","subsection","worker_category"], as_index=False)["value"]
-        .sum()
-        .rename(columns={"value":"jf_total"})
-    )
-    key = ["entity_name","year","quarter","subsection","worker_category"]
-    merged = jf_sum.merge(
-        main_q4[key+["Dec"]].rename(columns={"Dec":"dec_main"}),
-        on=key, how="left"
-    )
-    merged["jf_total"] = _num(merged["jf_total"])
-    merged["dec_main"] = _num(merged["dec_main"])
-    bad = merged[np.abs(merged["jf_total"] - merged["dec_main"]) > 0.5]
-    for _, r in bad.iterrows():
-        ex.append({
-            "entity_name": r["entity_name"], "year": r["year"], "quarter": r["quarter"], "where": "Q2A_JobFunc_Q4",
-            "key": f'{r["subsection"]} | {r["worker_category"]}',
-            "check": "Sum(job_function) equals Dec in Q2A Main",
-            "expected": float(r["dec_main"]), "actual": float(r["jf_total"]), "severity": "FAIL"
-        })
-    return _finalize(ex)
+        # quarterly banner
+        q_block = [h for h in headers if h in ["Q1","Q2","Q3","Q4"] or h.startswith("Diff Q") or h.startswith("%Diff Q")]
+        if q_block:
+            cols = _cols_for(q_block, col_index)
+            ws.merge_cells(start_row=banner_row, start_column=cols[0], end_row=banner_row, end_column=cols[-1])
+            ws.cell(banner_row, cols[0], "Quarterly (Sums, Δ, %Δ)").font = bold
+            ws.cell(banner_row, cols[0]).alignment = center
 
-def qc_q2b(stg: pd.DataFrame) -> pd.DataFrame:
-    if stg.empty:
-        return _finalize([])
-    df = stg.copy()
-    ex: List[Dict] = []
+        # YoY banner
+        yoy_headers = [h for h in headers if h.startswith("YoY ")]
+        if yoy_headers:
+            cols = _cols_for(yoy_headers, col_index)
+            ws.merge_cells(start_row=banner_row, start_column=cols[0], end_row=banner_row, end_column=cols[-1])
+            ws.cell(banner_row, cols[0], "YoY vs same quarter last year").font = bold
+            ws.cell(banner_row, cols[0]).alignment = center
+    else:
+        # single-month banner
+        cols = _cols_for(headers[len(dims):], col_index)
+        if cols:
+            ws.merge_cells(start_row=banner_row, start_column=cols[0], end_row=banner_row, end_column=cols[-1])
+            ws.cell(banner_row, cols[0], f"{single_month or 'Month'} {year} + Δ + YoY").font = bold
+            ws.cell(banner_row, cols[0]).alignment = center
 
-    subs = {
-        "A. Salary & Wages": "TOTAL Salary & Wages",
-        "B. Commissions Paid At Least Once a Month (RM)": "TOTAL Commissions Paid At Least Once a Month (RM)"
-    }
-    # Single month column is either Jun or Dec depending on quarter; just use the only month present.
-    mcols = _month_cols_present(df)
-    if not mcols:
-        return _finalize([])
-    m = mcols[0]
+    # Write rows
+    first_data_row = header_row + 1
+    # Ensure needed numeric cols exist
+    if monthly_mode:
+        months = months_up_to_quarter(current_q)
+        for m in months + ["Q1","Q2","Q3","Q4"]:
+            if m not in df.columns:
+                df[m] = 0
+    else:
+        m = single_month or "M"
+        if m not in df.columns:
+            df[m] = 0
 
-    cats = [
-        "Managers","Professional","Technicians & Associate Professionals",
-        "Clerical Occupations","Operative Workers","Elementary Occupations"
-    ]
-    for (ent, yr, q, sub), g in df.groupby(["entity_name","year","quarter","subsection"]):
-        tlabel = subs.get(sub)
-        if not tlabel: 
-            continue
-        trow = g[g["worker_category"]==tlabel]
-        if trow.empty:
-            continue
-        s = _num(g.loc[g["worker_category"].isin(cats), m]).sum()
-        t = _num(trow[m]).sum()
-        if abs(t - s) > 0.5:
-            ex.append({
-                "entity_name": ent, "year": yr, "quarter": q, "where": "Q2B",
-                "key": sub, "check": f"TOTAL equals sum of 6 categories ({m})",
-                "expected": s, "actual": t, "severity": "FAIL"
-            })
-    return _finalize(ex)
+    for _, row in df.iterrows():
+        dims_vals = [
+            row.get("entity_group",""),
+            row.get("institution",""),
+        ]
+        if "question" in df.columns:      dims_vals.append(row.get("question",""))
+        if "subquestion" in df.columns:   dims_vals.append(row.get("subquestion",""))
+        if "worker_category" in df.columns: dims_vals.append(row.get("worker_category",""))
+        if "job_function" in df.columns:  dims_vals.append(row.get("job_function",""))
 
-def qc_q3(stg: pd.DataFrame) -> pd.DataFrame:
-    if stg.empty:
-        return _finalize([])
-    df = stg.copy()
-    ex: List[Dict] = []
-    cats = [
-        "Managers","Professional","Technicians & Associate Professionals",
-        "Clerical Occupations","Operative Workers","Elementary Occupations"
-    ]
-    # Month columns depend on quarter
-    for (ent, yr, q), g in df.groupby(["entity_name","year","quarter"]):
-        m1,m2,m3 = _mcols_for_row(q)
-        if not m1: 
-            continue
-        total_row = g[g["worker_category"]=="TOTAL Hours Worked During the Month, Including Overtime"]
-        if total_row.empty:
-            continue
-        for col in [m1,m2,m3]:
-            s = _num(g.loc[g["worker_category"].isin(cats), col]).sum()
-            t = _num(total_row[col]).sum()
-            if abs(t - s) > 0.5:
-                ex.append({
-                    "entity_name": ent, "year": yr, "quarter": q, "where": "Q3",
-                    "key": col, "check": "TOTAL equals sum of 5 categories",
-                    "expected": s, "actual": t, "severity": "FAIL"
-                })
-    return _finalize(ex)
+        if monthly_mode:
+            months = months_up_to_quarter(current_q)
+            vals = dims_vals + [row.get(m, 0) for m in months] + [""]  # spacer
+            # diffs + mom placeholders
+            # (we don't need to pre-fill exact count; formulas target by header names)
+            # But we keep structure consistent → add a handful of empties; will be overwritten by formulas anyway.
+            vals += [""] * 50
+        else:
+            m = single_month or "M"
+            vals = dims_vals + [row.get(m, 0), "", "", ""]
 
-def qc_q4(stg: pd.DataFrame) -> pd.DataFrame:
-    if stg.empty:
-        return _finalize([])
-    df = stg.copy()
-    ex: List[Dict] = []
-    cats = [
-        "Managers","Professional","Technicians & Associate Professionals",
-        "Clerical Occupations","Operative Workers","Elementary Occupations"
-    ]
-    total_map = {
-        "A. Number of Job Vacancies as at End of the Month": "TOTAL Number of Job Vacancies as at end of the month",
-        "B. Minimum Basic Starting Salaries of Job Vacancies during the month (RM)": "TOTAL Minimum Basic Salaries",
-        "C(i). Number of Job Vacancies Due to New Jobs Created During the Month": "TOTAL Job Vacancies Due to New Jobs Created",
-        "C(ii). Number Job Vacancies Due to Retirements, Resignations and All Reasons, other than New Jobs Created during the Month": "TOTAL Job Vacancies Due to Retirements, Resignations and All Reasons, other than Jobs Created",
-    }
-    for (ent, yr, q, sub), g in df.groupby(["entity_name","year","quarter","subquestion"]):
-        m1,m2,m3 = _mcols_for_row(q)
-        if not m1:
-            continue
-        tlabel = total_map.get(sub)
-        if not tlabel:
-            continue
-        trow = g[g["worker_category"]==tlabel]
-        if trow.empty:
-            continue
-        for col in [m1,m2,m3]:
-            s = _num(g.loc[g["worker_category"].isin(cats), col]).sum()
-            t = _num(trow[col]).sum()
-            if abs(t - s) > 0.5:
-                ex.append({
-                    "entity_name": ent, "year": yr, "quarter": q, "where": "Q4",
-                    "key": f"{sub} | {col}",
-                    "check": "TOTAL equals sum of 6 categories",
-                    "expected": s, "actual": t, "severity": "FAIL"
-                })
-    return _finalize(ex)
+        ws.append(vals)
 
-def qc_q5(stg: pd.DataFrame) -> pd.DataFrame:
-    if stg.empty:
-        return _finalize([])
-    df = stg.copy()
-    ex: List[Dict] = []
+    last_data_row = first_data_row + df.shape[0] - 1
 
-    # Blocks & totals (names as in staging)
-    blocks = {
-        "New Hires and Recalls": "TOTAL New Hires and Recalls",
-        "Separations = A + B + C": "TOTAL Separations",
-        "A. Quits and Resignations (except retirements)": "TOTAL Quits and Resignations (except retirements)",
-        "B. Total Layoffs and Discharges": "TOTAL Layoffs and Discharges",
-        "B. (i) Layoffs and Discharges: of which; VSS/ MSS": "TOTAL Layoffs and Discharges, of which; VSS/ MSS",
-        "C. Other Separations": "TOTAL Other Separations",
-    }
-    cats = [
-        "Managers","Professional","Technicians & Associate Professionals",
-        "Clerical Occupations","Operative Workers","Elementary Occupations"
-    ]
+    # Fill formulas for monthly mode
+    if monthly_mode and df.shape[0] > 0:
+        months = months_up_to_quarter(current_q)
 
-    # 1) Totals equal sum of categories within each block
-    for (ent, yr, q, sub), g in df.groupby(["entity_name","year","quarter","subquestion"]):
-        m1,m2,m3 = _mcols_for_row(q)
-        if not m1:
-            continue
-        tlabel = blocks.get(sub)
-        if not tlabel:
-            continue
-        trow = g[g["worker_category"]==tlabel]
-        if trow.empty:
-            continue
-        for col in [m1,m2,m3]:
-            s = _num(g.loc[g["worker_category"].isin(cats), col]).sum()
-            t = _num(trow[col]).sum()
-            if abs(t - s) > 0.5:
-                ex.append({
-                    "entity_name": ent, "year": yr, "quarter": q, "where": "Q5",
-                    "key": f"{sub} | {col}",
-                    "check": "TOTAL equals sum of 6 categories",
-                    "expected": s, "actual": t, "severity": "FAIL"
-                })
+        # Build a fast index of header positions
+        col_index = {ws.cell(header_row, c).value: c for c in range(1, ws.max_column+1) if ws.cell(header_row, c).value}
 
-    # 2) Separations identity: Separations = A + B + C (month-wise) per worker category
-    # Build a pivot for fast lookups
-    piv = (df.pivot_table(
-        index=["entity_name","year","quarter","worker_category"],
-        columns="subquestion",
-        values=_month_cols_present(df),
-        aggfunc="sum",
-        fill_value=0.0,
-    ))
-    # Flatten columns: (month, subquestion) → separate frames by month
-    months_all = set(c for c in _month_cols_present(df) if c != "M")
-    for ent, yr, q, wc in piv.index:
-        m1,m2,m3 = _mcols_for_row(q)
-        for col in [m1,m2,m3]:
-            if col is None: 
+        # quarter sums (reassert for safety)
+        def qaddr(r, q): return ws.cell(r, col_index[q]).coordinate
+        def maddr(r, m): return ws.cell(r, col_index[m]).coordinate
+        if all(m in col_index for m in ["Jan","Feb","Mar"]) and "Q1" in col_index:
+            for r in range(first_data_row, last_data_row+1):
+                ws.cell(r, col_index["Q1"]).value = f"=SUM({maddr(r,'Jan')}:{maddr(r,'Mar')})"
+        if all(m in col_index for m in ["Apr","May","Jun"]) and "Q2" in col_index:
+            for r in range(first_data_row, last_data_row+1):
+                ws.cell(r, col_index["Q2"]).value = f"=SUM({maddr(r,'Apr')}:{maddr(r,'Jun')})"
+        if all(m in col_index for m in ["Jul","Aug","Sep"]) and "Q3" in col_index:
+            for r in range(first_data_row, last_data_row+1):
+                ws.cell(r, col_index["Q3"]).value = f"=SUM({maddr(r,'Jul')}:{maddr(r,'Sep')})"
+        if all(m in col_index for m in ["Oct","Nov","Dec"]) and "Q4" in col_index:
+            for r in range(first_data_row, last_data_row+1):
+                ws.cell(r, col_index["Q4"]).value = f"=SUM({maddr(r,'Oct')}:{maddr(r,'Dec')})"
+
+        # Monthly Diff & MoM%
+        for r in range(first_data_row, last_data_row + 1):
+            for m in months:
+                i = MONTHS_FULL.index(m)
+                prev = MONTHS_FULL[i-1] if i > 0 else None
+                if not prev or prev not in months or f"Diff {m}" not in col_index or f"MoM {m}" not in col_index:
+                    continue
+                ws.cell(r, col_index[f"Diff {m}"]).value = f"={maddr(r,m)}-{maddr(r,prev)}"
+                ws.cell(r, col_index[f"MoM {m}"]).value = (
+                    f"=IF(AND({maddr(r,m)}=0,{maddr(r,prev)}=0),0,"
+                    f"IF(AND({maddr(r,m)}<>0,{maddr(r,prev)}=0),\"N/A\","
+                    f"({maddr(r,m)}-{maddr(r,prev)})/{maddr(r,prev)}))"
+                )
+
+        # QoQ diff & %Diff
+        q_sums = ["Q1","Q2","Q3","Q4"]
+        for r in range(first_data_row, last_data_row + 1):
+            for i, q in enumerate(q_sums):
+                if q not in col_index: continue
+                if i == 0: continue
+                prev_q = q_sums[i-1]
+                if prev_q not in col_index: continue
+                if f"Diff {q}" in col_index:
+                    ws.cell(r, col_index[f"Diff {q}"]).value = f"={qaddr(r,q)}-{qaddr(r,prev_q)}"
+                if f"%Diff {q}" in col_index:
+                    ws.cell(r, col_index[f"%Diff {q}"]).value = (
+                        f"=IF(AND({qaddr(r,q)}=0,{qaddr(r,prev_q)}=0),0,"
+                        f"IF(AND({qaddr(r,q)}<>0,{qaddr(r,prev_q)}=0),\"N/A\","
+                        f"({qaddr(r,q)}-{qaddr(r,prev_q)})/{qaddr(r,prev_q)}))"
+                    )
+
+        # YoY & Prior (INDEX/MATCH on hidden sheet)
+        if prior_df is not None and not prior_df.empty:
+            # Build a hidden prior sheet with KEY + Q1..Q4
+            prior_sheet = f"_{ws_title}_PRIOR"
+            if prior_sheet in [s.title for s in wb.worksheets]:
+                del wb[prior_sheet]
+            ws_prior = wb.create_sheet(prior_sheet)
+
+            # columns: KEY | Q1..Q4 present
+            # KEY = entity_group|institution|question|subquestion|worker_category|job_function
+            dim_keys = ["entity_group","institution","question","subquestion","worker_category","job_function"]
+            for d in dim_keys:
+                if d not in prior_df.columns:
+                    prior_df[d] = ""
+            for q in ["Q1","Q2","Q3","Q4"]:
+                if q not in prior_df.columns:
+                    prior_df[q] = 0
+
+            ws_prior.cell(1,1,"KEY").font = Font(bold=True)
+            for j, q in enumerate(["Q1","Q2","Q3","Q4"], start=2):
+                ws_prior.cell(1,j,q).font = Font(bold=True)
+
+            for i, row in prior_df.iterrows():
+                key = "|".join(str(row.get(k,"") or "") for k in dim_keys)
+                ws_prior.cell(i+2, 1, key)
+                ws_prior.cell(i+2, 2, row.get("Q1",0))
+                ws_prior.cell(i+2, 3, row.get("Q2",0))
+                ws_prior.cell(i+2, 4, row.get("Q3",0))
+                ws_prior.cell(i+2, 5, row.get("Q4",0))
+            ws_prior.sheet_state = "hidden"
+
+            # Ensure hidden _KEY column exists on current sheet
+            if "_KEY" not in [ws.cell(header_row, c).value for c in range(1, ws.max_column+1)]:
+                key_col_idx = ws.max_column + 1
+                ws.cell(header_row, key_col_idx, "_KEY").font = bold
+                for r in range(first_data_row, last_data_row + 1):
+                    parts = []
+                    # match the display dims order we wrote:
+                    # dims: entity_group, institution, question?, subquestion?, worker_category?, job_function?
+                    dim_headers = ["Entity / Group","Institution","Question","Subquestion","Worker Category","Job Function"]
+                    for i2, h in enumerate(dim_headers, start=1):
+                        # find col if present
+                        found = None
+                        for c in range(1, ws.max_column+1):
+                            if ws.cell(header_row, c).value == h:
+                                found = c; break
+                        if found:
+                            parts.append(f"{ws.cell(r, found).coordinate}")
+                        else:
+                            parts.append('""')
+                    ws.cell(r, key_col_idx).value = f'={ "&" .join([f"{p}&\"|\"" for p in parts[:-1]]) }{parts[-1]}'
+                # hide header col
+                ws.column_dimensions[ws.cell(header_row, key_col_idx).column_letter].hidden = True
+
+            # Fill PRIOR / YoY for Q1..Q4
+            # find col of _KEY
+            key_col = None
+            for c in range(1, ws.max_column+1):
+                if ws.cell(header_row, c).value == "_KEY":
+                    key_col = c; break
+
+            if key_col:
+                A_col = "A"
+                for q in ["Q1","Q2","Q3","Q4"]:
+                    yoy_hdr = f"YoY {q}"
+                    prior_hdr = f"Prior {q}"
+                    if q not in col_index or yoy_hdr not in col_index or prior_hdr not in col_index:
+                        continue
+                    curr_col = col_index[q]
+                    yoy_col  = col_index[yoy_hdr]
+                    prior_col= col_index[prior_hdr]
+                    # prior column letter on prior sheet: Q1->B, Q2->C, ...
+                    prior_letter = {"Q1":"B","Q2":"C","Q3":"D","Q4":"E"}[q]
+                    prior_range = f"{prior_sheet}!${prior_letter}:${prior_letter}"
+                    key_range   = f"{prior_sheet}!${A_col}:${A_col}"
+                    for r in range(first_data_row, last_data_row+1):
+                        key_addr = ws.cell(r, key_col).coordinate
+                        curr_addr= ws.cell(r, curr_col).coordinate
+                        prior_expr = f"INDEX({prior_range},MATCH({key_addr},{key_range},0))"
+                        ws.cell(r, prior_col).value = f"=IFERROR({prior_expr},\"\")"
+                        ws.cell(r, yoy_col).value = (
+                            f'=IFERROR('
+                            f'IF({prior_expr}="","N/A",'
+                            f'IF(AND({prior_expr}=0,{curr_addr}=0),0,'
+                            f'IF(AND({prior_expr}=0,{curr_addr}>0),"N/A",'
+                            f'({curr_addr}-{prior_expr})/{prior_expr}))),'
+                            f'"N/A")'
+                        )
+                # formats
+                for h, c in col_index.items():
+                    if h.startswith("YoY "):
+                        for r in range(first_data_row, last_data_row + 1):
+                            ws.cell(r, c).number_format = "0.0%"
+                    if h.startswith("Prior "):
+                        for r in range(first_data_row, last_data_row + 1):
+                            ws.cell(r, c).number_format = "#,##0"
+
+    # single-month formulas
+    if (not monthly_mode) and df.shape[0] > 0:
+        col_index = {ws.cell(header_row, c).value: c for c in range(1, ws.max_column+1) if ws.cell(header_row, c).value}
+        m = single_month or "M"
+        if m in col_index:
+            mcol = col_index[m]
+            dcol = col_index.get(f"Diff {m}")
+            ycol = col_index.get(f"YoY {m}")
+            pcol = col_index.get(f"Prior {m}")
+            # Diff vs previous row's same institution? (There is no previous month → we leave Diff as blank)
+            # We'll just keep "Diff m" empty in single-month mode.
+            # YoY via prior sheet if provided
+            if prior_df is not None and not prior_df.empty and ycol and pcol:
+                # build prior helper (single month stored in quarter sums; use Q2 or Q4? We'll store the month value in M)
+                prior_sheet = f"_{ws_title}_PRIOR"
+                if prior_sheet in [s.title for s in wb.worksheets]:
+                    del wb[prior_sheet]
+                ws_prior = wb.create_sheet(prior_sheet)
+
+                dim_keys = ["entity_group","institution","question","subquestion","worker_category"]
+                for d in dim_keys:
+                    if d not in prior_df.columns: prior_df[d] = ""
+                if m not in prior_df.columns: prior_df[m] = 0
+
+                ws_prior.cell(1,1,"KEY").font = Font(bold=True)
+                ws_prior.cell(1,2,m).font = Font(bold=True)
+                for i, row in prior_df.iterrows():
+                    key = "|".join(str(row.get(k,"") or "") for k in dim_keys)
+                    ws_prior.cell(i+2, 1, key)
+                    ws_prior.cell(i+2, 2, row.get(m,0))
+                ws_prior.sheet_state = "hidden"
+
+                # ensure _KEY exists
+                if "_KEY" not in [ws.cell(header_row, c).value for c in range(1, ws.max_column+1)]:
+                    key_col_idx = ws.max_column + 1
+                    ws.cell(header_row, key_col_idx, "_KEY").font = bold
+                    dim_headers = ["Entity / Group","Institution","Question","Subquestion","Worker Category"]
+                    for r in range(first_data_row, last_data_row + 1):
+                        parts = []
+                        for h in dim_headers:
+                            found = None
+                            for c in range(1, ws.max_column+1):
+                                if ws.cell(header_row, c).value == h:
+                                    found = c; break
+                            parts.append(ws.cell(r, found).coordinate if found else '""')
+                        ws.cell(r, key_col_idx).value = f'={ "&" .join([f"{p}&\"|\"" for p in parts[:-1]]) }{parts[-1]}'
+                    ws.column_dimensions[ws.cell(header_row, key_col_idx).column_letter].hidden = True
+
+                # fill prior & yoy
+                # find _KEY col
+                key_col = None
+                for c in range(1, ws.max_column+1):
+                    if ws.cell(header_row, c).value == "_KEY":
+                        key_col = c; break
+                if key_col:
+                    prior_range = f"{prior_sheet}!$B:$B"
+                    key_range   = f"{prior_sheet}!$A:$A"
+                    for r in range(first_data_row, last_data_row + 1):
+                        key_addr = ws.cell(r, key_col).coordinate
+                        curr_addr= ws.cell(r, mcol).coordinate
+                        prior_expr = f"INDEX({prior_range},MATCH({key_addr},{key_range},0))"
+                        ws.cell(r, pcol).value = f"=IFERROR({prior_expr},\"\")"
+                        ws.cell(r, ycol).value = (
+                            f'=IFERROR('
+                            f'IF({prior_expr}="","N/A",'
+                            f'IF(AND({prior_expr}=0,{curr_addr}=0),0,'
+                            f'IF(AND({prior_expr}=0,{curr_addr}>0),"N/A",'
+                            f'({curr_addr}-{prior_expr})/{prior_expr}))),'
+                            f'"N/A")'
+                        )
+                # format
+                for r in range(first_data_row, last_data_row + 1):
+                    ws.cell(r, ycol).number_format = "0.0%"
+                    ws.cell(r, pcol).number_format = "#,##0"
+
+    # Styling: bold rollups & TOTAL rows
+    rollup_names = set(ROLLUP_ORDER_DEFAULT + list(ROLLUPS_PRESETS.keys()))
+    for r in range(first_data_row, last_data_row + 1):
+        if ws.cell(r, 1).value in rollup_names:
+            ws.cell(r, 1).font = Font(bold=True)
+        # TOTAL row hint (worker category = TOTAL...)
+        # apply subtle fill
+        # find wc col
+        wc_col = None
+        for c in range(1, ws.max_column+1):
+            if ws.cell(header_row, c).value == "Worker Category":
+                wc_col = c; break
+        if wc_col:
+            if str(ws.cell(r, wc_col).value or "").upper().startswith("TOTAL"):
+                for c in range(1, ws.max_column+1):
+                    ws.cell(r, c).font = Font(bold=True)
+                    ws.cell(r, c).fill = FILL_TOTAL_ROW
+
+    # Freeze & filter & table
+    if df.shape[0] > 0:
+        first_metric_col = len(dims) + 1
+        ws.freeze_panes = ws.cell(first_data_row, first_metric_col)
+        ws.auto_filter.ref = f"A{header_row}:{ws.cell(last_data_row, ws.max_column).coordinate}"
+        table_ref = f"A{header_row}:{ws.cell(last_data_row, ws.max_column).coordinate}"
+        table = Table(displayName=ws.title.replace(" ","_"), ref=table_ref)
+        table.tableStyleInfo = TableStyleInfo(name="TableStyleLight9", showRowStripes=True, showColumnStripes=False)
+        ws.add_table(table)
+
+    # Subtotal row
+    if df.shape[0] > 0:
+        totals_row = last_data_row + 2
+        ws.cell(totals_row, 1, "TOTALS (visible rows)").font = Font(bold=True)
+        for c in range(len(dims)+1, ws.max_column+1):
+            ws.cell(totals_row, c).value = f"=SUBTOTAL(9,{ws.cell(first_data_row,c).coordinate}:{ws.cell(last_data_row,c).coordinate})"
+            ws.cell(totals_row, c).font = Font(bold=True)
+
+    # Data bars on months (monthly mode)
+    if monthly_mode and df.shape[0] > 0:
+        months = months_up_to_quarter(current_q)
+        col_index = {ws.cell(header_row, c).value: c for c in range(1, ws.max_column+1) if ws.cell(header_row, c).value}
+        mn = [col_index[m] for m in months if m in col_index]
+        if mn:
+            m0, mN = min(mn), max(mn)
+            ws.conditional_formatting.add(
+                f"{ws.cell(first_data_row, m0).coordinate}:{ws.cell(last_data_row, mN).coordinate}",
+                DataBarRule(start_type='min', end_type='max', color="63BE7B")
+            )
+
+    # MoM & QoQ highlight rules
+    if monthly_mode and df.shape[0] > 0:
+        col_index = {ws.cell(header_row, c).value: c for c in range(1, ws.max_column+1) if ws.cell(header_row, c).value}
+        # MoM
+        for h, cidx in col_index.items():
+            if not h.startswith("MoM "):
                 continue
-            try:
-                sep = piv.loc[(ent,yr,q,wc)][col]["Separations = A + B + C"]
-                a   = piv.loc[(ent,yr,q,wc)][col]["A. Quits and Resignations (except retirements)"]
-                b   = piv.loc[(ent,yr,q,wc)][col]["B. Total Layoffs and Discharges"]
-                c   = piv.loc[(ent,yr,q,wc)][col]["C. Other Separations"]
-            except KeyError:
-                continue
-            if abs(sep - (a+b+c)) > 0.5:
-                ex.append({
-                    "entity_name": ent, "year": yr, "quarter": q, "where": "Q5",
-                    "key": f"{wc} | {col}",
-                    "check": "Separations = A + B + C",
-                    "expected": float(a+b+c), "actual": float(sep), "severity": "FAIL"
-                })
-    return _finalize(ex)
+            # find related diff
+            m = h.replace("MoM ","",1)
+            diff_h = f"Diff {m}"
+            if diff_h not in col_index: continue
+            pct_col_letter  = ws.cell(1, cidx).column_letter
+            diff_col_letter = ws.cell(1, col_index[diff_h]).column_letter
+            rng = f"{pct_col_letter}{first_data_row}:{pct_col_letter}{last_data_row}"
+            red_formula = (
+                f"=AND(ISNUMBER({pct_col_letter}{first_data_row}),"
+                f"ABS({pct_col_letter}{first_data_row})>={mom_pct_threshold},"
+                f"ABS({diff_col_letter}{first_data_row})>={abs_cutoff})"
+            )
+            y_formula = (
+                f"=AND(ISNUMBER({pct_col_letter}{first_data_row}),"
+                f"ABS({pct_col_letter}{first_data_row})>={mom_pct_threshold},"
+                f"ABS({diff_col_letter}{first_data_row})<{abs_cutoff})"
+            )
+            ws.conditional_formatting.add(rng, FormulaRule(formula=[red_formula], fill=FILL_RED))
+            ws.conditional_formatting.add(rng, FormulaRule(formula=[y_formula], fill=FILL_YELLOW))
+        # QoQ
+        for h, cidx in col_index.items():
+            if not h.startswith("%Diff "): continue
+            qlbl = h.replace("%Diff ","",1)
+            diff_h = f"Diff {qlbl}"
+            if diff_h not in col_index: continue
+            pct_col_letter  = ws.cell(1, cidx).column_letter
+            diff_col_letter = ws.cell(1, col_index[diff_h]).column_letter
+            rng = f"{pct_col_letter}{first_data_row}:{pct_col_letter}{last_data_row}"
+            red_formula = (
+                f"=AND(ISNUMBER({pct_col_letter}{first_data_row}),"
+                f"ABS({pct_col_letter}{first_data_row})>={qoq_pct_threshold},"
+                f"ABS({diff_col_letter}{first_data_row})>={abs_cutoff})"
+            )
+            y_formula = (
+                f"=AND(ISNUMBER({pct_col_letter}{first_data_row}),"
+                f"ABS({pct_col_letter}{first_data_row})>={qoq_pct_threshold},"
+                f"ABS({diff_col_letter}{first_data_row})<{abs_cutoff})"
+            )
+            ws.conditional_formatting.add(rng, FormulaRule(formula=[red_formula], fill=FILL_RED))
+            ws.conditional_formatting.add(rng, FormulaRule(formula=[y_formula], fill=FILL_YELLOW))
 
-# Main -----------------------------------------------------------------------
 
+# ----------------------------
+# Build QC workbook
+# ----------------------------
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Build QC template (exceptions) for Q1–Q5 from staging_all.xlsx")
+    ap = argparse.ArgumentParser(description="Build QC workbook for Q1–Q5 from unified staging (fast).")
     ap.add_argument("--stage", required=True, help="Path to staging_all.xlsx")
-    ap.add_argument("--out", required=True, help="Output QC workbook (.xlsx)")
+    ap.add_argument("--out",   required=True, help="Output QC workbook (.xlsx)")
+    ap.add_argument("--year",  type=int, default=None, help="Target year (default: mode of staging year)")
+    ap.add_argument("--prior-stage", type=str, default=None, help="Optional prior-year staging_all.xlsx for YoY")
+    ap.add_argument("--fi-map", type=str, default=None, help="Optional CSV: columns entity_name,fi_group")
+    ap.add_argument("--mom-threshold", type=float, default=0.25)
+    ap.add_argument("--abs-cutoff",    type=float, default=50)
+    ap.add_argument("--qoq-threshold", type=float, default=0.25)
     args = ap.parse_args()
 
     stage_path = Path(args.stage)
     if not stage_path.exists():
-        print(f"[ERROR] staging file not found: {stage_path}")
+        print(f"[ERROR] Stage not found: {stage_path}")
         return 2
 
-    with pd.ExcelFile(stage_path) as xf:
-        def rd(name: str) -> pd.DataFrame:
-            return xf.parse(name) if name in xf.sheet_names else pd.DataFrame()
+    sheets = load_stage_excel(stage_path)
+    # pick year & current_q from any available sheet with columns
+    any_df = None
+    for nm in ["Q5","Q4","Q3","Q2A_Main","Q1A_Main","Q2B","Q1B"]:
+        if nm in sheets and not sheets[nm].empty:
+            any_df = sheets[nm]; break
+    if any_df is None:
+        print("[ERROR] No usable sheets in stage file.")
+        return 1
 
-        q1a_main  = rd("Q1A_Main")
-        q1a_jf_q4 = rd("Q1A_JobFunc_Q4")
-        q1b       = rd("Q1B")
+    year = int(args.year) if args.year is not None else int(pd.Series(any_df["year"]).mode().iat[0])
+    current_q = pick_current_quarter_from_staging(any_df)
 
-        q2a_main  = rd("Q2A_Main")
-        q2a_jf_q4 = rd("Q2A_JobFunc_Q4")
-        q2b       = rd("Q2B")
+    # FI groups mapping (optional)
+    fi_groups = {}
+    if args.fi_map:
+        fi_map = pd.read_csv(args.fi_map)
+        fi_groups = build_fi_groups(fi_map)
 
-        q3        = rd("Q3")
-        q4        = rd("Q4")
-        q5        = rd("Q5")
+    # Prepare prior-stage pivots if provided
+    prior_sheets = {}
+    if args.prior_stage:
+        prior_sheets = load_stage_excel(Path(args.prior_stage))
 
-    # Build QC sheets
-    qc_tabs: Dict[str, pd.DataFrame] = {
-        "Q1A_Main_QC":       qc_q1a_main(q1a_main),
-        "Q1A_JobFunc_Q4_QC": qc_q1a_jobfunc_q4(q1a_jf_q4, q1a_main),
-        "Q1B_QC":            qc_q1b(q1b),
+    wb = Workbook()
+    # remove default
+    wb.remove(wb.active)
 
-        "Q2A_Main_QC":       qc_q2a_main(q2a_main),
-        "Q2A_JobFunc_Q4_QC": qc_q2a_jobfunc_q4(q2a_jf_q4, q2a_main),
-        "Q2B_QC":            qc_q2b(q2b),
+    # Helper to convert staging -> rollups -> pivot -> prior pivot
+    def make_monthly_qc(stage_df: pd.DataFrame, title: str):
+        if stage_df is None or stage_df.empty:
+            return
+        big = add_rollups(stage_df.rename(columns=str), fi_groups)
+        piv = pivot_monthly(big, year=year, current_q=current_q)
+        prior_piv = None
+        if args.prior_stage and title in ["QC_Q1A","QC_Q2A","QC_Q3","QC_Q4","QC_Q5"]:
+            prior_df = None
+            if title == "QC_Q1A" and "Q1A_Main" in prior_sheets: prior_df = add_rollups(prior_sheets["Q1A_Main"], fi_groups)
+            if title == "QC_Q2A" and "Q2A_Main" in prior_sheets: prior_df = add_rollups(prior_sheets["Q2A_Main"], fi_groups)
+            if title == "QC_Q3"  and "Q3" in prior_sheets:       prior_df = add_rollups(prior_sheets["Q3"], fi_groups)
+            if title == "QC_Q4"  and "Q4" in prior_sheets:       prior_df = add_rollups(prior_sheets["Q4"], fi_groups)
+            if title == "QC_Q5"  and "Q5" in prior_sheets:       prior_df = add_rollups(prior_sheets["Q5"], fi_groups)
+            if prior_df is not None and not prior_df.empty:
+                prior_piv = pivot_monthly(prior_df, year=year-1, current_q=current_q)
+        write_qc_sheet(
+            wb, title, piv, year, current_q,
+            monthly_mode=True, prior_df=prior_piv,
+            mom_pct_threshold=args.mom_threshold,
+            abs_cutoff=args.abs_cutoff,
+            qoq_pct_threshold=args.qoq_threshold,
+        )
 
-        "Q3_QC":             qc_q3(q3),
-        "Q4_QC":             qc_q4(q4),
-        "Q5_QC":             qc_q5(q5),
-    }
+    def make_single_month_qc(stage_df: pd.DataFrame, title: str, month: str):
+        if stage_df is None or stage_df.empty:
+            return
+        big = add_rollups(stage_df.rename(columns=str), fi_groups)
+        piv = pivot_single_month(big, year=year, month_name=month)
+        prior_piv = None
+        if args.prior_stage:
+            prior_df = None
+            if title == "QC_Q1B" and "Q1B" in prior_sheets: prior_df = add_rollups(prior_sheets["Q1B"], fi_groups)
+            if title == "QC_Q2B" and "Q2B" in prior_sheets: prior_df = add_rollups(prior_sheets["Q2B"], fi_groups)
+            if prior_df is not None and not prior_df.empty:
+                prior_piv = pivot_single_month(prior_df, year=year-1, month_name=month)
+        write_qc_sheet(
+            wb, title, piv, year, current_q,
+            monthly_mode=False, single_month=month, prior_df=prior_piv,
+            mom_pct_threshold=args.mom_threshold,
+            abs_cutoff=args.abs_cutoff,
+            qoq_pct_threshold=args.qoq_threshold,
+        )
 
-    # Summary sheet (all exceptions stacked)
-    all_ex = []
-    for name, df in qc_tabs.items():
-        if not df.empty:
-            tmp = df.copy()
-            tmp.insert(0, "sheet", name)
-            all_ex.append(tmp)
-    summary = (pd.concat(all_ex, ignore_index=True)
-               if all_ex else pd.DataFrame(columns=["sheet","entity_name","year","quarter","where","key","check","expected","actual","severity"]))
+    # Build each QC tab if its staging exists
+    # Q1A main
+    if "Q1A_Main" in sheets:
+        make_monthly_qc(sheets["Q1A_Main"], "QC_Q1A")
+    # Q1A job func (Q4 only) — monthly layout still fine; uses 'value' not months → we treat as monthly_mode with only quarter sums = value passthrough (MoM skipped)
+    if "Q1A_JobFunc_Q4" in sheets and not sheets["Q1A_JobFunc_Q4"].empty:
+        # transform value column to a pseudo month (Dec) so it renders; Q4 only context
+        jf = sheets["Q1A_JobFunc_Q4"].copy()
+        jf["Dec"] = jf["value"]
+        jf = jf.drop(columns=[c for c in jf.columns if c not in ["entity_name","year","quarter","subquestion","worker_category","job_function","Dec"]])
+        make_monthly_qc(jf, "QC_Q1A_JF_Q4")
+    # Q1B (single month: Jun for Q2, Dec for Q4 — but in staging Q1B has Jun & Dec columns)
+    if "Q1B" in sheets:
+        # choose by current_q which month to show
+        month = "Jun" if current_q == "Q2" else ("Dec" if current_q == "Q4" else "Jun")
+        # ensure single month present
+        df1b = sheets["Q1B"].copy()
+        keep = ["entity_name","year","quarter","subquestion","worker_category"]
+        if month not in df1b.columns:
+            df1b[month] = 0
+        df1b = df1b[keep + [month]]
+        make_single_month_qc(df1b, "QC_Q1B", month)
+
+    # Q2A main
+    if "Q2A_Main" in sheets:
+        make_monthly_qc(sheets["Q2A_Main"].rename(columns={"subsection":"subquestion"}), "QC_Q2A")
+    # Q2A job func
+    if "Q2A_JobFunc_Q4" in sheets and not sheets["Q2A_JobFunc_Q4"].empty:
+        jf2 = sheets["Q2A_JobFunc_Q4"].rename(columns={"subsection":"subquestion"}).copy()
+        jf2["Dec"] = jf2["value"]
+        jf2 = jf2.drop(columns=[c for c in jf2.columns if c not in ["entity_name","year","quarter","subquestion","worker_category","job_function","Dec"]])
+        make_monthly_qc(jf2, "QC_Q2A_JF_Q4")
+    # Q2B (single month Jun or Dec)
+    if "Q2B" in sheets:
+        month = "Jun" if current_q == "Q2" else ("Dec" if current_q == "Q4" else "Jun")
+        df2b = sheets["Q2B"].rename(columns={"subsection":"subquestion"})
+        keep = ["entity_name","year","quarter","subquestion","worker_category"]
+        if month not in df2b.columns:
+            df2b[month] = 0
+        df2b = df2b[keep + [month]]
+        make_single_month_qc(df2b, "QC_Q2B", month)
+
+    # Q3
+    if "Q3" in sheets:
+        make_monthly_qc(sheets["Q3"], "QC_Q3")
+
+    # Q4
+    if "Q4" in sheets:
+        make_monthly_qc(sheets["Q4"], "QC_Q4")
+
+    # Q5
+    if "Q5" in sheets:
+        make_monthly_qc(sheets["Q5"], "QC_Q5")
+
+    # About
+    about = wb.create_sheet("About")
+    about["A1"] = "RLMS – QC Workbook (All Questions)"
+    about["A2"] = "Year";          about["B2"] = year
+    about["A3"] = "Up to Quarter"; about["B3"] = current_q
+    about["A4"] = "Generated at";  about["B4"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
-        summary.to_excel(xw, index=False, sheet_name="Summary")
-        for name, df in qc_tabs.items():
-            df.to_excel(xw, index=False, sheet_name=name)
-
-    print(f"[DONE] QC workbook → {out_path}")
+    wb.save(str(out_path))
+    print(f"[DONE] Wrote QC workbook → {out_path}")
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
