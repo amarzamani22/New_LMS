@@ -335,3 +335,46 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
+def extract_q1b(ws, entity: str, year: int, qlbl: str) -> pd.DataFrame:
+    # Q1B appears in Q2 and Q4 (Islamic Ops). Only capture the end-month (Jun for Q2, Dec for Q4).
+    qn = (qlbl or "").strip().lower()
+    if qn not in ("q2", "quarter 2", "q4", "quarter 4"):
+        return pd.DataFrame()
+
+    # Decide which month to keep
+    month = "Jun" if qn in ("q2", "quarter 2") else "Dec"
+
+    out: List[Dict] = []
+    nonzero_seen = False
+
+    for subq, row_range in Q1B_BLOCKS:
+        for r in row_range:
+            wc_label = _norm(ws[f"A{r}"].value)
+            val = read_number(ws, f"C{r}")  # always column C
+            if val:
+                nonzero_seen = True
+            out.append({
+                "entity_name": entity,
+                "year": year,
+                "quarter": qlbl,
+                "subquestion": subq,
+                "worker_category": wc_label,
+                month: val,
+            })
+
+    df = pd.DataFrame(out)
+    if df.empty:
+        return df
+
+    # If ALL rows are zeros for this file, skip
+    if not nonzero_seen:
+        return pd.DataFrame()
+
+    df = df.sort_values(
+        ["entity_name","year","quarter","subquestion","worker_category", month],
+        kind="mergesort"
+    ).reset_index(drop=True)
+    return df
