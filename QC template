@@ -1,15 +1,31 @@
-# qc_fast_embedded.py
+# qc_build.py
 from __future__ import annotations
-import argparse
+import argparse, json, os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
 import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.worksheet.table import Table, TableStyleInfo
+from openpyxl.formatting.rule import DataBarRule, FormulaRule
+from datetime import datetime
 
-# ----------------- CONSTANTS -----------------
-MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
-QMAP   = {"Q1":["Jan","Feb","Mar"], "Q2":["Apr","May","Jun"], "Q3":["Jul","Aug","Sep"], "Q4":["Oct","Nov","Dec"]}
+# =============== Config: Months & Colors ===============
+MONTHS_FULL = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+Q_TO_MONTHS = {"Q1":["Jan","Feb","Mar"], "Q2":["Apr","May","Jun"], "Q3":["Jul","Aug","Sep"], "Q4":["Oct","Nov","Dec"]}
 
-# ----------------- ROLLUPS (as provided) -----------------
+FILL_Q1 = PatternFill(start_color="E8F3FF", end_color="E8F3FF", fill_type="solid")  # blue
+FILL_Q2 = PatternFill(start_color="E8F8E8", end_color="E8F8E8", fill_type="solid")  # green
+FILL_Q3 = PatternFill(start_color="FFF3E0", end_color="FFF3E0", fill_type="solid")  # orange
+FILL_Q4 = PatternFill(start_color="F3E5F5", end_color="F3E5F5", fill_type="solid")  # purple
+FILL_RAW = PatternFill(start_color="E6EEF7", end_color="E6EEF7", fill_type="solid")
+FILL_TOTAL_ROW = PatternFill(start_color="F7F7F7", end_color="F7F7F7", fill_type="solid")
+FILL_RED = PatternFill(start_color="FFE5E5", end_color="FFE5E5", fill_type="solid")
+FILL_YELLOW = PatternFill(start_color="FFF7CC", end_color="FFF7CC", fill_type="solid")
+QFILL = {"Q1": FILL_Q1, "Q2": FILL_Q2, "Q3": FILL_Q3, "Q4": FILL_Q4}
+
+# =============== Your ROLLUPS & Order ===============
 ROLLUPS: Dict[str, List[str]] = {
     "All Financial Institutions": [
         "Commercial Banks", "Investment Banks", "Islamic Banks", "DFI",
@@ -30,513 +46,777 @@ ROLLUPS: Dict[str, List[str]] = {
     "Insurers": ["Insurers"],
     "Takaful Operators": ["Takaful Operators"],
 }
-
 ROLLUP_ORDER = [
-    "All Financial Institutions",
-    "Banking Institutions",
-    "Commercial Banks",
-    "Investment Banks",
-    "Islamic Banks",
-    "Foreign Banks",
-    "Digital Banks",
-    "International Islamic Banks",
-    "DFI",
-    "Insurers",
-    "Takaful Operators",
+    "All Financial Institutions","Banking Institutions","Commercial Banks","Investment Banks",
+    "Islamic Banks","Foreign Banks","Digital Banks","International Islamic Banks","DFI","Insurers","Takaful Operators",
 ]
 
-# ----------------- FULL EMBEDDED MAPPING -----------------
+# =============== Embedded FI → Type mapping (from your list) ===============
 ENTITY_TO_TYPE: Dict[str, str] = {
-    # Banks / DFIs / Digital / Foreign / IIB
-    "AFFIN BANK BERHAD": "Commercial Banks",
-    "AFFIN HWANG INVESTMENT BANK BERHAD": "Investment Banks",
-    "AFFIN ISLAMIC BANK BERHAD": "Islamic Banks",
-    "AGROBANK (BANK PERTANIAN MALAYSIA BERHAD)": "DFI",
-    "AL RAJHI BANKING & INVESTMENT CORPORATION (MALAYSIA) BHD": "Islamic Banks",
-    "ALKHAIR INTERNATIONAL ISLAMIC BANK BHD": "International Islamic Banks",
-    "ALLIANCE BANK MALAYSIA BERHAD": "Commercial Banks",
-    "ALLIANCE INVESTMENT BANK BERHAD": "Investment Banks",
-    "ALLIANCE ISLAMIC BANK BERHAD": "Islamic Banks",
-    "AMBANK (M) BERHAD": "Commercial Banks",
-    "AMBANK ISLAMIC BERHAD": "Islamic Banks",
-    "AMINVESTMENT BANK BERHAD": "Investment Banks",
-    "MBSB BANK BERHAD": "Islamic Banks",
-    "BANGKOK BANK BERHAD": "Foreign Banks",
-    "BANK ISLAM MALAYSIA BERHAD": "Islamic Banks",
-    "BANK KERJASAMA RAKYAT MALAYSIA BERHAD": "Islamic Banks",
-    "BANK MUAMALAT MALAYSIA BERHAD": "Islamic Banks",
-    "BANK OF AMERICA MALAYSIA BERHAD": "Foreign Banks",
-    "BANK OF CHINA (MALAYSIA) BERHAD": "Foreign Banks",
-    "BANK OF TOKYO-MITSUBISHI UFJ (MALAYSIA) BERHAD": "Foreign Banks",
-    "BANK PEMBANGUNAN MALAYSIA BERHAD": "DFI",
-    "BANK SIMPANAN NASIONAL": "DFI",
-    "BNP PARIBAS MALAYSIA BERHAD": "Foreign Banks",
-    "CHINA CONSTRUCTION BANK MALAYSIA BERHAD": "Foreign Banks",
-    "CIMB BANK BERHAD": "Commercial Banks",
-    "CIMB INVESTMENT BANK BERHAD": "Investment Banks",
-    "CIMB ISLAMIC BANK BERHAD": "Islamic Banks",
-    "CITIBANK BERHAD": "Foreign Banks",
-    "DEUTSCHE BANK (MALAYSIA) BERHAD": "Foreign Banks",
-    "DEUTSCHE BANK AG, INTERNATIONAL ISLAMIC BANKING, MALAYSIA BRANCH": "International Islamic Banks",
-    "EXPORT-IMPORT BANK OF MALAYSIA BERHAD": "DFI",
-    "HONG LEONG BANK BERHAD": "Commercial Banks",
-    "HONG LEONG INVESTMENT BANK BERHAD": "Investment Banks",
-    "HONG LEONG ISLAMIC BANK BERHAD": "Islamic Banks",
-    "HSBC AMANAH MALAYSIA BERHAD": "Islamic Banks",
-    "HSBC BANK MALAYSIA BERHAD": "Commercial Banks",
-    "IBDAR BANK BSC": "International Islamic Banks",
-    "INDIA INTERNATIONAL BANK (MALAYSIA) BERHAD": "Foreign Banks",
-    "INDUSTRIAL AND COMMERCIAL BANK OF CHINA (MALAYSIA) BERHAD": "Foreign Banks",
-    "J.P MORGAN CHASE BANK BERHAD": "Foreign Banks",
-    "KAF INVESTMENT BANK BERHAD": "Investment Banks",
-    "KENANGA INVESTMENT BANK BERHAD": "Investment Banks",
-    "KUWAIT FINANCE HOUSE (MALAYSIA) BERHAD": "Islamic Banks",
-    "MALAYAN BANKING BERHAD": "Commercial Banks",
-    "MAYBANK INVESTMENT BANK BERHAD": "Investment Banks",
-    "MAYBANK ISLAMIC BERHAD": "Islamic Banks",
-    "MIDF AMANAH INVESTMENT BANK BERHAD": "Investment Banks",
-    "MIZUHO CORPORATE BANK (MALAYSIA) BERHAD": "Foreign Banks",
-    "NATIONAL BANK OF ABU DHABI MALAYSIA BERHAD": "Foreign Banks",
-    "OCBC AL-AMIN BANK BERHAD": "Islamic Banks",
-    "OCBC BANK (MALAYSIA) BERHAD": "Commercial Banks",
-    "PT. BANK SYARIAH MUALAMAT INDONESIA, TBK": "International Islamic Banks",
-    "PUBLIC BANK BERHAD": "Commercial Banks",
-    "PUBLIC INVESTMENT BANK BERHAD": "Investment Banks",
-    "PUBLIC ISLAMIC BANK BERHAD": "Islamic Banks",
-    "RHB BANK BERHAD": "Commercial Banks",
-    "RHB INVESTMENT BANK BERHAD": "Investment Banks",
-    "RHB ISLAMIC BANK BERHAD": "Islamic Banks",
-    "SMALL MEDIUM ENTERPRISE DEVELOPMENT BANK MALAYSIA BERHAD": "DFI",
-    "STANDARD CHARTERED BANK MALAYSIA BERHAD": "Commercial Banks",
-    "STANDARD CHARTERED SAADIQ BERHAD": "Islamic Banks",
-    "SUMITOMO MITSUI BANKING CORPORATION MALAYSIA BERHAD": "Foreign Banks",
-    "THE BANK OF NOVA SCOTIA BERHAD": "Foreign Banks",
-    "THE ROYAL BANK OF SCOTLAND BERHAD": "Foreign Banks",
-    "UNITED OVERSEAS BANK (MALAYSIA) BHD.": "Commercial Banks",
-    "BOOST BANK BERHAD": "Digital Banks",
-    "AEON BANK (M) BERHAD": "Digital Banks",
-    "KAF DIGITAL BERHAD": "Digital Banks",
-    "YTL DIGITAL BANK BERHAD": "Digital Banks",
-    "GX BANK BERHAD": "Digital Banks",
-
-    # Insurance & Takaful (inc. reinsurers)
-    "ACR RETAKAFUL BERHAD": "Takaful Operators",
-    "AIA BHD.": "Insurers",
-    "AIA GENERAL BERHAD": "Insurers",
-    "AIA PUBLIC TAKAFUL BHD.": "Takaful Operators",
-    "AIG MALAYSIA INSURANCE BERHAD": "Insurers",
-    "ALLIANZ GENERAL INSURANCE COMPANY (MALAYSIA) BERHAD": "Insurers",
-    "ALLIANZ LIFE INSURANCE MALAYSIA BERHAD": "Insurers",
-    "AMBRA VERSICHERUNG AG": "Insurers",
-    "AMMETLIFE INSURANCE BERHAD": "Insurers",
-    "AMMETLIFE TAKAFUL BERHAD": "Takaful Operators",
-    "ASIA CAPITAL REINSURANCE MALAYSIA SDN. BHD.": "Insurers",
-    "BERJAYA SOMPO INSURANCE BERHAD": "Insurers",
-    "CHUBB INSURANCE MALAYSIA BERHAD": "Insurers",
-    "DANAJAMIN NASIONAL BERHAD": "DFI",
-    "ETIQA GENERAL INSURANCE BERHAD": "Insurers",
-    "ETIQA LIFE INSURANCE BERHAD": "Insurers",
-    "ETIQA FAMILY TAKAFUL BERHAD": "Takaful Operators",
-    "ETIQA GENERAL TAKAFUL BERHAD": "Takaful Operators",
-    "FWD INSURANCE BERHAD": "Insurers",
-    "FWD TAKAFUL BERHAD": "Takaful Operators",
-    "GENERALI INSURANCE MALAYSIA BERHAD": "Insurers",
-    "GENERALI LIFE INSURANCE MALAYSIA BERHAD": "Insurers",
-    "GREAT EASTERN GENERAL INSURANCE (MALAYSIA) BERHAD": "Insurers",
-    "GREAT EASTERN LIFE ASSURANCE (MALAYSIA) BERHAD": "Insurers",
-    "GREAT EASTERN TAKAFUL BERHAD": "Takaful Operators",
-    "HANNOVER RUECKVERSICHERUNG AG, MALAYSIAN BRANCH": "Insurers",
-    "HONG LEONG ASSURANCE BERHAD": "Insurers",
-    "HONG LEONG MSIG TAKAFUL BERHAD": "Takaful Operators",
-    "LIBERTY GENERAL INSURANCE BERHAD": "Insurers",
-    "LONPAC INSURANCE BHD.": "Insurers",
-    "MALAYSIAN LIFE REINSURANCE GROUP BERHAD": "Insurers",
-    "MALAYSIAN REINSURANCE BERHAD": "Insurers",
-    "MANULIFE INSURANCE BERHAD": "Insurers",
-    "MCIS INSURANCE BERHAD": "Insurers",
-    "MSIG INSURANCE (MALAYSIA) BHD": "Insurers",
-    "MUNCHENER RUCKVERSICHERUNGS-GESELLSCHAFT (Munich Re Retakaful)": "Takaful Operators",
-    "PACIFIC & ORIENT INSURANCE CO. BERHAD": "Insurers",
-    "PROGRESSIVE INSURANCE BHD.": "Insurers",
-    "PRUDENTIAL ASSURANCE MALAYSIA BERHAD": "Insurers",
-    "PRUDENTIAL BSN TAKAFUL BERHAD": "Takaful Operators",
-    "QBE INSURANCE (MALAYSIA) BERHAD": "Insurers",
-    "RHB INSURANCE BERHAD": "Insurers",
-    "SUN LIFE MALAYSIA ASSURANCE BERHAD": "Insurers",
-    "SUN LIFE MALAYSIA TAKAFUL BERHAD": "Takaful Operators",
-    "SWISS RE ASIA PTE LTD": "Insurers",
-    "SWISS REINSURANCE COMPANY LTD (SWISS RE RETAKAFUL)": "Takaful Operators",
-    "SYARIKAT TAKAFUL MALAYSIA AM BERHAD": "Takaful Operators",
-    "SYARIKAT TAKAFUL MALAYSIA KELUARGA BERHAD": "Takaful Operators",
-    "TAKAFUL IKHLAS FAMILY BERHAD": "Takaful Operators",
-    "TAKAFUL IKHLAS GENERAL BERHAD": "Takaful Operators",
-    "THE PACIFIC INSURANCE BERHAD": "Insurers",
-    "THE TOA REINSURANCE COMPANY LTD.": "Insurers",
-    "TOKIO MARINE INSURANS (MALAYSIA) BERHAD": "Insurers",
-    "TOKIO MARINE LIFE INSURANCE MALAYSIA BHD": "Insurers",
-    "TUNE INSURANCE MALAYSIA BERHAD": "Insurers",
-    "ZURICH GENERAL INSURANCE MALAYSIA BERHAD": "Insurers",
-    "ZURICH LIFE INSURANCE MALAYSIA BERHAD": "Insurers",
-    "ZURICH GENERAL TAKAFUL MALAYSIA BERHAD": "Takaful Operators",
-    "ZURICH TAKAFUL MALAYSIA BERHAD": "Takaful Operators",
+    # (Banks/DFIs/Foreign/Islamic/Digital/IIB)
+    "AFFIN BANK BERHAD":"Commercial Banks","AFFIN HWANG INVESTMENT BANK BERHAD":"Investment Banks",
+    "AFFIN ISLAMIC BANK BERHAD":"Islamic Banks","AGROBANK (BANK PERTANIAN MALAYSIA BERHAD)":"DFI",
+    "AL RAJHI BANKING & INVESTMENT CORPORATION (MALAYSIA) BHD":"Islamic Banks",
+    "ALKHAIR INTERNATIONAL ISLAMIC BANK BHD":"International Islamic Banks",
+    "ALLIANCE BANK MALAYSIA BERHAD":"Commercial Banks","ALLIANCE INVESTMENT BANK BERHAD":"Investment Banks",
+    "ALLIANCE ISLAMIC BANK BERHAD":"Islamic Banks","AMBANK (M) BERHAD":"Commercial Banks",
+    "AMBANK ISLAMIC BERHAD":"Islamic Banks","AMINVESTMENT BANK BERHAD":"Investment Banks",
+    "MBSB BANK BERHAD":"Islamic Banks","BANGKOK BANK BERHAD":"Foreign Banks",
+    "BANK ISLAM MALAYSIA BERHAD":"Islamic Banks","BANK KERJASAMA RAKYAT MALAYSIA BERHAD":"Islamic Banks",
+    "BANK MUAMALAT MALAYSIA BERHAD":"Islamic Banks","BANK OF AMERICA MALAYSIA BERHAD":"Foreign Banks",
+    "BANK OF CHINA (MALAYSIA) BERHAD":"Foreign Banks","BANK OF TOKYO-MITSUBISHI UFJ (MALAYSIA) BERHAD":"Foreign Banks",
+    "BANK PEMBANGUNAN MALAYSIA BERHAD":"DFI","BANK SIMPANAN NASIONAL":"DFI",
+    "BNP PARIBAS MALAYSIA BERHAD":"Foreign Banks","CHINA CONSTRUCTION BANK MALAYSIA BERHAD":"Foreign Banks",
+    "CIMB BANK BERHAD":"Commercial Banks","CIMB INVESTMENT BANK BERHAD":"Investment Banks",
+    "CIMB ISLAMIC BANK BERHAD":"Islamic Banks","CITIBANK BERHAD":"Foreign Banks",
+    "DEUTSCHE BANK (MALAYSIA) BERHAD":"Foreign Banks",
+    "DEUTSCHE BANK AG, INTERNATIONAL ISLAMIC BANKING, MALAYSIA BRANCH":"International Islamic Banks",
+    "EXPORT-IMPORT BANK OF MALAYSIA BERHAD":"DFI","HONG LEONG BANK BERHAD":"Commercial Banks",
+    "HONG LEONG INVESTMENT BANK BERHAD":"Investment Banks","HONG LEONG ISLAMIC BANK BERHAD":"Islamic Banks",
+    "HSBC AMANAH MALAYSIA BERHAD":"Islamic Banks","HSBC BANK MALAYSIA BERHAD":"Commercial Banks",
+    "IBDAR BANK BSC":"International Islamic Banks","INDIA INTERNATIONAL BANK (MALAYSIA) BERHAD":"Foreign Banks",
+    "INDUSTRIAL AND COMMERCIAL BANK OF CHINA (MALAYSIA) BERHAD":"Foreign Banks",
+    "J.P MORGAN CHASE BANK BERHAD":"Foreign Banks","KAF INVESTMENT BANK BERHAD":"Investment Banks",
+    "KENANGA INVESTMENT BANK BERHAD":"Investment Banks","KUWAIT FINANCE HOUSE (MALAYSIA) BERHAD":"Islamic Banks",
+    "MALAYAN BANKING BERHAD":"Commercial Banks","MAYBANK INVESTMENT BANK BERHAD":"Investment Banks",
+    "MAYBANK ISLAMIC BERHAD":"Islamic Banks","MIDF AMANAH INVESTMENT BANK BERHAD":"Investment Banks",
+    "MIZUHO CORPORATE BANK (MALAYSIA) BERHAD":"Foreign Banks",
+    "NATIONAL BANK OF ABU DHABI MALAYSIA BERHAD":"Foreign Banks",
+    "OCBC AL-AMIN BANK BERHAD":"Islamic Banks","OCBC BANK (MALAYSIA) BERHAD":"Commercial Banks",
+    "PT. BANK SYARIAH MUALAMAT INDONESIA, TBK":"International Islamic Banks",
+    "PUBLIC BANK BERHAD":"Commercial Banks","PUBLIC INVESTMENT BANK BERHAD":"Investment Banks",
+    "PUBLIC ISLAMIC BANK BERHAD":"Islamic Banks","RHB BANK BERHAD":"Commercial Banks",
+    "RHB INVESTMENT BANK BERHAD":"Investment Banks","RHB ISLAMIC BANK BERHAD":"Islamic Banks",
+    "SMALL MEDIUM ENTERPRISE DEVELOPMENT BANK MALAYSIA BERHAD":"DFI",
+    "STANDARD CHARTERED BANK MALAYSIA BERHAD":"Commercial Banks","STANDARD CHARTERED SAADIQ BERHAD":"Islamic Banks",
+    "SUMITOMO MITSUI BANKING CORPORATION MALAYSIA BERHAD":"Foreign Banks",
+    "THE BANK OF NOVA SCOTIA BERHAD":"Foreign Banks","THE ROYAL BANK OF SCOTLAND BERHAD":"Foreign Banks",
+    "UNITED OVERSEAS BANK (MALAYSIA) BHD.":"Commercial Banks",
+    "BOOST BANK BERHAD":"Digital Banks","AEON BANK (M) BERHAD":"Digital Banks","KAF DIGITAL BERHAD":"Digital Banks",
+    "YTL DIGITAL BANK BERHAD":"Digital Banks","GX BANK BERHAD":"Digital Banks",
+    # Insurers & Takaful (inc. reinsurers)
+    "ACR RETAKAFUL BERHAD":"Takaful Operators","AIA BHD.":"Insurers","AIA GENERAL BERHAD":"Insurers",
+    "AIA PUBLIC TAKAFUL BHD.":"Takaful Operators","AIG MALAYSIA INSURANCE BERHAD":"Insurers",
+    "ALLIANZ GENERAL INSURANCE COMPANY (MALAYSIA) BERHAD":"Insurers",
+    "ALLIANZ LIFE INSURANCE MALAYSIA BERHAD":"Insurers","AMBRA VERSICHERUNG AG":"Insurers",
+    "AMMETLIFE INSURANCE BERHAD":"Insurers","AMMETLIFE TAKAFUL BERHAD":"Takaful Operators",
+    "ASIA CAPITAL REINSURANCE MALAYSIA SDN. BHD.":"Insurers","BERJAYA SOMPO INSURANCE BERHAD":"Insurers",
+    "CHUBB INSURANCE MALAYSIA BERHAD":"Insurers","DANAJAMIN NASIONAL BERHAD":"DFI",
+    "ETIQA GENERAL INSURANCE BERHAD":"Insurers","ETIQA LIFE INSURANCE BERHAD":"Insurers",
+    "ETIQA FAMILY TAKAFUL BERHAD":"Takaful Operators","ETIQA GENERAL TAKAFUL BERHAD":"Takaful Operators",
+    "FWD INSURANCE BERHAD":"Insurers","FWD TAKAFUL BERHAD":"Takaful Operators",
+    "GENERALI INSURANCE MALAYSIA BERHAD":"Insurers","GENERALI LIFE INSURANCE MALAYSIA BERHAD":"Insurers",
+    "GREAT EASTERN GENERAL INSURANCE (MALAYSIA) BERHAD":"Insurers",
+    "GREAT EASTERN LIFE ASSURANCE (MALAYSIA) BERHAD":"Insurers","GREAT EASTERN TAKAFUL BERHAD":"Takaful Operators",
+    "HANNOVER RUECKVERSICHERUNG AG, MALAYSIAN BRANCH":"Insurers","HONG LEONG ASSURANCE BERHAD":"Insurers",
+    "HONG LEONG MSIG TAKAFUL BERHAD":"Takaful Operators","LIBERTY GENERAL INSURANCE BERHAD":"Insurers",
+    "LONPAC INSURANCE BHD.":"Insurers","MALAYSIAN LIFE REINSURANCE GROUP BERHAD":"Insurers",
+    "MALAYSIAN REINSURANCE BERHAD":"Insurers","MANULIFE INSURANCE BERHAD":"Insurers",
+    "MCIS INSURANCE BERHAD":"Insurers","MSIG INSURANCE (MALAYSIA) BHD":"Insurers",
+    "MUNCHENER RUCKVERSICHERUNGS-GESELLSCHAFT (Munich Re Retakaful)":"Takaful Operators",
+    "PACIFIC & ORIENT INSURANCE CO. BERHAD":"Insurers","PROGRESSIVE INSURANCE BHD.":"Insurers",
+    "PRUDENTIAL ASSURANCE MALAYSIA BERHAD":"Insurers","PRUDENTIAL BSN TAKAFUL BERHAD":"Takaful Operators",
+    "QBE INSURANCE (MALAYSIA) BERHAD":"Insurers","RHB INSURANCE BERHAD":"Insurers",
+    "SUN LIFE MALAYSIA ASSURANCE BERHAD":"Insurers","SUN LIFE MALAYSIA TAKAFUL BERHAD":"Takaful Operators",
+    "SWISS RE ASIA PTE LTD":"Insurers","SWISS REINSURANCE COMPANY LTD (SWISS RE RETAKAFUL)":"Takaful Operators",
+    "SYARIKAT TAKAFUL MALAYSIA AM BERHAD":"Takaful Operators","SYARIKAT TAKAFUL MALAYSIA KELUARGA BERHAD":"Takaful Operators",
+    "TAKAFUL IKHLAS FAMILY BERHAD":"Takaful Operators","TAKAFUL IKHLAS GENERAL BERHAD":"Takaful Operators",
+    "THE PACIFIC INSURANCE BERHAD":"Insurers","THE TOA REINSURANCE COMPANY LTD.":"Insurers",
+    "TOKIO MARINE INSURANS (MALAYSIA) BERHAD":"Insurers","TOKIO MARINE LIFE INSURANCE MALAYSIA BHD":"Insurers",
+    "TUNE INSURANCE MALAYSIA BERHAD":"Insurers","ZURICH GENERAL INSURANCE MALAYSIA BERHAD":"Insurers",
+    "ZURICH LIFE INSURANCE MALAYSIA BERHAD":"Insurers","ZURICH GENERAL TAKAFUL MALAYSIA BERHAD":"Takaful Operators",
+    "ZURICH TAKAFUL MALAYSIA BERHAD":"Takaful Operators",
 }
 
-# ----------------- HELPERS -----------------
-def load_xlsx(path: Path) -> Dict[str, pd.DataFrame]:
+# =============== Helpers ===============
+def months_up_to_quarter(q_label: str) -> List[str]:
+    order = ["Q1","Q2","Q3","Q4"]
+    months: List[str] = []
+    for q in order:
+        months += Q_TO_MONTHS[q]
+        if q == q_label:
+            break
+    return months
+
+def pick_current_quarter_from_staging(stag: pd.DataFrame) -> str:
+    mapping = {"Quarter 1":"Q1","Quarter 2":"Q2","Quarter 3":"Q3","Quarter 4":"Q4","Q1":"Q1","Q2":"Q2","Q3":"Q3","Q4":"Q4"}
+    q = stag["quarter"].map(mapping).fillna(stag["quarter"])
+    q_order = {"Q1":1,"Q2":2,"Q3":3,"Q4":4}
+    idx = q.map(q_order).idxmax()
+    return str(q.loc[idx])
+
+def load_stage_excel(path: Path) -> Dict[str, pd.DataFrame]:
     xl = pd.ExcelFile(path, engine="openpyxl")
-    out: Dict[str, pd.DataFrame] = {}
-    for nm in xl.sheet_names:
+    sheets = {}
+    for name in xl.sheet_names:
         try:
-            out[nm] = xl.parse(nm)
+            sheets[name] = xl.parse(name)
         except Exception:
             pass
-    return out
+    return sheets
 
-def normalize_quarter_col(df: pd.DataFrame) -> pd.DataFrame:
-    if "quarter" not in df.columns: return df
-    mapping = {
-        "1":"Q1","2":"Q2","3":"Q3","4":"Q4",
-        "Quarter 1":"Q1","Quarter 2":"Q2","Quarter 3":"Q3","Quarter 4":"Q4",
-        "Q1":"Q1","Q2":"Q2","Q3":"Q3","Q4":"Q4"
-    }
-    c = df["quarter"].astype(str).map(mapping).fillna(df["quarter"])
-    df = df.copy()
-    df["quarter"] = c
-    return df
-
-def detect_current_quarter(sheets: Dict[str, pd.DataFrame]) -> str:
-    order = {"Q1":1,"Q2":2,"Q3":3,"Q4":4}
-    best = "Q1"; bestv = 1
-    for nm in ["Q5","Q4","Q3","Q2A_Main","Q1A_Main","Q2B","Q1B"]:
-        if nm in sheets and not sheets[nm].empty and "quarter" in sheets[nm].columns:
-            q = normalize_quarter_col(sheets[nm])["quarter"].astype(str)
-            qv = q.map(order).max(skipna=True)
-            if pd.notna(qv) and int(qv) > bestv:
-                bestv = int(qv)
-                best   = [k for k,v in order.items() if v==bestv][0]
-    return best
-
-def months_up_to(q: str) -> List[str]:
-    out: List[str] = []
-    for oq in ["Q1","Q2","Q3","Q4"]:
-        out += QMAP[oq]
-        if oq == q: break
-    return out
-
-def ensure_months(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    for m in MONTHS:
-        if m not in out.columns:
-            out[m] = 0
-    return out
-
-def quarter_sums(df: pd.DataFrame) -> pd.DataFrame:
-    out = ensure_months(df.copy())
-    out["Q1"] = out[QMAP["Q1"]].sum(axis=1)
-    out["Q2"] = out[QMAP["Q2"]].sum(axis=1)
-    out["Q3"] = out[QMAP["Q3"]].sum(axis=1)
-    out["Q4"] = out[QMAP["Q4"]].sum(axis=1)
-    return out
-
-def add_mom(df: pd.DataFrame, months: List[str]) -> pd.DataFrame:
-    out = df.copy()
-    for i, m in enumerate(months):
-        if i == 0: continue
-        p = months[i-1]
-        out[f"Diff_{m}"] = out[m] - out[p]
-        denom = out[p].replace(0, pd.NA)
-        out[f"MoM_{m}"] = (out[m] - out[p]) / denom
-    return out
-
-def add_qoq(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    qs = ["Q1","Q2","Q3","Q4"]
-    for i, q in enumerate(qs):
-        if i == 0: continue
-        pq = qs[i-1]
-        out[f"Diff_{q}"]    = out[q] - out[pq]
-        out[f"PctDiff_{q}"] = (out[q] - out[pq]) / out[pq].replace(0, pd.NA)
-    return out
-
-def add_yoy_quarters(curr_q: pd.DataFrame, prev_q: Optional[pd.DataFrame], join_dims: List[str]) -> pd.DataFrame:
-    if prev_q is None or prev_q.empty:
-        return curr_q
-    join_keys = [c for c in join_dims if c in curr_q.columns]
-    left  = curr_q.copy()
-    right = prev_q.copy()
-    cols_keep = ["Q1","Q2","Q3","Q4"]
-    right = right[join_keys + cols_keep].copy()
-    right = right.rename(columns={q:f"Prior_{q}" for q in cols_keep})
-    merged = left.merge(right, on=join_keys, how="left")
-    for q in ["Q1","Q2","Q3","Q4"]:
-        pr = f"Prior_{q}"
-        denom = merged[pr].replace(0, pd.NA)
-        merged[f"YoY_{q}"] = (merged[q] - merged[pr]) / denom
-    return merged
-
-def attach_fi_type(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    if "entity_name" not in df.columns:
-        raise ValueError("staging sheet missing 'entity_name'")
-    df["fi_type"] = df["entity_name"].map(ENTITY_TO_TYPE)
-    return df
-
-def base_group_sum(df: pd.DataFrame, value_cols: List[str], dims: List[str]) -> pd.DataFrame:
-    agg = {c:"sum" for c in value_cols}
-    g = df.groupby(dims, dropna=False).agg(agg).reset_index()
-    return g
-
-def build_rollup_blocks(df_with_type: pd.DataFrame, value_cols: List[str], facet_dims: List[str]) -> pd.DataFrame:
+def build_fi_groups_from_entity_map(entities: pd.Series) -> Dict[str, List[str]]:
     """
-    Create stacked rows:
-      - All defined rollups in ROLLUP_ORDER
-      - Institution rows (entity level)
-    Columns produced: fi_type, entity_group, institution, [facets], year, quarter, [values...]
+    Build a dict of rollup_name -> list of entity_name using ENTITY_TO_TYPE and ROLLUPS.
+    We include leaf groups (fi_type) and composite groups (e.g., Banking Institutions).
+    """
+    df = pd.DataFrame({"entity_name": entities.astype(str)})
+    df["fi_type"] = df["entity_name"].map(ENTITY_TO_TYPE)
+    # Leaf groups: fi_type itself
+    leaf_groups: Dict[str, List[str]] = {}
+    for g in set(ENTITY_TO_TYPE.values()):
+        leaf_groups[g] = sorted(df.loc[df["fi_type"]==g, "entity_name"].unique().tolist())
+    # Composite using ROLLUPS
+    out: Dict[str, List[str]] = {}
+    out.update(leaf_groups)
+    for roll_name, member_types in ROLLUPS.items():
+        members = df.loc[df["fi_type"].isin(member_types), "entity_name"].unique().tolist()
+        out[roll_name] = sorted(members)
+    return out
+
+def add_rollups(stage: pd.DataFrame, fi_groups: Dict[str, List[str]]) -> pd.DataFrame:
+    """
+    stage must have: entity_name, year, quarter, [subquestion?], [worker_category?], [job_function?], months/Value columns
+    Adds rows for: each group in fi_groups, "All Financial Institutions" (already covered), and institution rows.
+    Adds: entity_group, institution
     """
     base_dims = ["year","quarter"]
-    dims_inst = ["fi_type","entity_group","institution"] + facet_dims + base_dims
+    facet_dims = [c for c in ["question","subquestion","worker_category","job_function"] if c in stage.columns]
+    value_cols = [c for c in MONTHS_FULL + ["M","value","Jun","Dec"] if c in stage.columns]
 
-    # Ensure expected cols
-    for c in ["fi_type","entity_name","year","quarter"]:
-        if c not in df_with_type.columns:
-            df_with_type[c] = ""
+    # institution rows
+    inst = stage.copy()
+    inst["entity_group"] = inst["entity_name"].map(ENTITY_TO_TYPE)  # group = fi_type for institution
+    inst["institution"] = inst["entity_name"]
+    inst = inst.drop(columns=["entity_name"])
 
-    # Institution rows (entity_group = fi_type, institution = entity_name)
-    inst = df_with_type.copy()
-    inst["entity_group"] = inst["fi_type"]
-    inst["institution"]  = inst["entity_name"]
-    inst_block = base_group_sum(inst, value_cols, dims_inst)
+    # function to group-sum
+    def _sum(df: pd.DataFrame) -> pd.DataFrame:
+        by = base_dims + facet_dims + ["entity_group","institution"]
+        agg = {c:"sum" for c in value_cols}
+        g = df.groupby(by, dropna=False).agg(agg).reset_index()
+        return g[by + facet_dims + ["entity_group","institution"] + value_cols]
 
-    # Rollup rows (entity_group = rollup name, institution = "")
-    roll_frames = []
-    for rname in ROLLUP_ORDER:
-        members = ROLLUPS.get(rname, [])
-        if not members:
-            continue
-        sub = df_with_type[df_with_type["fi_type"].isin(members)].copy()
-        if sub.empty:
-            continue
-        sub["entity_group"] = rname
-        sub["institution"]  = ""
-        dims_roll = ["entity_group","institution"] + facet_dims + base_dims
-        roll_frames.append(base_group_sum(sub, value_cols, ["fi_type"] + dims_roll).drop(columns=["fi_type"]))
+    out_frames = [_sum(inst)]
 
-    all_rolls = pd.concat(roll_frames, ignore_index=True) if roll_frames else pd.DataFrame(columns=dims_inst+value_cols)
-    out = pd.concat([all_rolls, inst_block], ignore_index=True)
+    # FI group rollups (including All FI and composites)
+    for gname, insts in fi_groups.items():
+        sub = stage[stage["entity_name"].isin(insts)].copy()
+        if sub.empty: continue
+        block = sub.copy()
+        block["entity_group"] = gname
+        block["institution"] = ""
+        block = block.drop(columns=["entity_name"])
+        out_frames.append(_sum(block))
 
-    # Order columns
-    lead = ["fi_type","entity_group","institution"] + facet_dims + base_dims
-    cols = lead + value_cols
+    out = pd.concat(out_frames, ignore_index=True) if out_frames else pd.DataFrame()
+    # order columns
+    lead = ["entity_group","institution"] + facet_dims + base_dims
+    tails = [c for c in MONTHS_FULL + ["M","value","Jun","Dec"] if c in out.columns]
+    cols = [c for c in lead + tails if c in out.columns]
     return out[cols]
 
-def sort_rows(df: pd.DataFrame) -> pd.DataFrame:
-    order = pd.CategoricalDtype(categories=ROLLUP_ORDER + sorted([x for x in df.get("fi_type", pd.Series([])).dropna().unique()]), ordered=True)
-    dfo = df.copy()
-    if "entity_group" in dfo.columns:
-        dfo["entity_group"] = dfo["entity_group"].astype(order)
-    return dfo.sort_values(by=["entity_group","institution"] + [c for c in ["subquestion","worker_category","job_function"] if c in dfo.columns], kind="stable")
+def pivot_monthly(big: pd.DataFrame, year: int, current_q: str) -> pd.DataFrame:
+    months = months_up_to_quarter(current_q)
+    cols_keep = ["entity_group","institution"] + [c for c in ["question","subquestion","worker_category","job_function"] if c in big.columns]
+    sub = big[big["year"] == year].copy()
+    for m in MONTHS_FULL:
+        if m not in sub.columns:
+            sub[m] = 0
+    keep_months = months
+    base = sub[cols_keep + keep_months]
+    def qsum(df: pd.DataFrame, months3: List[str]) -> pd.Series:
+        ok = [c for c in months3 if c in df.columns]
+        return df[ok].sum(axis=1) if ok else 0
+    base["Q1"] = qsum(base, Q_TO_MONTHS["Q1"])
+    base["Q2"] = qsum(base, Q_TO_MONTHS["Q2"])
+    base["Q3"] = qsum(base, Q_TO_MONTHS["Q3"])
+    base["Q4"] = qsum(base, Q_TO_MONTHS["Q4"])
+    return base
 
-# ----------------- SHEET BUILDERS -----------------
-def make_monthly_sheet(stage_df: pd.DataFrame, current_q: str, prior_df: Optional[pd.DataFrame]) -> pd.DataFrame:
-    d0 = attach_fi_type(normalize_quarter_col(stage_df))
-    vcols = [c for c in MONTHS if c in d0.columns]
-    d0 = ensure_months(d0); vcols = MONTHS
-    facet_dims = [c for c in ["question","subquestion","worker_category","job_function"] if c in d0.columns]
+def pivot_single_month(big: pd.DataFrame, year: int, month_name: str) -> pd.DataFrame:
+    cols_keep = ["entity_group","institution"] + [c for c in ["question","subquestion","worker_category"] if c in big.columns]
+    sub = big[big["year"] == year].copy()
+    if month_name not in sub.columns:
+        sub[month_name] = 0
+    return sub[cols_keep + [month_name]]
 
-    stacked = build_rollup_blocks(d0, vcols, facet_dims)
-    stacked = quarter_sums(stacked)
+# =============== Styled Excel writer (your design, with tunable thresholds) ===============
+def write_qc_sheet(
+    wb: Workbook,
+    ws_title: str,
+    df: pd.DataFrame,
+    year: int,
+    current_q: str,
+    *,
+    monthly_mode: bool,
+    single_month: Optional[str] = None,
+    prior_df: Optional[pd.DataFrame] = None,
+    mom_pct_threshold: float = 0.25,
+    abs_cutoff: float = 50,
+    qoq_pct_threshold: float = 0.25,
+):
+    ws = wb.create_sheet(ws_title)
+    banner_row = 7
+    header_row = 8
+    bold = Font(bold=True)
+    center = Alignment(horizontal="center", vertical="center")
 
-    months = months_up_to(current_q)
-    keep_metrics = months + ["Q1","Q2","Q3","Q4"]
-    out = stacked[["fi_type","entity_group","institution", *facet_dims, "year","quarter", *keep_metrics]].copy()
+    dims = ["Entity / Group","Institution"]
+    if "question" in df.columns: dims.append("Question")
+    if "subquestion" in df.columns: dims.append("Subquestion")
+    if "worker_category" in df.columns: dims.append("Worker Category")
+    if "job_function" in df.columns: dims.append("Job Function")
 
-    out = add_mom(out, months)
-    out = add_qoq(out)
+    if monthly_mode:
+        months = months_up_to_quarter(current_q)
+        q_sums = ["Q1","Q2","Q3","Q4"]
+        month_diff_headers: List[str] = []
+        month_mom_headers: List[str] = []
+        for m in months:
+            i = MONTHS_FULL.index(m)
+            prev = MONTHS_FULL[i-1] if i > 0 else None
+            if prev and prev in months:
+                month_diff_headers.append(f"Diff {m}")
+                month_mom_headers.append(f"MoM {m}")
+        q_diff_headers: List[str] = []
+        for i, q in enumerate(q_sums):
+            if i == 0: continue
+            q_diff_headers += [f"Diff {q}", f"%Diff {q}"]
+        yoy_headers = [f"YoY {q}" for q in q_sums]
+        prior_headers = [f"Prior {q}" for q in q_sums]
+        s1,s2,s3,s4 = " ", "  ", "   ", "    "
+        headers = dims + months + [s1] + month_diff_headers + [s2] + month_mom_headers + [s3] + q_sums + q_diff_headers + [s4] + yoy_headers + prior_headers
+    else:
+        m = single_month or "M"
+        headers = dims + [m, "Diff "+m, "YoY "+m, "Prior "+m]
 
-    if prior_df is not None and not prior_df.empty:
-        p0 = attach_fi_type(normalize_quarter_col(prior_df))
-        p0 = ensure_months(p0)
-        pstack = build_rollup_blocks(p0, MONTHS, facet_dims)
-        pstack = quarter_sums(pstack)
-        join_dims = ["fi_type","entity_group","institution", *facet_dims]
-        out = add_yoy_quarters(out, pstack, join_dims)
+    for c in range(1, len(headers)+1):
+        ws.cell(banner_row, c, None)
 
-    return sort_rows(out)
+    for idx, h in enumerate(headers, start=1):
+        ws.cell(header_row, idx, h).font = bold
+        if monthly_mode and h in months_up_to_quarter(current_q):
+            ws.cell(header_row, idx).fill = FILL_RAW
 
-def make_single_month_sheet(stage_df: pd.DataFrame, months_avail: List[str], prior_df: Optional[pd.DataFrame]) -> pd.DataFrame:
-    d0 = attach_fi_type(normalize_quarter_col(stage_df))
-    facet_dims = [c for c in ["question","subquestion","worker_category"] if c in d0.columns]
-    vcols = [m for m in months_avail if m in d0.columns]
-    stacked = build_rollup_blocks(d0, vcols, facet_dims)
-    out = stacked[["fi_type","entity_group","institution", *facet_dims, "year","quarter", *vcols]].copy()
+    def _cols_for(names: List[str], col_index: Dict[str,int]) -> List[int]:
+        return [col_index[n] for n in names if n in col_index]
+    col_index = {h: i+1 for i, h in enumerate(headers)}
 
-    if prior_df is not None and not prior_df.empty:
-        p0 = attach_fi_type(normalize_quarter_col(prior_df))
-        pstack = build_rollup_blocks(p0, vcols, facet_dims)
-        join_dims = ["fi_type","entity_group","institution", *facet_dims]
-        left  = out.copy()
-        right = pstack[join_dims + vcols].copy().rename(columns={m:f"Prior_{m}" for m in vcols})
-        out   = left.merge(right, on=join_dims, how="left")
-        for m in vcols:
-            denom = out[f"Prior_{m}"].replace(0, pd.NA)
-            out[f"YoY_{m}"] = (out[m] - out[f"Prior_{m}"]) / denom
+    ws.merge_cells(start_row=banner_row, start_column=1, end_row=banner_row, end_column=len(dims))
+    ws.cell(banner_row, 1, "Dimensions").font = bold
+    ws.cell(banner_row, 1).alignment = center
 
-    return sort_rows(out)
+    if monthly_mode:
+        months = months_up_to_quarter(current_q)
+        for qlbl, q_months in Q_TO_MONTHS.items():
+            include = [m for m in months if m in q_months]
+            if include:
+                cols = _cols_for(include, col_index)
+                ws.merge_cells(start_row=banner_row, start_column=cols[0], end_row=banner_row, end_column=cols[-1])
+                ws.cell(banner_row, cols[0], f"{qlbl} {year}").font = bold
+                ws.cell(banner_row, cols[0]).alignment = center
+                for c in cols:
+                    ws.cell(header_row, c).fill = QFILL[qlbl]
+                    ws.cell(banner_row, c).fill = QFILL[qlbl]
 
-def make_jobfunc_q4_sheet(stage_df: pd.DataFrame, prior_df: Optional[pd.DataFrame]) -> pd.DataFrame:
-    d0 = attach_fi_type(normalize_quarter_col(stage_df)).copy()
-    if "value" not in d0.columns: d0["value"] = 0
-    d0["Dec"] = d0["value"]
-    for m in [m for m in MONTHS if m != "Dec"]:
-        if m not in d0.columns: d0[m] = 0
-    d0 = d0.drop(columns=[c for c in d0.columns if c not in ["entity_name","fi_type","year","quarter","subquestion","worker_category","job_function", *MONTHS]])
+        by_q_diff = {q:[h for h in headers if h.startswith("Diff ") and any(h.endswith(m) for m in Q_TO_MONTHS[q])] for q in ["Q1","Q2","Q3","Q4"]}
+        by_q_mom  = {q:[h for h in headers if h.startswith("MoM ")  and any(h.endswith(m) for m in Q_TO_MONTHS[q])] for q in ["Q1","Q2","Q3","Q4"]}
+        for q in ["Q1","Q2","Q3","Q4"]:
+            cols = _cols_for(by_q_diff[q], col_index)
+            if cols:
+                ws.merge_cells(start_row=banner_row, start_column=cols[0], end_row=banner_row, end_column=cols[-1])
+                ws.cell(banner_row, cols[0], f"{q} – Differences").font = bold
+                ws.cell(banner_row, cols[0]).alignment = center
+                for c in cols:
+                    ws.cell(header_row, c).fill = QFILL[q]
+                    ws.cell(banner_row, c).fill = QFILL[q]
+            cols = _cols_for(by_q_mom[q], col_index)
+            if cols:
+                ws.merge_cells(start_row=banner_row, start_column=cols[0], end_row=banner_row, end_column=cols[-1])
+                ws.cell(banner_row, cols[0], f"{q} – MoM%").font = bold
+                ws.cell(banner_row, cols[0]).alignment = center
+                for c in cols:
+                    ws.cell(header_row, c).fill = QFILL[q]
+                    ws.cell(banner_row, c).fill = QFILL[q]
 
-    facet_dims = [c for c in ["subquestion","worker_category","job_function"] if c in d0.columns]
-    stacked = build_rollup_blocks(d0, MONTHS, facet_dims)
-    stacked = quarter_sums(stacked)
-    out = stacked[["fi_type","entity_group","institution", *facet_dims, "year","quarter", *MONTHS, "Q1","Q2","Q3","Q4"]].copy()
+        q_block = [h for h in headers if h in ["Q1","Q2","Q3","Q4"] or h.startswith("Diff Q") or h.startswith("%Diff Q")]
+        if q_block:
+            cols = _cols_for(q_block, col_index)
+            ws.merge_cells(start_row=banner_row, start_column=cols[0], end_row=banner_row, end_column=cols[-1])
+            ws.cell(banner_row, cols[0], "Quarterly (Sums, Δ, %Δ)").font = bold
+            ws.cell(banner_row, cols[0]).alignment = center
 
-    out = add_qoq(out)
-    if prior_df is not None and not prior_df.empty:
-        p0 = attach_fi_type(normalize_quarter_col(prior_df)).copy()
-        if "value" not in p0.columns: p0["value"] = 0
-        p0["Dec"] = p0["value"]
-        for m in [m for m in MONTHS if m != "Dec"]:
-            if m not in p0.columns: p0[m] = 0
-        p0 = p0.drop(columns=[c for c in p0.columns if c not in ["entity_name","fi_type","year","quarter","subquestion","worker_category","job_function", *MONTHS]])
-        pstack = build_rollup_blocks(p0, MONTHS, facet_dims)
-        pstack = quarter_sums(pstack)
-        join_dims = ["fi_type","entity_group","institution", *facet_dims]
-        out = add_yoy_quarters(out, pstack, join_dims)
+        yoy_headers = [h for h in headers if h.startswith("YoY ")]
+        if yoy_headers:
+            cols = _cols_for(yoy_headers, col_index)
+            ws.merge_cells(start_row=banner_row, start_column=cols[0], end_row=banner_row, end_column=cols[-1])
+            ws.cell(banner_row, cols[0], "YoY vs same quarter last year").font = bold
+            ws.cell(banner_row, cols[0]).alignment = center
+    else:
+        cols = _cols_for(headers[len(dims):], col_index)
+        if cols:
+            ws.merge_cells(start_row=banner_row, start_column=cols[0], end_row=banner_row, end_column=cols[-1])
+            ws.cell(banner_row, cols[0], f"{single_month or 'Month'} {year} + Δ + YoY").font = bold
+            ws.cell(banner_row, cols[0]).alignment = center
 
-    return sort_rows(out)
+    # Write rows
+    first_data_row = header_row + 1
+    if monthly_mode:
+        months = months_up_to_quarter(current_q)
+        for m in months + ["Q1","Q2","Q3","Q4"]:
+            if m not in df.columns:
+                df[m] = 0
+    else:
+        m = single_month or "M"
+        if m not in df.columns:
+            df[m] = 0
 
-# ----------------- MAIN -----------------
+    for _, row in df.iterrows():
+        dims_vals = [
+            row.get("entity_group",""),
+            row.get("institution",""),
+        ]
+        if "question" in df.columns:      dims_vals.append(row.get("question",""))
+        if "subquestion" in df.columns:   dims_vals.append(row.get("subquestion",""))
+        if "worker_category" in df.columns: dims_vals.append(row.get("worker_category",""))
+        if "job_function" in df.columns:  dims_vals.append(row.get("job_function",""))
+        if monthly_mode:
+            months = months_up_to_quarter(current_q)
+            vals = dims_vals + [row.get(m, 0) for m in months] + [""]
+            vals += [""] * 50
+        else:
+            m = single_month or "M"
+            vals = dims_vals + [row.get(m, 0), "", "", ""]
+        # defensive cast (avoid Excel type errors)
+        vals = [("" if pd.isna(v) else v) for v in vals]
+        ws.append(vals)
+
+    last_data_row = first_data_row + df.shape[0] - 1
+
+    # Fill formulas for monthly mode
+    if monthly_mode and df.shape[0] > 0:
+        months = months_up_to_quarter(current_q)
+        col_index = {ws.cell(header_row, c).value: c for c in range(1, ws.max_column+1) if ws.cell(header_row, c).value}
+        def qaddr(r, q): return ws.cell(r, col_index[q]).coordinate
+        def maddr(r, m): return ws.cell(r, col_index[m]).coordinate
+        if all(m in col_index for m in ["Jan","Feb","Mar"]) and "Q1" in col_index:
+            for r in range(first_data_row, last_data_row+1):
+                ws.cell(r, col_index["Q1"]).value = f"=SUM({maddr(r,'Jan')}:{maddr(r,'Mar')})"
+        if all(m in col_index for m in ["Apr","May","Jun"]) and "Q2" in col_index:
+            for r in range(first_data_row, last_data_row+1):
+                ws.cell(r, col_index["Q2"]).value = f"=SUM({maddr(r,'Apr')}:{maddr(r,'Jun')})"
+        if all(m in col_index for m in ["Jul","Aug","Sep"]) and "Q3" in col_index:
+            for r in range(first_data_row, last_data_row+1):
+                ws.cell(r, col_index["Q3"]).value = f"=SUM({maddr(r,'Jul')}:{maddr(r,'Sep')})"
+        if all(m in col_index for m in ["Oct","Nov","Dec"]) and "Q4" in col_index:
+            for r in range(first_data_row, last_data_row+1):
+                ws.cell(r, col_index["Q4"]).value = f"=SUM({maddr(r,'Oct')}:{maddr(r,'Dec')})"
+
+        # Monthly Diff & MoM%
+        for r in range(first_data_row, last_data_row + 1):
+            for m in months:
+                i = MONTHS_FULL.index(m)
+                prev = MONTHS_FULL[i-1] if i > 0 else None
+                if not prev or prev not in months or f"Diff {m}" not in col_index or f"MoM {m}" not in col_index:
+                    continue
+                ws.cell(r, col_index[f"Diff {m}"]).value = f"={maddr(r,m)}-{maddr(r,prev)}"
+                ws.cell(r, col_index[f"MoM {m}"]).value = (
+                    f"=IF(AND({maddr(r,m)}=0,{maddr(r,prev)}=0),0,"
+                    f"IF(AND({maddr(r,m)}<>0,{maddr(r,prev)}=0),\"N/A\","
+                    f"({maddr(r,m)}-{maddr(r,prev)})/{maddr(r,prev)}))"
+                )
+
+        # QoQ
+        q_sums = ["Q1","Q2","Q3","Q4"]
+        for r in range(first_data_row, last_data_row + 1):
+            for i, q in enumerate(q_sums):
+                if q not in col_index: continue
+                if i == 0: continue
+                prev_q = q_sums[i-1]
+                if prev_q not in col_index: continue
+                if f"Diff {q}" in col_index:
+                    ws.cell(r, col_index[f"Diff {q}"]).value = f"={qaddr(r,q)}-{qaddr(r,prev_q)}"
+                if f"%Diff {q}" in col_index:
+                    ws.cell(r, col_index[f"%Diff {q}"]).value = (
+                        f"=IF(AND({qaddr(r,q)}=0,{qaddr(r,prev_q)}=0),0,"
+                        f"IF(AND({qaddr(r,q)}<>0,{qaddr(r,prev_q)}=0),\"N/A\","
+                        f"({qaddr(r,q)}-{qaddr(r,prev_q)})/{qaddr(r,prev_q)}))"
+                    )
+
+        # YoY & Prior linking via hidden sheet (unchanged from your design)
+        if prior_df is not None and not prior_df.empty:
+            prior_sheet = f"_{ws_title}_PRIOR"
+            if prior_sheet in [s.title for s in wb.worksheets]:
+                del wb[prior_sheet]
+            ws_prior = wb.create_sheet(prior_sheet)
+            dim_keys = ["entity_group","institution","question","subquestion","worker_category","job_function"]
+            for d in dim_keys:
+                if d not in prior_df.columns: prior_df[d] = ""
+            for q in ["Q1","Q2","Q3","Q4"]:
+                if q not in prior_df.columns: prior_df[q] = 0
+            ws_prior.cell(1,1,"KEY").font = Font(bold=True)
+            for j, q in enumerate(["Q1","Q2","Q3","Q4"], start=2):
+                ws_prior.cell(1,j,q).font = Font(bold=True)
+            for i, prow in prior_df.iterrows():
+                key = "|".join(str(prow.get(k,"") or "") for k in dim_keys)
+                ws_prior.cell(i+2, 1, key)
+                ws_prior.cell(i+2, 2, prow.get("Q1",0))
+                ws_prior.cell(i+2, 3, prow.get("Q2",0))
+                ws_prior.cell(i+2, 4, prow.get("Q3",0))
+                ws_prior.cell(i+2, 5, prow.get("Q4",0))
+            ws_prior.sheet_state = "hidden"
+
+            if "_KEY" not in [ws.cell(header_row, c).value for c in range(1, ws.max_column+1)]:
+                key_col_idx = ws.max_column + 1
+                ws.cell(header_row, key_col_idx, "_KEY").font = Font(bold=True)
+                dim_headers = ["Entity / Group","Institution","Question","Subquestion","Worker Category","Job Function"]
+                for r in range(first_data_row, last_data_row + 1):
+                    parts = []
+                    for h in dim_headers:
+                        found = None
+                        for c in range(1, ws.max_column+1):
+                            if ws.cell(header_row, c).value == h:
+                                found = c; break
+                        parts.append(ws.cell(r, found).coordinate if found else '""')
+                    ws.cell(r, key_col_idx).value = f'={ "&" .join([f"{p}&\"|\"" for p in parts[:-1]]) }{parts[-1]}'
+                ws.column_dimensions[ws.cell(header_row, key_col_idx).column_letter].hidden = True
+
+            key_col = None
+            for c in range(1, ws.max_column+1):
+                if ws.cell(header_row, c).value == "_KEY":
+                    key_col = c; break
+
+            if key_col:
+                for q in ["Q1","Q2","Q3","Q4"]:
+                    yoy_hdr = f"YoY {q}"
+                    prior_hdr = f"Prior {q}"
+                    if q not in col_index or yoy_hdr not in col_index or prior_hdr not in col_index:
+                        continue
+                    curr_col = col_index[q]
+                    yoy_col  = col_index[yoy_hdr]
+                    prior_col= col_index[prior_hdr]
+                    prior_letter = {"Q1":"B","Q2":"C","Q3":"D","Q4":"E"}[q]
+                    prior_range = f"{prior_sheet}!${prior_letter}:${prior_letter}"
+                    key_range   = f"{prior_sheet}!$A:$A"
+                    for r in range(first_data_row, last_data_row+1):
+                        key_addr = ws.cell(r, key_col).coordinate
+                        curr_addr= ws.cell(r, curr_col).coordinate
+                        prior_expr = f"INDEX({prior_range},MATCH({key_addr},{key_range},0))"
+                        ws.cell(r, prior_col).value = f"=IFERROR({prior_expr},\"\")"
+                        ws.cell(r, yoy_col).value = (
+                            f'=IFERROR('
+                            f'IF({prior_expr}="","N/A",'
+                            f'IF(AND({prior_expr}=0,{curr_addr}=0),0,'
+                            f'IF(AND({prior_expr}=0,{curr_addr}>0),"N/A",'
+                            f'({curr_addr}-{prior_expr})/{prior_expr}))),'
+                            f'"N/A")'
+                        )
+                for h, c in col_index.items():
+                    if h.startswith("YoY "):
+                        for r in range(first_data_row, last_data_row + 1):
+                            ws.cell(r, c).number_format = "0.0%"
+                    if h.startswith("Prior "):
+                        for r in range(first_data_row, last_data_row + 1):
+                            ws.cell(r, c).number_format = "#,##0"
+
+    # Single-month YoY handled above when needed (unchanged)
+
+    # Styling: bold rollups & TOTAL rows
+    rollup_names = set(ROLLUP_ORDER + list(ROLLUPS.keys()))
+    for r in range(first_data_row, last_data_row + 1):
+        if str(ws.cell(r, 1).value) in rollup_names:
+            ws.cell(r, 1).font = Font(bold=True)
+        wc_col = None
+        for c in range(1, ws.max_column+1):
+            if ws.cell(header_row, c).value == "Worker Category":
+                wc_col = c; break
+        if wc_col:
+            if str(ws.cell(r, wc_col).value or "").upper().startswith("TOTAL"):
+                for c in range(1, ws.max_column+1):
+                    ws.cell(r, c).font = Font(bold=True)
+                    ws.cell(r, c).fill = FILL_TOTAL_ROW
+
+    # Freeze, filter, table
+    if df.shape[0] > 0:
+        first_metric_col = len(dims) + 1
+        ws.freeze_panes = ws.cell(first_data_row, first_metric_col)
+        ws.auto_filter.ref = f"A{header_row}:{ws.cell(last_data_row, ws.max_column).coordinate}"
+        table_ref = f"A{header_row}:{ws.cell(last_data_row, ws.max_column).coordinate}"
+        table = Table(displayName=ws.title.replace(" ","_"), ref=table_ref)
+        table.tableStyleInfo = TableStyleInfo(name="TableStyleLight9", showRowStripes=True, showColumnStripes=False)
+        ws.add_table(table)
+
+    # Totals row
+    if df.shape[0] > 0:
+        totals_row = last_data_row + 2
+        ws.cell(totals_row, 1, "TOTALS (visible rows)").font = Font(bold=True)
+        for c in range(len(dims)+1, ws.max_column+1):
+            ws.cell(totals_row, c).value = f"=SUBTOTAL(9,{ws.cell(first_data_row,c).coordinate}:{ws.cell(last_data_row,c).coordinate})"
+            ws.cell(totals_row, c).font = Font(bold=True)
+
+    # Data bars on months
+    if monthly_mode and df.shape[0] > 0:
+        months = months_up_to_quarter(current_q)
+        col_index = {ws.cell(header_row, c).value: c for c in range(1, ws.max_column+1) if ws.cell(header_row, c).value}
+        mn = [col_index[m] for m in months if m in col_index]
+        if mn:
+            m0, mN = min(mn), max(mn)
+            ws.conditional_formatting.add(
+                f"{ws.cell(first_data_row, m0).coordinate}:{ws.cell(last_data_row, mN).coordinate}",
+                DataBarRule(start_type='min', end_type='max', color="63BE7B")
+            )
+
+    # MoM & QoQ highlight rules (TUNABLE)
+    if monthly_mode and df.shape[0] > 0:
+        col_index = {ws.cell(header_row, c).value: c for c in range(1, ws.max_column+1) if ws.cell(header_row, c).value}
+        # MoM
+        for h, cidx in col_index.items():
+            if not h.startswith("MoM "):
+                continue
+            m = h.replace("MoM ","",1)
+            diff_h = f"Diff {m}"
+            if diff_h not in col_index: continue
+            pct_col_letter  = ws.cell(1, cidx).column_letter
+            diff_col_letter = ws.cell(1, col_index[diff_h]).column_letter
+            rng = f"{pct_col_letter}{first_data_row}:{pct_col_letter}{last_data_row}"
+            red_formula = (
+                f"=AND(ISNUMBER({pct_col_letter}{first_data_row}),"
+                f"ABS({pct_col_letter}{first_data_row})>={mom_pct_threshold},"
+                f"ABS({diff_col_letter}{first_data_row})>={abs_cutoff})"
+            )
+            y_formula = (
+                f"=AND(ISNUMBER({pct_col_letter}{first_data_row}),"
+                f"ABS({pct_col_letter}{first_data_row})>={mom_pct_threshold},"
+                f"ABS({diff_col_letter}{first_data_row})<{abs_cutoff})"
+            )
+            ws.conditional_formatting.add(rng, FormulaRule(formula=[red_formula], fill=FILL_RED))
+            ws.conditional_formatting.add(rng, FormulaRule(formula=[y_formula], fill=FILL_YELLOW))
+        # QoQ
+        for h, cidx in col_index.items():
+            if not h.startswith("%Diff "): continue
+            qlbl = h.replace("%Diff ","",1)
+            diff_h = f"Diff {qlbl}"
+            if diff_h not in col_index: continue
+            pct_col_letter  = ws.cell(1, cidx).column_letter
+            diff_col_letter = ws.cell(1, col_index[diff_h]).column_letter
+            rng = f"{pct_col_letter}{first_data_row}:{pct_col_letter}{last_data_row}"
+            red_formula = (
+                f"=AND(ISNUMBER({pct_col_letter}{first_data_row}),"
+                f"ABS({pct_col_letter}{first_data_row})>={qoq_pct_threshold},"
+                f"ABS({diff_col_letter}{first_data_row})>={abs_cutoff})"
+            )
+            y_formula = (
+                f"=AND(ISNUMBER({pct_col_letter}{first_data_row}),"
+                f"ABS({pct_col_letter}{first_data_row})>={qoq_pct_threshold},"
+                f"ABS({diff_col_letter}{first_data_row})<{abs_cutoff})"
+            )
+            ws.conditional_formatting.add(rng, FormulaRule(formula=[red_formula], fill=FILL_RED))
+            ws.conditional_formatting.add(rng, FormulaRule(formula=[y_formula], fill=FILL_YELLOW))
+
+# =============== Build QC tabs (per question) ===============
+def build_monthly_qc(staging_sheet: pd.DataFrame, title: str, wb: Workbook, year: int, current_q: str,
+                     prior_sheet: Optional[pd.DataFrame],
+                     mom: float, qoq: float, abs_cut: float):
+    if staging_sheet is None or staging_sheet.empty:
+        return
+    # Build FI groups from the entities present
+    fi_groups = build_fi_groups_from_entity_map(staging_sheet["entity_name"])
+    big = add_rollups(staging_sheet.rename(columns=str), fi_groups)
+    piv = pivot_monthly(big, year=year, current_q=current_q)
+    prior_piv = None
+    if prior_sheet is not None and not prior_sheet.empty:
+        prior_big = add_rollups(prior_sheet.rename(columns=str), fi_groups)
+        prior_piv = pivot_monthly(prior_big, year=year-1, current_q=current_q)
+    write_qc_sheet(
+        wb, title, piv, year, current_q,
+        monthly_mode=True, prior_df=prior_piv,
+        mom_pct_threshold=mom, abs_cutoff=abs_cut, qoq_pct_threshold=qoq,
+    )
+
+def build_single_month_qc(staging_sheet: pd.DataFrame, title: str, month: str, wb: Workbook, year: int, current_q: str,
+                          prior_sheet: Optional[pd.DataFrame],
+                          mom: float, qoq: float, abs_cut: float):
+    if staging_sheet is None or staging_sheet.empty:
+        return
+    fi_groups = build_fi_groups_from_entity_map(staging_sheet["entity_name"])
+    big = add_rollups(staging_sheet.rename(columns=str), fi_groups)
+    piv = pivot_single_month(big, year=year, month_name=month)
+    prior_piv = None
+    if prior_sheet is not None and not prior_sheet.empty:
+        prior_big = add_rollups(prior_sheet.rename(columns=str), fi_groups)
+        prior_piv = pivot_single_month(prior_big, year=year-1, month_name=month)
+    write_qc_sheet(
+        wb, title, piv, year, current_q,
+        monthly_mode=False, single_month=month, prior_df=prior_piv,
+        mom_pct_threshold=mom, abs_cutoff=abs_cut, qoq_pct_threshold=qoq,
+    )
+
+# =============== Prefs (remember per-question thresholds) ===============
+PREFS_PATH = Path.home() / ".qc_prefs.json"
+DEFAULTS = {"mom":0.25, "qoq":0.25, "abs":50}
+
+def load_prefs() -> Dict[str, Dict[str,float]]:
+    if PREFS_PATH.exists():
+        try:
+            return json.loads(PREFS_PATH.read_text())
+        except Exception:
+            return {}
+    return {}
+
+def save_prefs(prefs: Dict[str, Dict[str,float]]):
+    try:
+        PREFS_PATH.write_text(json.dumps(prefs, indent=2))
+    except Exception:
+        pass
+
+def prompt_thresholds(question_code: str, cli_mom: Optional[float], cli_qoq: Optional[float], cli_abs: Optional[float]) -> Tuple[float,float,float]:
+    prefs = load_prefs()
+    base = prefs.get(question_code, DEFAULTS)
+    def ask(label, default_val, cli_val):
+        if cli_val is not None: return float(cli_val)
+        try:
+            raw = input(f"{label} [{default_val}]: ").strip()
+            return float(raw) if raw else float(default_val)
+        except Exception:
+            return float(default_val)
+    mom = ask("MoM % threshold", base.get("mom", DEFAULTS["mom"]), cli_mom)
+    qoq = ask("QoQ % threshold", base.get("qoq", DEFAULTS["qoq"]), cli_qoq)
+    ab  = ask("Abs diff cutoff", base.get("abs", DEFAULTS["abs"]), cli_abs)
+    prefs[question_code] = {"mom":mom,"qoq":qoq,"abs":ab}
+    save_prefs(prefs)
+    return mom, qoq, ab
+
+# =============== Main CLI ===============
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Fast, values-only QC workbook (embedded FI mapping + rollups).")
+    ap = argparse.ArgumentParser(description="Interactive, styled QC builder (per question) with tunable thresholds.")
     ap.add_argument("--stage", required=True, help="Path to current staging_all.xlsx")
-    ap.add_argument("--out", required=True, help="Output workbook .xlsx")
     ap.add_argument("--prior-stage", help="Optional prior-year staging_all.xlsx for YoY")
+    ap.add_argument("--question", help="One of: Q1A,Q1B,Q2A,Q2B,Q3,Q4,Q5,Q1A_JF_Q4,Q2A_JF_Q4,all")
+    ap.add_argument("--mom-threshold", type=float, help="MoM percent threshold (overrides prompt)")
+    ap.add_argument("--qoq-threshold", type=float, help="QoQ percent threshold (overrides prompt)")
+    ap.add_argument("--abs-cutoff", type=float, help="Absolute diff cutoff (overrides prompt)")
     args = ap.parse_args()
 
     stage_path = Path(args.stage)
     if not stage_path.exists():
-        raise SystemExit(f"[ERROR] Stage not found: {stage_path}")
+        print(f"[ERROR] Stage not found: {stage_path}")
+        return 2
 
-    sheets = load_xlsx(stage_path)
-    if not sheets:
-        raise SystemExit("[ERROR] Stage file has no readable sheets.")
+    sheets = load_stage_excel(stage_path)
+    # pick year & current_q from any available sheet with columns
+    any_df = None
+    for nm in ["Q5","Q4","Q3","Q2A_Main","Q1A_Main","Q2B","Q1B"]:
+        if nm in sheets and not sheets[nm].empty:
+            any_df = sheets[nm]; break
+    if any_df is None:
+        print("[ERROR] No usable sheets in stage file.")
+        return 1
 
-    prior_sheets: Dict[str,pd.DataFrame] = {}
+    year = int(pd.Series(any_df["year"]).mode().iat[0])
+    current_q = pick_current_quarter_from_staging(any_df)
+
+    prior_sheets = {}
     if args.prior_stage:
-        ppath = Path(args.prior_stage)
-        if not ppath.exists():
-            print(f"[WARN] Prior stage not found: {ppath} (YoY will be skipped)")
+        prior_path = Path(args.prior_stage)
+        if prior_path.exists():
+            prior_sheets = load_stage_excel(prior_path)
         else:
-            prior_sheets = load_xlsx(ppath)
+            print(f"[WARN] Prior stage not found: {prior_path} (YoY skipped)")
 
-    current_q = detect_current_quarter(sheets)
+    # Decide which questions to run
+    available = {
+        "Q1A": "Q1A_Main" in sheets and not sheets["Q1A_Main"].empty,
+        "Q1B": "Q1B" in sheets and not sheets["Q1B"].empty,
+        "Q2A": "Q2A_Main" in sheets and not sheets["Q2A_Main"].empty,
+        "Q2B": "Q2B" in sheets and not sheets["Q2B"].empty,
+        "Q3":  "Q3" in sheets and not sheets["Q3"].empty,
+        "Q4":  "Q4" in sheets and not sheets["Q4"].empty,
+        "Q5":  "Q5" in sheets and not sheets["Q5"].empty,
+        "Q1A_JF_Q4": "Q1A_JobFunc_Q4" in sheets and not sheets["Q1A_JobFunc_Q4"].empty,
+        "Q2A_JF_Q4": "Q2A_JobFunc_Q4" in sheets and not sheets["Q2A_JobFunc_Q4"].empty,
+    }
 
-    outputs: List[Tuple[str,pd.DataFrame]] = []
+    q = args.question
+    if not q:
+        opts = [k for k,v in available.items() if v]
+        print("Which QC do you want? Available:", ", ".join(opts + (["all"] if any(available.values()) else [])))
+        q = input("Enter code (e.g., Q2A or all): ").strip().upper() or (opts[0] if opts else "Q1A")
 
-    # Q1A main
-    if "Q1A_Main" in sheets and not sheets["Q1A_Main"].empty:
-        prev = prior_sheets.get("Q1A_Main")
-        outputs.append(("QC_Q1A", make_monthly_sheet(sheets["Q1A_Main"], current_q, prev)))
+    targets = []
+    if q == "ALL":
+        targets = [k for k,v in available.items() if v]
+    else:
+        if q not in available or not available[q]:
+            print(f"[ERROR] '{q}' not found in staging or empty.")
+            return 3
+        targets = [q]
 
-    # Q1B (Jun/Dec may exist one or both)
-    if "Q1B" in sheets and not sheets["Q1B"].empty:
-        months_avail = [m for m in ["Jun","Dec"] if m in sheets["Q1B"].columns]
-        if months_avail:
+    for qcode in targets:
+        # Prepare thresholds (per question, interactive if not provided)
+        mom, qoq, ab = prompt_thresholds(qcode, args.mom_threshold, args.qoq_threshold, args.abs_cutoff)
+        # Build workbook for that question
+        wb = Workbook(); wb.remove(wb.active)
+        title = f"QC_{qcode}"
+        # Route per question
+        if qcode == "Q1A":
+            prev = prior_sheets.get("Q1A_Main")
+            build_monthly_qc(sheets["Q1A_Main"], title, wb, year, current_q, prev, mom, qoq, ab)
+        elif qcode == "Q1B":
+            month = "Jun" if current_q == "Q2" else ("Dec" if current_q == "Q4" else "Jun")
             prev = prior_sheets.get("Q1B")
-            outputs.append(("QC_Q1B", make_single_month_sheet(sheets["Q1B"], months_avail, prev)))
-
-    # Q1A Job Function (Q4 only)
-    if "Q1A_JobFunc_Q4" in sheets and not sheets["Q1A_JobFunc_Q4"].empty:
-        prev = prior_sheets.get("Q1A_JobFunc_Q4")
-        outputs.append(("QC_Q1A_JF_Q4", make_jobfunc_q4_sheet(sheets["Q1A_JobFunc_Q4"], prev)))
-
-    # Q2A main
-    if "Q2A_Main" in sheets and not sheets["Q2A_Main"].empty:
-        df = sheets["Q2A_Main"].rename(columns={"subsection":"subquestion"})
-        prev = prior_sheets.get("Q2A_Main")
-        outputs.append(("QC_Q2A", make_monthly_sheet(df, current_q, prev)))
-
-    # Q2B
-    if "Q2B" in sheets and not sheets["Q2B"].empty:
-        df = sheets["Q2B"].rename(columns={"subsection":"subquestion"})
-        months_avail = [m for m in ["Jun","Dec"] if m in df.columns]
-        if months_avail:
+            build_single_month_qc(sheets["Q1B"], title, month, wb, year, current_q, prev, mom, qoq, ab)
+        elif qcode == "Q2A":
+            df = sheets["Q2A_Main"].rename(columns={"subsection":"subquestion"})
+            prev = prior_sheets.get("Q2A_Main")
+            build_monthly_qc(df, title, wb, year, current_q, prev, mom, qoq, ab)
+        elif qcode == "Q2B":
+            df = sheets["Q2B"].rename(columns={"subsection":"subquestion"})
+            month = "Jun" if current_q == "Q2" else ("Dec" if current_q == "Q4" else "Jun")
             prev = prior_sheets.get("Q2B")
-            outputs.append(("QC_Q2B", make_single_month_sheet(df, months_avail, prev)))
+            build_single_month_qc(df, title, month, wb, year, current_q, prev, mom, qoq, ab)
+        elif qcode == "Q3":
+            prev = prior_sheets.get("Q3")
+            build_monthly_qc(sheets["Q3"], title, wb, year, current_q, prev, mom, qoq, ab)
+        elif qcode == "Q4":
+            prev = prior_sheets.get("Q4")
+            build_monthly_qc(sheets["Q4"], title, wb, year, current_q, prev, mom, qoq, ab)
+        elif qcode == "Q5":
+            prev = prior_sheets.get("Q5")
+            build_monthly_qc(sheets["Q5"], title, wb, year, current_q, prev, mom, qoq, ab)
+        elif qcode == "Q1A_JF_Q4":
+            prev = prior_sheets.get("Q1A_JobFunc_Q4")
+            # Treat value as Dec; reuse monthly builder by first converting
+            jf = sheets["Q1A_JobFunc_Q4"].copy()
+            jf["Dec"] = jf.get("value", 0)
+            jf = jf.drop(columns=[c for c in jf.columns if c not in ["entity_name","year","quarter","subquestion","worker_category","job_function","Dec"]])
+            build_monthly_qc(jf, title, wb, year, current_q, prev, mom, qoq, ab)
+        elif qcode == "Q2A_JF_Q4":
+            prev = prior_sheets.get("Q2A_JobFunc_Q4")
+            jf2 = sheets["Q2A_JobFunc_Q4"].rename(columns={"subsection":"subquestion"}).copy()
+            jf2["Dec"] = jf2.get("value", 0)
+            jf2 = jf2.drop(columns=[c for c in jf2.columns if c not in ["entity_name","year","quarter","subquestion","worker_category","job_function","Dec"]])
+            build_monthly_qc(jf2, title, wb, year, current_q, prev, mom, qoq, ab)
+        else:
+            print(f"[WARN] Unknown question code: {qcode}")
+            continue
 
-    # Q2A Job Function (Q4 only)
-    if "Q2A_JobFunc_Q4" in sheets and not sheets["Q2A_JobFunc_Q4"].empty:
-        df = sheets["Q2A_JobFunc_Q4"].rename(columns={"subsection":"subquestion"})
-        prev = prior_sheets.get("Q2A_JobFunc_Q4")
-        outputs.append(("QC_Q2A_JF_Q4", make_jobfunc_q4_sheet(df, prev)))
+        # About sheet
+        about = wb.create_sheet("About")
+        about["A1"] = "RLMS – QC Workbook"
+        about["A2"] = "Question";       about["B2"] = qcode
+        about["A3"] = "Year";           about["B3"] = year
+        about["A4"] = "Up to Quarter";  about["B4"] = current_q
+        about["A5"] = "Generated at";   about["B5"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        about["A7"] = "MoM threshold";  about["B7"] = mom
+        about["A8"] = "QoQ threshold";  about["B8"] = qoq
+        about["A9"] = "Abs cutoff";     about["B9"] = ab
 
-    # Q3
-    if "Q3" in sheets and not sheets["Q3"].empty:
-        prev = prior_sheets.get("Q3")
-        outputs.append(("QC_Q3", make_monthly_sheet(sheets["Q3"], current_q, prev)))
+        out_name = f"QC_{qcode}.xlsx"
+        wb.save(out_name)
+        print(f"[DONE] {qcode}: wrote {out_name}")
 
-    # Q4
-    if "Q4" in sheets and not sheets["Q4"].empty:
-        prev = prior_sheets.get("Q4")
-        outputs.append(("QC_Q4", make_monthly_sheet(sheets["Q4"], current_q, prev)))
-
-    # Q5
-    if "Q5" in sheets and not sheets["Q5"].empty:
-        prev = prior_sheets.get("Q5")
-        outputs.append(("QC_Q5", make_monthly_sheet(sheets["Q5"], current_q, prev)))
-
-    if not outputs:
-        raise SystemExit("[ERROR] No usable sheets in stage file.")
-
-    # Write workbook (values only) + freeze header & autofilter
-    with pd.ExcelWriter(args.out, engine="openpyxl") as w:
-        for name, df in outputs:
-            df.to_excel(w, index=False, sheet_name=name)
-        wb = w.book
-        for name, _ in outputs:
-            ws = wb[name]
-            ws.freeze_panes = "A2"
-            ws.auto_filter.ref = f"A1:{ws.cell(row=ws.max_row, column=ws.max_column).coordinate}"
-
-    print(f"[DONE] Wrote QC workbook → {args.out}  (Quarter in scope: {current_q})")
     return 0
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-
-def sort_rows(df: pd.DataFrame) -> pd.DataFrame:
-    # collect labels in desired order, but make them UNIQUE while preserving order
-    fi_types = (
-        df.get("fi_type", pd.Series([], dtype=object))
-          .dropna()
-          .astype(str)
-          .unique()
-          .tolist()
-    )
-    ordered_labels = []
-    for x in ROLLUP_ORDER + fi_types:
-        if x not in ordered_labels:
-            ordered_labels.append(x)
-
-    cat = pd.CategoricalDtype(categories=ordered_labels, ordered=True)
-
-    dfo = df.copy()
-    if "entity_group" in dfo.columns:
-        dfo["entity_group"] = dfo["entity_group"].astype(str).astype(cat)
-
-    # stable sort: entity_group (by our categorical order) → institution → other dims
-    extra = [c for c in ["subquestion","worker_category","job_function"] if c in dfo.columns]
-    return dfo.sort_values(by=["entity_group","institution", *extra], kind="stable")
-
-
-
-
-
