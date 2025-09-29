@@ -1,3 +1,4 @@
+# qc_fast_embedded.py
 from __future__ import annotations
 import argparse
 from pathlib import Path
@@ -8,7 +9,7 @@ import pandas as pd
 MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
 QMAP   = {"Q1":["Jan","Feb","Mar"], "Q2":["Apr","May","Jun"], "Q3":["Jul","Aug","Sep"], "Q4":["Oct","Nov","Dec"]}
 
-# Your rollup mapping & order (exactly as provided)
+# ----------------- ROLLUPS (as provided) -----------------
 ROLLUPS: Dict[str, List[str]] = {
     "All Financial Institutions": [
         "Commercial Banks", "Investment Banks", "Islamic Banks", "DFI",
@@ -44,7 +45,143 @@ ROLLUP_ORDER = [
     "Takaful Operators",
 ]
 
-# ----------------- UTILITIES -----------------
+# ----------------- FULL EMBEDDED MAPPING -----------------
+ENTITY_TO_TYPE: Dict[str, str] = {
+    # Banks / DFIs / Digital / Foreign / IIB
+    "AFFIN BANK BERHAD": "Commercial Banks",
+    "AFFIN HWANG INVESTMENT BANK BERHAD": "Investment Banks",
+    "AFFIN ISLAMIC BANK BERHAD": "Islamic Banks",
+    "AGROBANK (BANK PERTANIAN MALAYSIA BERHAD)": "DFI",
+    "AL RAJHI BANKING & INVESTMENT CORPORATION (MALAYSIA) BHD": "Islamic Banks",
+    "ALKHAIR INTERNATIONAL ISLAMIC BANK BHD": "International Islamic Banks",
+    "ALLIANCE BANK MALAYSIA BERHAD": "Commercial Banks",
+    "ALLIANCE INVESTMENT BANK BERHAD": "Investment Banks",
+    "ALLIANCE ISLAMIC BANK BERHAD": "Islamic Banks",
+    "AMBANK (M) BERHAD": "Commercial Banks",
+    "AMBANK ISLAMIC BERHAD": "Islamic Banks",
+    "AMINVESTMENT BANK BERHAD": "Investment Banks",
+    "MBSB BANK BERHAD": "Islamic Banks",
+    "BANGKOK BANK BERHAD": "Foreign Banks",
+    "BANK ISLAM MALAYSIA BERHAD": "Islamic Banks",
+    "BANK KERJASAMA RAKYAT MALAYSIA BERHAD": "Islamic Banks",
+    "BANK MUAMALAT MALAYSIA BERHAD": "Islamic Banks",
+    "BANK OF AMERICA MALAYSIA BERHAD": "Foreign Banks",
+    "BANK OF CHINA (MALAYSIA) BERHAD": "Foreign Banks",
+    "BANK OF TOKYO-MITSUBISHI UFJ (MALAYSIA) BERHAD": "Foreign Banks",
+    "BANK PEMBANGUNAN MALAYSIA BERHAD": "DFI",
+    "BANK SIMPANAN NASIONAL": "DFI",
+    "BNP PARIBAS MALAYSIA BERHAD": "Foreign Banks",
+    "CHINA CONSTRUCTION BANK MALAYSIA BERHAD": "Foreign Banks",
+    "CIMB BANK BERHAD": "Commercial Banks",
+    "CIMB INVESTMENT BANK BERHAD": "Investment Banks",
+    "CIMB ISLAMIC BANK BERHAD": "Islamic Banks",
+    "CITIBANK BERHAD": "Foreign Banks",
+    "DEUTSCHE BANK (MALAYSIA) BERHAD": "Foreign Banks",
+    "DEUTSCHE BANK AG, INTERNATIONAL ISLAMIC BANKING, MALAYSIA BRANCH": "International Islamic Banks",
+    "EXPORT-IMPORT BANK OF MALAYSIA BERHAD": "DFI",
+    "HONG LEONG BANK BERHAD": "Commercial Banks",
+    "HONG LEONG INVESTMENT BANK BERHAD": "Investment Banks",
+    "HONG LEONG ISLAMIC BANK BERHAD": "Islamic Banks",
+    "HSBC AMANAH MALAYSIA BERHAD": "Islamic Banks",
+    "HSBC BANK MALAYSIA BERHAD": "Commercial Banks",
+    "IBDAR BANK BSC": "International Islamic Banks",
+    "INDIA INTERNATIONAL BANK (MALAYSIA) BERHAD": "Foreign Banks",
+    "INDUSTRIAL AND COMMERCIAL BANK OF CHINA (MALAYSIA) BERHAD": "Foreign Banks",
+    "J.P MORGAN CHASE BANK BERHAD": "Foreign Banks",
+    "KAF INVESTMENT BANK BERHAD": "Investment Banks",
+    "KENANGA INVESTMENT BANK BERHAD": "Investment Banks",
+    "KUWAIT FINANCE HOUSE (MALAYSIA) BERHAD": "Islamic Banks",
+    "MALAYAN BANKING BERHAD": "Commercial Banks",
+    "MAYBANK INVESTMENT BANK BERHAD": "Investment Banks",
+    "MAYBANK ISLAMIC BERHAD": "Islamic Banks",
+    "MIDF AMANAH INVESTMENT BANK BERHAD": "Investment Banks",
+    "MIZUHO CORPORATE BANK (MALAYSIA) BERHAD": "Foreign Banks",
+    "NATIONAL BANK OF ABU DHABI MALAYSIA BERHAD": "Foreign Banks",
+    "OCBC AL-AMIN BANK BERHAD": "Islamic Banks",
+    "OCBC BANK (MALAYSIA) BERHAD": "Commercial Banks",
+    "PT. BANK SYARIAH MUALAMAT INDONESIA, TBK": "International Islamic Banks",
+    "PUBLIC BANK BERHAD": "Commercial Banks",
+    "PUBLIC INVESTMENT BANK BERHAD": "Investment Banks",
+    "PUBLIC ISLAMIC BANK BERHAD": "Islamic Banks",
+    "RHB BANK BERHAD": "Commercial Banks",
+    "RHB INVESTMENT BANK BERHAD": "Investment Banks",
+    "RHB ISLAMIC BANK BERHAD": "Islamic Banks",
+    "SMALL MEDIUM ENTERPRISE DEVELOPMENT BANK MALAYSIA BERHAD": "DFI",
+    "STANDARD CHARTERED BANK MALAYSIA BERHAD": "Commercial Banks",
+    "STANDARD CHARTERED SAADIQ BERHAD": "Islamic Banks",
+    "SUMITOMO MITSUI BANKING CORPORATION MALAYSIA BERHAD": "Foreign Banks",
+    "THE BANK OF NOVA SCOTIA BERHAD": "Foreign Banks",
+    "THE ROYAL BANK OF SCOTLAND BERHAD": "Foreign Banks",
+    "UNITED OVERSEAS BANK (MALAYSIA) BHD.": "Commercial Banks",
+    "BOOST BANK BERHAD": "Digital Banks",
+    "AEON BANK (M) BERHAD": "Digital Banks",
+    "KAF DIGITAL BERHAD": "Digital Banks",
+    "YTL DIGITAL BANK BERHAD": "Digital Banks",
+    "GX BANK BERHAD": "Digital Banks",
+
+    # Insurance & Takaful (inc. reinsurers)
+    "ACR RETAKAFUL BERHAD": "Takaful Operators",
+    "AIA BHD.": "Insurers",
+    "AIA GENERAL BERHAD": "Insurers",
+    "AIA PUBLIC TAKAFUL BHD.": "Takaful Operators",
+    "AIG MALAYSIA INSURANCE BERHAD": "Insurers",
+    "ALLIANZ GENERAL INSURANCE COMPANY (MALAYSIA) BERHAD": "Insurers",
+    "ALLIANZ LIFE INSURANCE MALAYSIA BERHAD": "Insurers",
+    "AMBRA VERSICHERUNG AG": "Insurers",
+    "AMMETLIFE INSURANCE BERHAD": "Insurers",
+    "AMMETLIFE TAKAFUL BERHAD": "Takaful Operators",
+    "ASIA CAPITAL REINSURANCE MALAYSIA SDN. BHD.": "Insurers",
+    "BERJAYA SOMPO INSURANCE BERHAD": "Insurers",
+    "CHUBB INSURANCE MALAYSIA BERHAD": "Insurers",
+    "DANAJAMIN NASIONAL BERHAD": "DFI",
+    "ETIQA GENERAL INSURANCE BERHAD": "Insurers",
+    "ETIQA LIFE INSURANCE BERHAD": "Insurers",
+    "ETIQA FAMILY TAKAFUL BERHAD": "Takaful Operators",
+    "ETIQA GENERAL TAKAFUL BERHAD": "Takaful Operators",
+    "FWD INSURANCE BERHAD": "Insurers",
+    "FWD TAKAFUL BERHAD": "Takaful Operators",
+    "GENERALI INSURANCE MALAYSIA BERHAD": "Insurers",
+    "GENERALI LIFE INSURANCE MALAYSIA BERHAD": "Insurers",
+    "GREAT EASTERN GENERAL INSURANCE (MALAYSIA) BERHAD": "Insurers",
+    "GREAT EASTERN LIFE ASSURANCE (MALAYSIA) BERHAD": "Insurers",
+    "GREAT EASTERN TAKAFUL BERHAD": "Takaful Operators",
+    "HANNOVER RUECKVERSICHERUNG AG, MALAYSIAN BRANCH": "Insurers",
+    "HONG LEONG ASSURANCE BERHAD": "Insurers",
+    "HONG LEONG MSIG TAKAFUL BERHAD": "Takaful Operators",
+    "LIBERTY GENERAL INSURANCE BERHAD": "Insurers",
+    "LONPAC INSURANCE BHD.": "Insurers",
+    "MALAYSIAN LIFE REINSURANCE GROUP BERHAD": "Insurers",
+    "MALAYSIAN REINSURANCE BERHAD": "Insurers",
+    "MANULIFE INSURANCE BERHAD": "Insurers",
+    "MCIS INSURANCE BERHAD": "Insurers",
+    "MSIG INSURANCE (MALAYSIA) BHD": "Insurers",
+    "MUNCHENER RUCKVERSICHERUNGS-GESELLSCHAFT (Munich Re Retakaful)": "Takaful Operators",
+    "PACIFIC & ORIENT INSURANCE CO. BERHAD": "Insurers",
+    "PROGRESSIVE INSURANCE BHD.": "Insurers",
+    "PRUDENTIAL ASSURANCE MALAYSIA BERHAD": "Insurers",
+    "PRUDENTIAL BSN TAKAFUL BERHAD": "Takaful Operators",
+    "QBE INSURANCE (MALAYSIA) BERHAD": "Insurers",
+    "RHB INSURANCE BERHAD": "Insurers",
+    "SUN LIFE MALAYSIA ASSURANCE BERHAD": "Insurers",
+    "SUN LIFE MALAYSIA TAKAFUL BERHAD": "Takaful Operators",
+    "SWISS RE ASIA PTE LTD": "Insurers",
+    "SWISS REINSURANCE COMPANY LTD (SWISS RE RETAKAFUL)": "Takaful Operators",
+    "SYARIKAT TAKAFUL MALAYSIA AM BERHAD": "Takaful Operators",
+    "SYARIKAT TAKAFUL MALAYSIA KELUARGA BERHAD": "Takaful Operators",
+    "TAKAFUL IKHLAS FAMILY BERHAD": "Takaful Operators",
+    "TAKAFUL IKHLAS GENERAL BERHAD": "Takaful Operators",
+    "THE PACIFIC INSURANCE BERHAD": "Insurers",
+    "THE TOA REINSURANCE COMPANY LTD.": "Insurers",
+    "TOKIO MARINE INSURANS (MALAYSIA) BERHAD": "Insurers",
+    "TOKIO MARINE LIFE INSURANCE MALAYSIA BHD": "Insurers",
+    "TUNE INSURANCE MALAYSIA BERHAD": "Insurers",
+    "ZURICH GENERAL INSURANCE MALAYSIA BERHAD": "Insurers",
+    "ZURICH LIFE INSURANCE MALAYSIA BERHAD": "Insurers",
+    "ZURICH GENERAL TAKAFUL MALAYSIA BERHAD": "Takaful Operators",
+    "ZURICH TAKAFUL MALAYSIA BERHAD": "Takaful Operators",
+}
+
+# ----------------- HELPERS -----------------
 def load_xlsx(path: Path) -> Dict[str, pd.DataFrame]:
     xl = pd.ExcelFile(path, engine="openpyxl")
     out: Dict[str, pd.DataFrame] = {}
@@ -124,7 +261,6 @@ def add_qoq(df: pd.DataFrame) -> pd.DataFrame:
 def add_yoy_quarters(curr_q: pd.DataFrame, prev_q: Optional[pd.DataFrame], join_dims: List[str]) -> pd.DataFrame:
     if prev_q is None or prev_q.empty:
         return curr_q
-    # Join on non-time dims
     join_keys = [c for c in join_dims if c in curr_q.columns]
     left  = curr_q.copy()
     right = prev_q.copy()
@@ -138,18 +274,12 @@ def add_yoy_quarters(curr_q: pd.DataFrame, prev_q: Optional[pd.DataFrame], join_
         merged[f"YoY_{q}"] = (merged[q] - merged[pr]) / denom
     return merged
 
-def read_entity_map(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    need = {"entity_name","fi_type"}
-    missing = need - set(df.columns)
-    if missing:
-        raise ValueError(f"entity map missing columns: {missing}")
-    return df[["entity_name","fi_type"]].copy()
-
-def attach_fi_type(df: pd.DataFrame, emap: pd.DataFrame) -> pd.DataFrame:
+def attach_fi_type(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
     if "entity_name" not in df.columns:
         raise ValueError("staging sheet missing 'entity_name'")
-    return df.merge(emap, on="entity_name", how="left")
+    df["fi_type"] = df["entity_name"].map(ENTITY_TO_TYPE)
+    return df
 
 def base_group_sum(df: pd.DataFrame, value_cols: List[str], dims: List[str]) -> pd.DataFrame:
     agg = {c:"sum" for c in value_cols}
@@ -166,7 +296,7 @@ def build_rollup_blocks(df_with_type: pd.DataFrame, value_cols: List[str], facet
     base_dims = ["year","quarter"]
     dims_inst = ["fi_type","entity_group","institution"] + facet_dims + base_dims
 
-    # ensure required cols exist
+    # Ensure expected cols
     for c in ["fi_type","entity_name","year","quarter"]:
         if c not in df_with_type.columns:
             df_with_type[c] = ""
@@ -181,7 +311,7 @@ def build_rollup_blocks(df_with_type: pd.DataFrame, value_cols: List[str], facet
     roll_frames = []
     for rname in ROLLUP_ORDER:
         members = ROLLUPS.get(rname, [])
-        if not members:  # e.g., the simple leaf rollups already covered as entity_group=fi_type in inst
+        if not members:
             continue
         sub = df_with_type[df_with_type["fi_type"].isin(members)].copy()
         if sub.empty:
@@ -200,61 +330,48 @@ def build_rollup_blocks(df_with_type: pd.DataFrame, value_cols: List[str], facet
     return out[cols]
 
 def sort_rows(df: pd.DataFrame) -> pd.DataFrame:
-    # entity_group ordered by ROLLUP_ORDER, then institution, then others
-    order = pd.CategoricalDtype(categories=ROLLUP_ORDER + sorted([x for x in df.get("fi_type", pd.Series([])).unique() if pd.notna(x)]), ordered=True)
+    order = pd.CategoricalDtype(categories=ROLLUP_ORDER + sorted([x for x in df.get("fi_type", pd.Series([])).dropna().unique()]), ordered=True)
     dfo = df.copy()
     if "entity_group" in dfo.columns:
         dfo["entity_group"] = dfo["entity_group"].astype(order)
     return dfo.sort_values(by=["entity_group","institution"] + [c for c in ["subquestion","worker_category","job_function"] if c in dfo.columns], kind="stable")
 
-def make_monthly_sheet(stage_df: pd.DataFrame, emap: pd.DataFrame, current_q: str, prior_df: Optional[pd.DataFrame]) -> pd.DataFrame:
-    # Attach fi_type, normalize quarter
-    d0 = attach_fi_type(normalize_quarter_col(stage_df), emap)
-    # Value columns present
+# ----------------- SHEET BUILDERS -----------------
+def make_monthly_sheet(stage_df: pd.DataFrame, current_q: str, prior_df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    d0 = attach_fi_type(normalize_quarter_col(stage_df))
     vcols = [c for c in MONTHS if c in d0.columns]
-    d0 = ensure_months(d0)
-    vcols = MONTHS  # after ensure
-
-    # Facets
+    d0 = ensure_months(d0); vcols = MONTHS
     facet_dims = [c for c in ["question","subquestion","worker_category","job_function"] if c in d0.columns]
 
-    # Build rollups + institution stack
     stacked = build_rollup_blocks(d0, vcols, facet_dims)
     stacked = quarter_sums(stacked)
 
-    # In-scope months
     months = months_up_to(current_q)
     keep_metrics = months + ["Q1","Q2","Q3","Q4"]
     out = stacked[["fi_type","entity_group","institution", *facet_dims, "year","quarter", *keep_metrics]].copy()
 
-    # Add MoM & QoQ (values only)
     out = add_mom(out, months)
     out = add_qoq(out)
 
-    # YoY (if prior provided)
     if prior_df is not None and not prior_df.empty:
-        p0 = attach_fi_type(normalize_quarter_col(prior_df), emap)
+        p0 = attach_fi_type(normalize_quarter_col(prior_df))
         p0 = ensure_months(p0)
         pstack = build_rollup_blocks(p0, MONTHS, facet_dims)
         pstack = quarter_sums(pstack)
         join_dims = ["fi_type","entity_group","institution", *facet_dims]
         out = add_yoy_quarters(out, pstack, join_dims)
 
-    # Sort
-    out = sort_rows(out)
-    return out
+    return sort_rows(out)
 
-def make_single_month_sheet(stage_df: pd.DataFrame, emap: pd.DataFrame, months_avail: List[str], prior_df: Optional[pd.DataFrame]) -> pd.DataFrame:
-    d0 = attach_fi_type(normalize_quarter_col(stage_df), emap)
+def make_single_month_sheet(stage_df: pd.DataFrame, months_avail: List[str], prior_df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    d0 = attach_fi_type(normalize_quarter_col(stage_df))
     facet_dims = [c for c in ["question","subquestion","worker_category"] if c in d0.columns]
     vcols = [m for m in months_avail if m in d0.columns]
-    # Build blocks
     stacked = build_rollup_blocks(d0, vcols, facet_dims)
     out = stacked[["fi_type","entity_group","institution", *facet_dims, "year","quarter", *vcols]].copy()
 
-    # YoY for those months if prior provided (compare same month)
     if prior_df is not None and not prior_df.empty:
-        p0 = attach_fi_type(normalize_quarter_col(prior_df), emap)
+        p0 = attach_fi_type(normalize_quarter_col(prior_df))
         pstack = build_rollup_blocks(p0, vcols, facet_dims)
         join_dims = ["fi_type","entity_group","institution", *facet_dims]
         left  = out.copy()
@@ -264,14 +381,11 @@ def make_single_month_sheet(stage_df: pd.DataFrame, emap: pd.DataFrame, months_a
             denom = out[f"Prior_{m}"].replace(0, pd.NA)
             out[f"YoY_{m}"] = (out[m] - out[f"Prior_{m}"]) / denom
 
-    out = sort_rows(out)
-    return out
+    return sort_rows(out)
 
-def make_jobfunc_q4_sheet(stage_df: pd.DataFrame, emap: pd.DataFrame, prior_df: Optional[pd.DataFrame]) -> pd.DataFrame:
-    d0 = attach_fi_type(normalize_quarter_col(stage_df), emap).copy()
-    # Treat 'value' as Dec (Q4 context)
-    if "value" not in d0.columns:
-        d0["value"] = 0
+def make_jobfunc_q4_sheet(stage_df: pd.DataFrame, prior_df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    d0 = attach_fi_type(normalize_quarter_col(stage_df)).copy()
+    if "value" not in d0.columns: d0["value"] = 0
     d0["Dec"] = d0["value"]
     for m in [m for m in MONTHS if m != "Dec"]:
         if m not in d0.columns: d0[m] = 0
@@ -282,10 +396,9 @@ def make_jobfunc_q4_sheet(stage_df: pd.DataFrame, emap: pd.DataFrame, prior_df: 
     stacked = quarter_sums(stacked)
     out = stacked[["fi_type","entity_group","institution", *facet_dims, "year","quarter", *MONTHS, "Q1","Q2","Q3","Q4"]].copy()
 
-    # QoQ/YoY if prior provided
     out = add_qoq(out)
     if prior_df is not None and not prior_df.empty:
-        p0 = attach_fi_type(normalize_quarter_col(prior_df), emap).copy()
+        p0 = attach_fi_type(normalize_quarter_col(prior_df)).copy()
         if "value" not in p0.columns: p0["value"] = 0
         p0["Dec"] = p0["value"]
         for m in [m for m in MONTHS if m != "Dec"]:
@@ -300,9 +413,8 @@ def make_jobfunc_q4_sheet(stage_df: pd.DataFrame, emap: pd.DataFrame, prior_df: 
 
 # ----------------- MAIN -----------------
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Fast, values-only QC workbook for Q1–Q5 with rollups.")
+    ap = argparse.ArgumentParser(description="Fast, values-only QC workbook (embedded FI mapping + rollups).")
     ap.add_argument("--stage", required=True, help="Path to current staging_all.xlsx")
-    ap.add_argument("--entity-map", required=True, help="CSV with columns: entity_name,fi_type")
     ap.add_argument("--out", required=True, help="Output workbook .xlsx")
     ap.add_argument("--prior-stage", help="Optional prior-year staging_all.xlsx for YoY")
     args = ap.parse_args()
@@ -315,8 +427,6 @@ def main() -> int:
     if not sheets:
         raise SystemExit("[ERROR] Stage file has no readable sheets.")
 
-    emap = read_entity_map(Path(args.entity_map))
-
     prior_sheets: Dict[str,pd.DataFrame] = {}
     if args.prior_stage:
         ppath = Path(args.prior_stage)
@@ -326,34 +436,31 @@ def main() -> int:
             prior_sheets = load_xlsx(ppath)
 
     current_q = detect_current_quarter(sheets)
-    months_scope = months_up_to(current_q)
 
-    # Build each tab if present
     outputs: List[Tuple[str,pd.DataFrame]] = []
 
     # Q1A main
     if "Q1A_Main" in sheets and not sheets["Q1A_Main"].empty:
         prev = prior_sheets.get("Q1A_Main")
-        outputs.append(("QC_Q1A", make_monthly_sheet(sheets["Q1A_Main"], emap, current_q, prev)))
+        outputs.append(("QC_Q1A", make_monthly_sheet(sheets["Q1A_Main"], current_q, prev)))
 
     # Q1B (Jun/Dec may exist one or both)
     if "Q1B" in sheets and not sheets["Q1B"].empty:
         months_avail = [m for m in ["Jun","Dec"] if m in sheets["Q1B"].columns]
         if months_avail:
             prev = prior_sheets.get("Q1B")
-            outputs.append(("QC_Q1B", make_single_month_sheet(sheets["Q1B"], emap, months_avail, prev)))
+            outputs.append(("QC_Q1B", make_single_month_sheet(sheets["Q1B"], months_avail, prev)))
 
-    # Q1A Job Function (Q4 only tab)
+    # Q1A Job Function (Q4 only)
     if "Q1A_JobFunc_Q4" in sheets and not sheets["Q1A_JobFunc_Q4"].empty:
         prev = prior_sheets.get("Q1A_JobFunc_Q4")
-        outputs.append(("QC_Q1A_JF_Q4", make_jobfunc_q4_sheet(sheets["Q1A_JobFunc_Q4"], emap, prev)))
+        outputs.append(("QC_Q1A_JF_Q4", make_jobfunc_q4_sheet(sheets["Q1A_JobFunc_Q4"], prev)))
 
     # Q2A main
     if "Q2A_Main" in sheets and not sheets["Q2A_Main"].empty:
-        # normalize subsection -> subquestion if exists
         df = sheets["Q2A_Main"].rename(columns={"subsection":"subquestion"})
         prev = prior_sheets.get("Q2A_Main")
-        outputs.append(("QC_Q2A", make_monthly_sheet(df, emap, current_q, prev)))
+        outputs.append(("QC_Q2A", make_monthly_sheet(df, current_q, prev)))
 
     # Q2B
     if "Q2B" in sheets and not sheets["Q2B"].empty:
@@ -361,45 +468,41 @@ def main() -> int:
         months_avail = [m for m in ["Jun","Dec"] if m in df.columns]
         if months_avail:
             prev = prior_sheets.get("Q2B")
-            outputs.append(("QC_Q2B", make_single_month_sheet(df, emap, months_avail, prev)))
+            outputs.append(("QC_Q2B", make_single_month_sheet(df, months_avail, prev)))
 
     # Q2A Job Function (Q4 only)
     if "Q2A_JobFunc_Q4" in sheets and not sheets["Q2A_JobFunc_Q4"].empty:
         df = sheets["Q2A_JobFunc_Q4"].rename(columns={"subsection":"subquestion"})
         prev = prior_sheets.get("Q2A_JobFunc_Q4")
-        outputs.append(("QC_Q2A_JF_Q4", make_jobfunc_q4_sheet(df, emap, prev)))
+        outputs.append(("QC_Q2A_JF_Q4", make_jobfunc_q4_sheet(df, prev)))
 
     # Q3
     if "Q3" in sheets and not sheets["Q3"].empty:
         prev = prior_sheets.get("Q3")
-        outputs.append(("QC_Q3", make_monthly_sheet(sheets["Q3"], emap, current_q, prev)))
+        outputs.append(("QC_Q3", make_monthly_sheet(sheets["Q3"], current_q, prev)))
 
     # Q4
     if "Q4" in sheets and not sheets["Q4"].empty:
         prev = prior_sheets.get("Q4")
-        outputs.append(("QC_Q4", make_monthly_sheet(sheets["Q4"], emap, current_q, prev)))
+        outputs.append(("QC_Q4", make_monthly_sheet(sheets["Q4"], current_q, prev)))
 
     # Q5
     if "Q5" in sheets and not sheets["Q5"].empty:
         prev = prior_sheets.get("Q5")
-        outputs.append(("QC_Q5", make_monthly_sheet(sheets["Q5"], emap, current_q, prev)))
+        outputs.append(("QC_Q5", make_monthly_sheet(sheets["Q5"], current_q, prev)))
 
     if not outputs:
         raise SystemExit("[ERROR] No usable sheets in stage file.")
 
-    # Write workbook (values only). Freeze panes & autofilter kept minimal.
+    # Write workbook (values only) + freeze header & autofilter
     with pd.ExcelWriter(args.out, engine="openpyxl") as w:
         for name, df in outputs:
             df.to_excel(w, index=False, sheet_name=name)
-
-        # Light post-processing: freeze header + autofilter
         wb = w.book
-        for name in [n for n,_ in outputs]:
+        for name, _ in outputs:
             ws = wb[name]
-            ws.freeze_panes = "A2"  # freeze header row
-            max_col = ws.max_column
-            max_row = ws.max_row
-            ws.auto_filter.ref = f"A1:{ws.cell(row=max_row, column=max_col).coordinate}"
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = f"A1:{ws.cell(row=ws.max_row, column=ws.max_column).coordinate}"
 
     print(f"[DONE] Wrote QC workbook → {args.out}  (Quarter in scope: {current_q})")
     return 0
