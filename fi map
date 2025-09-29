@@ -1,0 +1,34 @@
+ROLLUPS: Dict[str, List[str]] = {
+    "All Financial Institutions": [
+        "Commercial Banks", "Investment Banks", "Islamic Banks", "DFI",
+        "Insurers", "Takaful Operators", "Foreign Banks",
+        "International Islamic Banks", "Digital Banks"
+    ],
+    "Banking Institutions": [
+        "Commercial Banks", "Investment Banks", "Islamic Banks",
+        "Digital Banks", "International Islamic Banks", "Foreign Banks"
+    ],
+    "Commercial Banks": ["Commercial Banks", "Foreign Banks"],
+    "Investment Banks": ["Investment Banks"],
+    "Islamic Banks": ["Islamic Banks"],
+    "Digital Banks": ["Digital Banks"],
+    "International Islamic Banks": ["International Islamic Banks"],
+    "Foreign Banks": ["Foreign Banks"],
+    "DFI": ["DFI"],
+    "Insurers": ["Insurers"],
+    "Takaful Operators": ["Takaful Operators"],
+}
+
+ROLLUP_ORDER = [
+    "All Financial Institutions",
+    "Banking Institutions",
+    "Commercial Banks",
+    "Investment Banks",
+    "Islamic Banks",
+    "Foreign Banks",
+    "Digital Banks",
+    "International Islamic Banks",
+    "DFI",
+    "Insurers",
+    "Takaful Operators",
+]
