@@ -509,3 +509,34 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
+def sort_rows(df: pd.DataFrame) -> pd.DataFrame:
+    # collect labels in desired order, but make them UNIQUE while preserving order
+    fi_types = (
+        df.get("fi_type", pd.Series([], dtype=object))
+          .dropna()
+          .astype(str)
+          .unique()
+          .tolist()
+    )
+    ordered_labels = []
+    for x in ROLLUP_ORDER + fi_types:
+        if x not in ordered_labels:
+            ordered_labels.append(x)
+
+    cat = pd.CategoricalDtype(categories=ordered_labels, ordered=True)
+
+    dfo = df.copy()
+    if "entity_group" in dfo.columns:
+        dfo["entity_group"] = dfo["entity_group"].astype(str).astype(cat)
+
+    # stable sort: entity_group (by our categorical order) → institution → other dims
+    extra = [c for c in ["subquestion","worker_category","job_function"] if c in dfo.columns]
+    return dfo.sort_values(by=["entity_group","institution", *extra], kind="stable")
+
+
+
+
+
