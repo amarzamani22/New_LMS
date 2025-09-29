@@ -180,14 +180,20 @@ def extract_q1a_jobfunc_q4(ws, entity: str, year: int, qlbl: str) -> pd.DataFram
                 "entity_name": entity,
                 "year": year,
                 "quarter": qlbl,
+                # >>> Added as requested (right after 'quarter')
+                "subquestion": "Employment = A + B(i) + B(ii)",
+                # <<<
                 "worker_category": wc_label,
                 "job_function": jf_name,
                 "value": val,
             })
     df = pd.DataFrame(out)
     if not df.empty:
+        # ensure column order has subquestion right after quarter
+        cols = ["entity_name","year","quarter","subquestion","worker_category","job_function","value"]
+        df = df[cols]
         df = df.sort_values(
-            ["entity_name","year","quarter","worker_category","job_function"],
+            ["entity_name","year","quarter","subquestion","worker_category","job_function"],
             kind="mergesort"
         ).reset_index(drop=True)
     return df
