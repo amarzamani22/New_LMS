@@ -36,7 +36,7 @@ MONTHS_BY_Q = {
 }
 
 # Month columns (always the same 3 columns for the active quarter)
-MONTH_COLS = ["C", "D", "E"]
+MONTH_COLS = ["C", "D", "E"]  # Jan/Apr/Jul/Oct in C, mid in D, end-month in E
 
 # Q1A main subquestion blocks (fixed row ranges)
 Q1A_BLOCKS: List[Tuple[str, List[int]]] = [
@@ -67,8 +67,14 @@ JOBFUNC_COLS_ORDERED: List[Tuple[str, str]] = [
     ("Y",  "Other functions"),
 ]
 
-# Q1A job-func rows: same worker-category row indices as the Employment block (excluding A28 special line)
-Q1A_JOBFUNC_ROWS = [15, 17, 19, 21, 23, 25, 27]
+# Q1A job-function blocks: ALL subquestions with their row lists
+# (Exclude row 28 here unless your template truly has I..Y for that special "shared islamic job function" line.)
+Q1A_JOBFUNC_BLOCKS: List[Tuple[str, List[int]]] = [
+    ("Employment = A + B(i) + B(ii)", [15, 17, 19, 21, 23, 25, 27]),
+    ("A. Malaysian",                   list(range(30, 36 + 1))),
+    ("B(i) Non-Malaysian: Permanent Resident", list(range(38, 44 + 1))),
+    ("B(ii) Non-Malaysian: Non-Permanent Resident", list(range(46, 52 + 1))),
+]
 
 # Q1B (Islamic Ops) subquestion blocks (fixed row ranges)
 Q1B_BLOCKS: List[Tuple[str, range]] = [
@@ -144,7 +150,6 @@ def extract_q1a_main(ws, entity: str, year: int, qlbl: str) -> pd.DataFrame:
     for subq, rows in Q1A_BLOCKS:
         for r in rows:
             wc_label = _norm(ws[f"A{r}"].value)
-            # read month values from C/D/E on that row
             v1 = read_number(ws, f"{MONTH_COLS[0]}{r}")
             v2 = read_number(ws, f"{MONTH_COLS[1]}{r}")
             v3 = read_number(ws, f"{MONTH_COLS[2]}{r}")
@@ -159,11 +164,11 @@ def extract_q1a_main(ws, entity: str, year: int, qlbl: str) -> pd.DataFrame:
                 months[2]: v3,
             })
     df = pd.DataFrame(out)
-    # Sort for neatness
-    order_cols = ["entity_name","year","quarter","subquestion","worker_category"]
-    month_cols = [c for c in months]
     if not df.empty:
-        df = df.sort_values(order_cols + month_cols, kind="mergesort").reset_index(drop=True)
+        df = df.sort_values(
+            ["entity_name","year","quarter","subquestion","worker_category"] + months,
+            kind="mergesort"
+        ).reset_index(drop=True)
     return df
 
 def extract_q1a_jobfunc_q4(ws, entity: str, year: int, qlbl: str) -> pd.DataFrame:
@@ -172,26 +177,22 @@ def extract_q1a_jobfunc_q4(ws, entity: str, year: int, qlbl: str) -> pd.DataFram
         return pd.DataFrame()
 
     out: List[Dict] = []
-    for r in Q1A_JOBFUNC_ROWS:
-        wc_label = _norm(ws[f"A{r}"].value)
-        for col_letter, jf_name in JOBFUNC_COLS_ORDERED:
-            val = read_number(ws, f"{col_letter}{r}")
-            out.append({
-                "entity_name": entity,
-                "year": year,
-                "quarter": qlbl,
-                # >>> Added as requested (right after 'quarter')
-                "subquestion": "Employment = A + B(i) + B(ii)",
-                # <<<
-                "worker_category": wc_label,
-                "job_function": jf_name,
-                "value": val,
-            })
+    for subq, rows in Q1A_JOBFUNC_BLOCKS:
+        for r in rows:
+            wc_label = _norm(ws[f"A{r}"].value)
+            for col_letter, jf_name in JOBFUNC_COLS_ORDERED:
+                val = read_number(ws, f"{col_letter}{r}")
+                out.append({
+                    "entity_name": entity,
+                    "year": year,
+                    "quarter": qlbl,
+                    "subquestion": subq,           # <- now present for ALL subquestions
+                    "worker_category": wc_label,
+                    "job_function": jf_name,
+                    "value": val,
+                })
     df = pd.DataFrame(out)
     if not df.empty:
-        # ensure column order has subquestion right after quarter
-        cols = ["entity_name","year","quarter","subquestion","worker_category","job_function","value"]
-        df = df[cols]
         df = df.sort_values(
             ["entity_name","year","quarter","subquestion","worker_category","job_function"],
             kind="mergesort"
@@ -199,21 +200,23 @@ def extract_q1a_jobfunc_q4(ws, entity: str, year: int, qlbl: str) -> pd.DataFram
     return df
 
 def extract_q1b(ws, entity: str, year: int, qlbl: str) -> pd.DataFrame:
-    # Q1B appears in Q2 and Q4 (Islamic Ops). We’ll still read in any quarter; rows will be zeros if blank.
+    """
+    Q1B is end-of-quarter only (like Q2B). We output a single month column:
+    Mar/Jun/Sep/Dec, read from column E (the 3rd month in the C-D-E trio).
+    """
     months = MONTHS_BY_Q.get(qlbl or "", [])
     if len(months) != 3:
         return pd.DataFrame()
 
+    target_month = months[2]  # end-month of the quarter: Mar/Jun/Sep/Dec
+
     out: List[Dict] = []
     nonzero_seen = False
-
     for subq, row_range in Q1B_BLOCKS:
         for r in row_range:
             wc_label = _norm(ws[f"A{r}"].value)
-            v1 = read_number(ws, f"{MONTH_COLS[0]}{r}")
-            v2 = read_number(ws, f"{MONTH_COLS[1]}{r}")
-            v3 = read_number(ws, f"{MONTH_COLS[2]}{r}")
-            if (v1 or v2 or v3):
+            v = read_number(ws, f"E{r}")  # end-month lives in column E
+            if v != 0:
                 nonzero_seen = True
             out.append({
                 "entity_name": entity,
@@ -221,21 +224,15 @@ def extract_q1b(ws, entity: str, year: int, qlbl: str) -> pd.DataFrame:
                 "quarter": qlbl,
                 "subquestion": subq,
                 "worker_category": wc_label,
-                months[0]: v1,
-                months[1]: v2,
-                months[2]: v3,
+                target_month: v,  # single month column
             })
 
-    df = pd.DataFrame(out)
-    if df.empty:
-        return df
-
-    # If ALL rows are zeros for this file, return empty (so the final workbook only includes Q1B if someone reported it)
     if not nonzero_seen:
         return pd.DataFrame()
 
+    df = pd.DataFrame(out)
     df = df.sort_values(
-        ["entity_name","year","quarter","subquestion","worker_category"] + months,
+        ["entity_name","year","quarter","subquestion","worker_category", target_month],
         kind="mergesort"
     ).reset_index(drop=True)
     return df
@@ -318,7 +315,7 @@ def main() -> int:
     def _sort(df: pd.DataFrame) -> pd.DataFrame:
         if df.empty: return df
         cols = [c for c in ["entity_name","year","quarter","subquestion","worker_category","job_function"] if c in df.columns]
-        # months in order if present
+        # keep month order if present
         mcols = [m for m in ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"] if m in df.columns]
         return df.sort_values(cols + mcols, kind="mergesort").reset_index(drop=True)
 
@@ -338,54 +335,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-
-
-
-
-
-
-
-#=======
-def extract_q1b(ws, entity: str, year: int, qlbl: str) -> pd.DataFrame:
-    # Q1B appears in Q2 and Q4 (Islamic Ops). Only capture the end-month (Jun for Q2, Dec for Q4).
-    qn = (qlbl or "").strip().lower()
-    if qn not in ("q2", "quarter 2", "q4", "quarter 4"):
-        return pd.DataFrame()
-
-    # Decide which month to keep
-    month = "Jun" if qn in ("q2", "quarter 2") else "Dec"
-
-    out: List[Dict] = []
-    nonzero_seen = False
-
-    for subq, row_range in Q1B_BLOCKS:
-        for r in row_range:
-            wc_label = _norm(ws[f"A{r}"].value)
-            val = read_number(ws, f"C{r}")  # always column C
-            if val:
-                nonzero_seen = True
-            out.append({
-                "entity_name": entity,
-                "year": year,
-                "quarter": qlbl,
-                "subquestion": subq,
-                "worker_category": wc_label,
-                month: val,
-            })
-
-    df = pd.DataFrame(out)
-    if df.empty:
-        return df
-
-    # If ALL rows are zeros for this file, skip
-    if not nonzero_seen:
-        return pd.DataFrame()
-
-    df = df.sort_values(
-        ["entity_name","year","quarter","subquestion","worker_category", month],
-        kind="mergesort"
-    ).reset_index(drop=True)
-    return df
-
