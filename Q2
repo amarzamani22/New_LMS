@@ -1,3 +1,4 @@
+# extract_q2.py
 from __future__ import annotations
 import argparse, time, re
 from pathlib import Path
@@ -16,15 +17,6 @@ LIKELY_SHEETS = [
 ]
 COVER = {"entity": "F6", "year": "F7", "quarter": "F8"}
 
-WORKER_CATEGORIES = [
-    "Managers",
-    "Professional",
-    "Technicians & Associate Professionals",
-    "Clerical Occupations",
-    "Operative Workers",
-    "Elementary Occupations",
-]
-
 MONTHS_BY_Q = {
     "Quarter 1": ["Jan","Feb","Mar"],
     "Quarter 2": ["Apr","May","Jun"],
@@ -35,13 +27,6 @@ MONTHS_BY_Q = {
     "Q3": ["Jul","Aug","Sep"],
     "Q4": ["Oct","Nov","Dec"],
 }
-
-JOB_FUNCTIONS = [
-    "Banking Operations","Compliance","Corporate Banking","Credit Management",
-    "Digital Banking & Innovation","Finance","Human Resources","Information Technology",
-    "Internal Audit","Investment Banking","Legal","Retail Banking","Risk Management",
-    "Sales and Marketing","Shariah","Treasury","Other functions"
-]
 
 # ---- Fixed positions for Q2A MAIN (rows are absolute in the template) ----
 # Month values are always in columns C, D, E for the active quarter.
@@ -56,7 +41,7 @@ Q2A_BLOCKS: List[Dict] = [
      "rows": {"Managers":102,"Professional":103,"Technicians & Associate Professionals":104,
               "Clerical Occupations":105,"Operative Workers":106,"Elementary Occupations":107,
               "TOTAL Basic Salary & Wages":108}},
-    # B. Arrears to Basic Salary & Wages  (note: period rows are interleaved; values at even rows below)
+    # B. Arrears to Basic Salary & Wages  (note: period rows interleaved in template)
     {"subq": "B. Arrears to Basic Salary & Wages",
      "rows": {"Managers":110,"Professional":112,"Technicians & Associate Professionals":114,
               "Clerical Occupations":116,"Operative Workers":118,"Elementary Occupations":120,
@@ -79,14 +64,31 @@ Q2A_BLOCKS: List[Dict] = [
 ]
 
 # Q2B (Islamic ops only): fixed positions (single month in col C)
-Q2B_START_SUBQ_A = 150   # "A. Salary & Wages"
 Q2B_ROWS_A = {"Managers":151,"Professional":152,"Technicians & Associate Professionals":153,
               "Clerical Occupations":154,"Operative Workers":155,"Elementary Occupations":156,
               "TOTAL Salary & Wages":157}
-Q2B_START_SUBQ_B = 158   # "B. Commissions Paid At Least Once a Month (RM)"
 Q2B_ROWS_B = {"Managers":159,"Professional":160,"Technicians & Associate Professionals":161,
               "Clerical Occupations":162,"Operative Workers":163,"Elementary Occupations":164,
               "TOTAL Commissions Paid At Least Once a Month (RM)":165}
+
+# ---- Job functions (I..Y) ----
+JOBFUNC_COLS = ["I","J","K","L","M","N","O","P","Q","R","S","T","U","V","W","X","Y"]
+
+# Banking / DFI names
+JOBFUNC_BANKING = [
+    "Banking Operations","Compliance","Corporate Banking","Credit Management",
+    "Digital Banking & Innovation","Finance","Human Resources","Information Technology",
+    "Internal Audit","Investment Banking","Legal","Retail Banking","Risk Management",
+    "Sales and Marketing","Shariah","Treasury","Other functions"
+]
+
+# Insurance / Takaful names (same columns I..Y, names differ)
+JOBFUNC_INSURANCE = [
+    "Actuarial","Claims","Compliance","Customer Service","Finance",
+    "Human Resources","Information Technology","Internal Audit","Investment",
+    "Legal","Operations","Product Development","Risk Management",
+    "Sales and Marketing","Shariah","Treasury","Other functions"
+]
 
 # -------------------------------------------------
 # Helpers
@@ -167,6 +169,7 @@ def extract_q2a_main(ws, entity: str, yr: int, qlabel: str) -> pd.DataFrame:
                 "entity_name": entity,
                 "year": yr,
                 "quarter": qlabel,
+                "question": "Q2A",
                 "subsection": subq,
                 "worker_category": wc,
                 months[0]: read_num_cell(ws, r, "C"),
@@ -177,61 +180,32 @@ def extract_q2a_main(ws, entity: str, yr: int, qlabel: str) -> pd.DataFrame:
     return pd.DataFrame(out)
 
 # -------------------------------------------------
-# Q2A – JOB FUNCTION (Q4 only, fixed rows + header match for columns)
+# Q2A – JOB FUNCTION (Q4 only, fixed rows; two name sets)
 # -------------------------------------------------
-def find_jobfunc_header(ws) -> Tuple[int, Dict[str,int]]:
-    """
-    Return (header_row_index, {job_function -> column_index}).
-    We scan for the row with the most job function name matches then map columns.
-    """
-    best_r, best_hits = None, -1
-    for r in range(1, ws.max_row + 1):
-        row_vals = [ _norm(ws.cell(r, c).value) for c in range(1, ws.max_column + 1) ]
-        hits = sum(1 for jf in JOB_FUNCTIONS if _norm(jf) in row_vals)
-        if hits > best_hits:
-            best_hits, best_r = hits, r
-        if hits >= 10:  # good enough
-            break
-    if not best_r or best_hits <= 0:
-        return (0, {})
-    # map headers in that row
-    jf_cols: Dict[str,int] = {}
-    for c in range(1, ws.max_column + 1):
-        txt = ws.cell(best_r, c).value
-        for jf in JOB_FUNCTIONS:
-            if _norm(txt) == _norm(jf) and jf not in jf_cols:
-                jf_cols[jf] = c
-    return (best_r, jf_cols)
-
 def extract_q2a_jobfunc_q4(ws, entity: str, yr: int, qlabel: str) -> pd.DataFrame:
     if _norm(qlabel) not in ("q4","quarter 4"):
         return pd.DataFrame()
 
-    header_r, jf_cols = find_jobfunc_header(ws)
-    if not header_r or not jf_cols:
-        return pd.DataFrame()
+    # Pick the job-function names from sheet title (Banking/DFI vs Insurance/Takaful)
+    sheet_name = ws.title.lower()
+    if ("insurance" in sheet_name) or ("takaful" in sheet_name):
+        jobfuncs = JOBFUNC_INSURANCE
+    else:
+        jobfuncs = JOBFUNC_BANKING
 
-    # Rows to read are exactly the SAME as Q2A main (across all blocks)
-    # We'll read value at each (row, jf_col).
     out: List[Dict] = []
     for block in Q2A_BLOCKS:
         subq = block["subq"]
         for wc, r in block["rows"].items():
-            for jf, c in jf_cols.items():
-                # build address safely (avoid EmptyCell.coordinate)
-                addr = f"{get_column_letter(c)}{r}"
-                v = ws[addr].value
-                try:
-                    val = 0.0 if v in (None,"","-"," ") else float(str(v).replace(",",""))
-                except Exception:
-                    val = 0.0
+            for col_letter, jf_name in zip(JOBFUNC_COLS, jobfuncs):
+                val = read_num_cell(ws, r, col_letter)
                 out.append({
                     "entity_name": entity,
                     "year": yr,
                     "quarter": qlabel,
                     "subsection": subq,
                     "worker_category": wc,
-                    "job_function": jf,
+                    "job_function": jf_name,
                     "value": val,
                 })
     return pd.DataFrame(out)
@@ -240,7 +214,6 @@ def extract_q2a_jobfunc_q4(ws, entity: str, yr: int, qlabel: str) -> pd.DataFram
 # Q2B – Islamic ops (Jun/Dec only), include sheet if any FI has data
 # -------------------------------------------------
 def extract_q2b(ws, entity: str, yr: int, qlabel: str) -> pd.DataFrame:
-    # Single month (Jun for Q2, Dec for Q4)
     qn = _norm(qlabel)
     if qn not in ("q2","quarter 2","q4","quarter 4"):
         return pd.DataFrame()
@@ -253,6 +226,7 @@ def extract_q2b(ws, entity: str, yr: int, qlabel: str) -> pd.DataFrame:
         val = read_num_cell(ws, r, "C")
         out.append({
             "entity_name": entity, "year": yr, "quarter": qlabel,
+            "question": "Q2B",
             "subsection": "A. Salary & Wages", "worker_category": wc, month: val
         })
     # Subsection B
@@ -260,6 +234,7 @@ def extract_q2b(ws, entity: str, yr: int, qlabel: str) -> pd.DataFrame:
         val = read_num_cell(ws, r, "C")
         out.append({
             "entity_name": entity, "year": yr, "quarter": qlabel,
+            "question": "Q2B",
             "subsection": "B. Commissions Paid At Least Once a Month (RM)",
             "worker_category": wc, month: val
         })
@@ -273,7 +248,7 @@ def extract_q2b(ws, entity: str, yr: int, qlabel: str) -> pd.DataFrame:
 # -------------------------------------------------
 # File driver
 # -------------------------------------------------
-def extract_from_file(path: Path, verbose=False) -> Tuple[pd.DataFrame,pd.DataFrame,pd.DataFrame]:
+def extract_q2_from_file(path: Path, verbose=False) -> Tuple[pd.DataFrame,pd.DataFrame,pd.DataFrame]:
     try:
         wb = load_workbook(str(path), data_only=True, read_only=True)
     except Exception as e:
@@ -288,16 +263,16 @@ def extract_from_file(path: Path, verbose=False) -> Tuple[pd.DataFrame,pd.DataFr
         return (pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
 
     ws = wb[pick_data_sheet(wb)]
-    a = extract_q2a_main(ws, ent, yr, ql)
+    a  = extract_q2a_main(ws, ent, yr, ql)
     jf = extract_q2a_jobfunc_q4(ws, ent, yr, ql)
-    b = extract_q2b(ws, ent, yr, ql)
+    b  = extract_q2b(ws, ent, yr, ql)
 
     try: wb.close()
     except: pass
     return (a, jf, b)
 
 # -------------------------------------------------
-# CLI
+# CLI (optional; handy for quick checks)
 # -------------------------------------------------
 def main() -> int:
     ap = argparse.ArgumentParser(description="Extract RLMS Q2 → staging (fixed positions, fast)")
@@ -323,7 +298,7 @@ def main() -> int:
     t0 = time.perf_counter()
     rows_a, rows_jf, rows_b = [], [], []
     for i, p in enumerate(files, 1):
-        a, jf, b = extract_from_file(p, verbose=args.verbose)
+        a, jf, b = extract_q2_from_file(p, verbose=args.verbose)
         if not a.empty:  rows_a.append(a)
         if not jf.empty: rows_jf.append(jf)
         if not b.empty:  rows_b.append(b)
@@ -338,7 +313,8 @@ def main() -> int:
     def _sort(df: pd.DataFrame) -> pd.DataFrame:
         if df.empty: return df
         sort_cols = [c for c in ["entity_name","year","quarter","subsection","worker_category","job_function"] if c in df.columns]
-        return df.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
+        mcols = [c for c in ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"] if c in df.columns]
+        return df.sort_values(sort_cols + mcols, kind="mergesort").reset_index(drop=True)
 
     df_a  = _sort(df_a)
     df_jf = _sort(df_jf)
