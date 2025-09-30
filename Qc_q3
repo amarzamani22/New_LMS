@@ -1,0 +1,55 @@
+# qc_q3.py
+from __future__ import annotations
+import argparse
+from pathlib import Path
+import pandas as pd
+from qc_common import write_qc_sheet, new_workbook_with_about, normalize_quarter_label, months_up_to_quarter
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="QC for Question 3 from staging.")
+    ap.add_argument("--stage", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--prior-stage", default=None)
+    ap.add_argument("--year", type=int, default=None)
+    args = ap.parse_args()
+
+    stage = Path(args.stage)
+    try:
+        df = pd.read_excel(stage, sheet_name="Q3", engine="openpyxl")
+    except Exception:
+        print("[WARN] Q3 sheet not found.")
+        return 0
+
+    if args.year is None:
+        year = int(df["year"].mode().iat[0])
+    else:
+        year = int(args.year)
+
+    current_q = normalize_quarter_label(df["quarter"])
+    df = df[df["year"]==year]
+
+    prior_df = None
+    if args.prior_stage:
+        p = Path(args.prior_stage)
+        try:
+            prev = pd.read_excel(p, sheet_name="Q3", engine="openpyxl")
+            prior_df = prev[prev["year"]==(year-1)]
+        except Exception:
+            prior_df = None
+
+    wb = new_workbook_with_about("RLMS – QC (Q3)", year, current_q)
+    write_qc_sheet(
+        wb, "QC_Q3", df,
+        id_cols=["entity_name","worker_category"],  # Q3 has 'question' fixed; we don't need it in row id
+        month_cols_in_df=months_up_to_quarter(current_q),
+        add_job_function=False,
+        current_q=current_q, year=year,
+        prior_df=prior_df
+    )
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    wb.save(args.out)
+    print(f"[DONE] {args.out}")
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
