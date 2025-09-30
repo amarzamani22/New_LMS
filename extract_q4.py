@@ -1,0 +1,164 @@
+from __future__ import annotations
+import argparse
+from pathlib import Path
+from typing import List, Dict, Tuple
+import pandas as pd
+from openpyxl import load_workbook
+
+# ---------- Config ----------
+LIKELY_DATA_SHEETS = [
+    "Banking & DFI", "Banking & DFI ", "Banking & DFI  ",
+    "Insurance/Takaful", "Insurance & Takaful", "Data"
+]
+
+COVER_ADDR = {"entity": "F6", "year": "F7", "quarter": "F8"}
+
+# Quarter → month labels
+MONTHS_BY_Q: Dict[str, List[str]] = {
+    "Quarter 1": ["Jan","Feb","Mar"],
+    "Quarter 2": ["Apr","May","Jun"],
+    "Quarter 3": ["Jul","Aug","Sep"],
+    "Quarter 4": ["Oct","Nov","Dec"],
+    "Q1": ["Jan","Feb","Mar"],
+    "Q2": ["Apr","May","Jun"],
+    "Q3": ["Jul","Aug","Sep"],
+    "Q4": ["Oct","Nov","Dec"],
+}
+
+# Q4 subquestions: (label in output, start_row, end_row_inclusive)
+# Data are always in columns C/D/E for M1/M2/M3
+BLOCKS: List[Tuple[str, int, int]] = [
+    ("A. Number of Job Vacancies as at End of the Month", 179, 185),
+    ("B. Minimum Basic Starting Salaries of Job Vacancies during the month (RM)", 187, 193),
+    ("C(i). Number of Job Vacancies Due to New Jobs Created During the Month", 195, 201),
+    ("C(ii). Number Job Vacancies Due to Retirements, Resignations and All Reasons, other than New Jobs Created during the Month", 202, 209),
+]
+
+# ---------- Helpers ----------
+def read_cover_meta(wb) -> Tuple[str,int,str]:
+    ent = yr = q = None
+    if "Cover" in wb.sheetnames:
+        ws = wb["Cover"]
+        ent = ws[COVER_ADDR["entity"]].value
+        yr  = ws[COVER_ADDR["year"]].value
+        q   = ws[COVER_ADDR["quarter"]].value
+    # normalize
+    ent = "" if ent is None else str(ent).strip()
+    try:
+        yr = int(str(yr).strip())
+    except Exception:
+        yr = None
+    q = "" if q is None else str(q).strip()
+    return ent, yr, q
+
+def pick_data_sheet(wb) -> str:
+    names = {s.lower().strip(): s for s in wb.sheetnames}
+    for want in LIKELY_DATA_SHEETS:
+        key = want.lower().strip()
+        if key in names: return names[key]
+    # fallback: first non-Cover
+    for s in wb.sheetnames:
+        if s != "Cover": return s
+    return wb.sheetnames[0]
+
+def read_num(ws, cell_addr: str) -> float:
+    v = ws[cell_addr].value
+    if v in (None, "", "-"): return 0.0
+    try:
+        return float(v)
+    except Exception:
+        try:
+            return float(str(v).replace(",", ""))
+        except Exception:
+            return 0.0
+
+# ---------- Core ----------
+def extract_q4_from_file(path: Path) -> pd.DataFrame:
+    try:
+        wb = load_workbook(str(path), data_only=True, read_only=True)
+    except Exception:
+        return pd.DataFrame()
+
+    ent, yr, q = read_cover_meta(wb)
+    if not ent or not yr or not q:
+        try: wb.close()
+        except Exception: pass
+        return pd.DataFrame()
+
+    months = MONTHS_BY_Q.get(q, [])
+    if len(months) != 3:
+        try: wb.close()
+        except Exception: pass
+        return pd.DataFrame()
+
+    ws = wb[pick_data_sheet(wb)]
+
+    out_rows: List[Dict] = []
+    # columns for the three months
+    mcols = ["C", "D", "E"]
+
+    for sublabel, r0, r1 in BLOCKS:
+        for r in range(r0, r1 + 1):
+            worker = ws[f"A{r}"].value
+            if worker is None or str(worker).strip() == "":
+                # keep empty lines as zero? we skip truly empty labels
+                continue
+            row = {
+                "entity_name": ent,
+                "year": yr,
+                "quarter": q,
+                "question": "Q4",
+                "subquestion": sublabel,
+                "worker_category": str(worker).strip(),
+                months[0]: read_num(ws, f"{mcols[0]}{r}"),
+                months[1]: read_num(ws, f"{mcols[1]}{r}"),
+                months[2]: read_num(ws, f"{mcols[2]}{r}"),
+            }
+            out_rows.append(row)
+
+    try: wb.close()
+    except Exception: pass
+
+    return pd.DataFrame(out_rows)
+
+# ---------- CLI ----------
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Extract RLMS Question 4 → staging workbook (fast, fixed-cells).")
+    ap.add_argument("--input", required=True, help="Folder containing submissions (.xlsx/.xlsm)")
+    ap.add_argument("--out", required=True, help="Output staging workbook (.xlsx)")
+    ap.add_argument("--limit", type=int, default=None, help="Limit files (debug)")
+    args = ap.parse_args()
+
+    root = Path(args.input)
+    files: List[Path] = []
+    for ext in ("*.xlsx","*.xlsm"):
+        files += [p for p in root.rglob(ext) if not p.name.startswith("~$")]
+    files.sort()
+    if args.limit: files = files[:args.limit]
+    print(f"[INFO] Files: {len(files)}")
+
+    frames: List[pd.DataFrame] = []
+    for p in files:
+        df = extract_q4_from_file(p)
+        if not df.empty:
+            frames.append(df)
+
+    out_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
+        columns=["entity_name","year","quarter","question","subquestion","worker_category","M1","M2","M3"]
+    )
+
+    # nice sort & write
+    order_cols = ["entity_name","year","quarter","question","subquestion","worker_category"]
+    month_cols = [c for c in ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"] if c in out_df.columns]
+    if not out_df.empty:
+        out_df = out_df.sort_values(order_cols + month_cols, kind="mergesort").reset_index(drop=True)
+
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
+        out_df.to_excel(xw, index=False, sheet_name="Q4")
+    print(f"[DONE] Wrote staging → {out_path}")
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
