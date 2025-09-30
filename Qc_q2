@@ -3,26 +3,28 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import pandas as pd
-from qc_common import (
-    new_empty_workbook, append_about_sheet_last, write_qc_sheet,
-    normalize_quarter_label, MONTHS_FULL
-)
+from qc_common import new_empty_workbook, append_about_sheet_last, write_qc_sheet, normalize_quarter_label, MONTHS_FULL
 
-def load(path: Path, preferred: str, fallbacks=None) -> pd.DataFrame:
-    if fallbacks is None: fallbacks = []
+def load_any(path: Path, preferred: str, also_try: list[str]=None) -> pd.DataFrame:
+    if also_try is None: also_try = []
     try:
         return pd.read_excel(path, sheet_name=preferred, engine="openpyxl")
     except Exception:
-        # try fuzzy match
         try:
             xls = pd.ExcelFile(path, engine="openpyxl")
-            for name in xls.sheet_names:
-                if preferred.lower() == name.lower():
-                    return pd.read_excel(path, sheet_name=name, engine="openpyxl")
-            for f in fallbacks:
-                for name in xls.sheet_names:
-                    if f.lower() == name.lower():
-                        return pd.read_excel(path, sheet_name=name, engine="openpyxl")
+            names = xls.sheet_names
+            # exact (case-insensitive)
+            for nm in names:
+                if nm.lower() == preferred.lower():
+                    return pd.read_excel(path, sheet_name=nm, engine="openpyxl")
+            # simple fuzzy
+            cand = [nm for nm in names if preferred.replace("_","").replace(" ","").lower() in nm.replace("_","").replace(" ","").lower()]
+            if cand:
+                return pd.read_excel(path, sheet_name=cand[0], engine="openpyxl")
+            for alt in also_try:
+                for nm in names:
+                    if nm.lower() == alt.lower():
+                        return pd.read_excel(path, sheet_name=nm, engine="openpyxl")
         except Exception:
             pass
     return pd.DataFrame()
@@ -36,15 +38,23 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--prior-stage", default=None)
     ap.add_argument("--year", type=int, default=None)
+    ap.add_argument("--mom-threshold", type=float, default=0.25)
+    ap.add_argument("--qoq-threshold", type=float, default=0.25)
+    ap.add_argument("--abs-cutoff", type=float, default=50)
+    ap.add_argument("--yoy-threshold", type=float, default=0.25)
     args = ap.parse_args()
 
     stage = Path(args.stage)
-    q2a  = load(stage, "Q2A_Main")
-    q2jf = load(stage, "Q2A_JobFunc_Q4")
-    q2b  = load(stage, "Q2B")
+    q2a  = load_any(stage, "Q2A_Main", ["Q2A Main"])
+    q2jf = load_any(stage, "Q2A_JobFunc_Q4", ["Q2A JobFunc Q4"])
+    q2b  = load_any(stage, "Q2B")
 
     if q2a.empty and q2jf.empty and q2b.empty:
-        print("[WARN] No Q2 sheets in staging.")
+        try:
+            names = pd.ExcelFile(stage, engine="openpyxl").sheet_names
+            print(f"[WARN] No Q2 sheets in staging. Found sheets: {names}")
+        except Exception:
+            print("[WARN] No Q2 sheets in staging.")
         return 0
 
     if args.year is None:
@@ -60,19 +70,21 @@ def main() -> int:
     if not q2jf.empty: q2jf = q2jf[q2jf["year"]==year]
     if not q2b.empty:  q2b  = q2b[q2b["year"]==year]
 
-    # Keep only FIs with any non-zero data for Q2B (as requested)
+    # Keep only FIs with any non-zero data for Q2B
     if not q2b.empty:
         valcols = [c for c in q2b.columns if c in MONTHS_FULL]
-        grp = q2b.groupby("entity_name")[valcols].sum().sum(axis=1)
-        keep = set(grp[grp != 0].index)
-        q2b = q2b[q2b["entity_name"].isin(keep)]
+        keep = q2b.groupby("entity_name")[valcols].sum().sum(axis=1)
+        q2b = q2b[q2b["entity_name"].isin(set(keep[keep!=0].index))]
 
-    prior_a = prior_b = None
+    prior_a = prior_jf = prior_b = None
     if args.prior_stage:
         p = Path(args.prior_stage)
-        pa = load(p, "Q2A_Main"); pb = load(p, "Q2B")
-        if not pa.empty: prior_a = pa[pa["year"]==(year-1)]
-        if not pb.empty: prior_b = pb[pb["year"]==(year-1)]
+        pa = load_any(p, "Q2A_Main", ["Q2A Main"])
+        pj = load_any(p, "Q2A_JobFunc_Q4", ["Q2A JobFunc Q4"])
+        pb = load_any(p, "Q2B")
+        if not pa.empty: prior_a  = pa[pa["year"]==(year-1)]
+        if not pj.empty: prior_jf = pj[pj["year"]==(year-1)]
+        if not pb.empty: prior_b  = pb[pb["year"]==(year-1)]
 
     wb = new_empty_workbook()
 
@@ -81,24 +93,27 @@ def main() -> int:
             wb, "QC_Q2A_Main", q2a,
             include_job_function=False,
             months_to_show=months_in_df(q2a),
-            current_q=current_q, year=year,
-            prior_df=prior_a
+            current_q=current_q, year=year, prior_df=prior_a,
+            mom_pct_threshold=args.mom_threshold, qoq_pct_threshold=args.qoq_threshold,
+            abs_cutoff=args.abs_cutoff, yoy_pct_threshold=args.yoy_threshold
         )
     if not q2jf.empty:
         write_qc_sheet(
             wb, "QC_Q2A_JobFunc_Q4", q2jf,
             include_job_function=True,
             months_to_show=[],  # value-only
-            current_q=current_q, year=year,
-            prior_df=None
+            current_q=current_q, year=year, prior_df=prior_jf,
+            mom_pct_threshold=args.mom_threshold, qoq_pct_threshold=args.qoq_threshold,
+            abs_cutoff=args.abs_cutoff, yoy_pct_threshold=args.yoy_threshold
         )
     if not q2b.empty:
         write_qc_sheet(
             wb, "QC_Q2B", q2b,
             include_job_function=False,
-            months_to_show=months_in_df(q2b),  # typically ["Jun"] or ["Dec"]
-            current_q=current_q, year=year,
-            prior_df=prior_b
+            months_to_show=months_in_df(q2b),  # ["Jun"] or ["Dec"]
+            current_q=current_q, year=year, prior_df=prior_b,
+            mom_pct_threshold=args.mom_threshold, qoq_pct_threshold=args.qoq_threshold,
+            abs_cutoff=args.abs_cutoff, yoy_pct_threshold=args.yoy_threshold
         )
 
     append_about_sheet_last(wb, "RLMS – QC (Q2)", year, current_q)
