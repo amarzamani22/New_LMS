@@ -1,6 +1,6 @@
-# qc_q5.py — stand-alone QC builder for Q5
+# qc_q5.py — stand-alone QC builder for Q5 (pure Python)
 from __future__ import annotations
-import argparse, json, sys
+import argparse, sys
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -11,11 +11,10 @@ from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.formatting.rule import DataBarRule, FormulaRule
 
-# ========= Built-in defaults (you can override via --config) =========
+# ========= Styling & constants =========
 MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
 QMAP = {"Q1":["Jan","Feb","Mar"], "Q2":["Apr","May","Jun"], "Q3":["Jul","Aug","Sep"], "Q4":["Oct","Nov","Dec"]}
 
-# Colors
 FILL_Q1 = PatternFill("solid","E8F3FF")
 FILL_Q2 = PatternFill("solid","E8F8E8")
 FILL_Q3 = PatternFill("solid","FFF3E0")
@@ -26,8 +25,8 @@ FILL_RED= PatternFill("solid","FFE5E5")
 FILL_YEL= PatternFill("solid","FFF7CC")
 QFILL = {"Q1":FILL_Q1,"Q2":FILL_Q2,"Q3":FILL_Q3,"Q4":FILL_Q4}
 
-# Rollups + order
-DEFAULT_ROLLUPS: Dict[str,List[str]] = {
+# ========= Rollups & order (embedded) =========
+ROLLUPS: Dict[str, List[str]] = {
     "All Financial Institutions": [
         "Commercial Banks", "Investment Banks", "Islamic Banks", "DFI",
         "Insurers", "Takaful Operators", "Foreign Banks",
@@ -37,7 +36,7 @@ DEFAULT_ROLLUPS: Dict[str,List[str]] = {
         "Commercial Banks", "Investment Banks", "Islamic Banks",
         "Digital Banks", "International Islamic Banks", "Foreign Banks"
     ],
-    "Commercial Banks": ["Commercial Banks","Foreign Banks"],
+    "Commercial Banks": ["Commercial Banks", "Foreign Banks"],
     "Investment Banks": ["Investment Banks"],
     "Islamic Banks": ["Islamic Banks"],
     "Digital Banks": ["Digital Banks"],
@@ -47,113 +46,156 @@ DEFAULT_ROLLUPS: Dict[str,List[str]] = {
     "Insurers": ["Insurers"],
     "Takaful Operators": ["Takaful Operators"],
 }
-DEFAULT_ROLLUP_ORDER = [
-    "All Financial Institutions","Banking Institutions","Commercial Banks","Investment Banks",
-    "Islamic Banks","Foreign Banks","Digital Banks","International Islamic Banks","DFI","Insurers","Takaful Operators",
+ROLLUP_ORDER = [
+    "All Financial Institutions",
+    "Banking Institutions",
+    "Commercial Banks",
+    "Investment Banks",
+    "Islamic Banks",
+    "Foreign Banks",
+    "Digital Banks",
+    "International Islamic Banks",
+    "DFI",
+    "Insurers",
+    "Takaful Operators",
 ]
 
-# FI → Type mapping (from your list)
-DEFAULT_ENTITY_TO_TYPE: Dict[str,str] = {
+# ========= FI → Type mapping (embedded from your list) =========
+ENTITY_TO_TYPE: Dict[str, str] = {
     # Banks / DFIs / Foreign / Islamic / Digital / IIB
-    "AFFIN BANK BERHAD":"Commercial Banks","AFFIN HWANG INVESTMENT BANK BERHAD":"Investment Banks",
-    "AFFIN ISLAMIC BANK BERHAD":"Islamic Banks","AGROBANK (BANK PERTANIAN MALAYSIA BERHAD)":"DFI",
+    "AFFIN BANK BERHAD":"Commercial Banks",
+    "AFFIN HWANG INVESTMENT BANK BERHAD":"Investment Banks",
+    "AFFIN ISLAMIC BANK BERHAD":"Islamic Banks",
+    "AGROBANK (BANK PERTANIAN MALAYSIA BERHAD)":"DFI",
     "AL RAJHI BANKING & INVESTMENT CORPORATION (MALAYSIA) BHD":"Islamic Banks",
     "ALKHAIR INTERNATIONAL ISLAMIC BANK BHD":"International Islamic Banks",
-    "ALLIANCE BANK MALAYSIA BERHAD":"Commercial Banks","ALLIANCE INVESTMENT BANK BERHAD":"Investment Banks",
-    "ALLIANCE ISLAMIC BANK BERHAD":"Islamic Banks","AMBANK (M) BERHAD":"Commercial Banks",
-    "AMBANK ISLAMIC BERHAD":"Islamic Banks","AMINVESTMENT BANK BERHAD":"Investment Banks",
-    "MBSB BANK BERHAD":"Islamic Banks","BANGKOK BANK BERHAD":"Foreign Banks",
-    "BANK ISLAM MALAYSIA BERHAD":"Islamic Banks","BANK KERJASAMA RAKYAT MALAYSIA BERHAD":"Islamic Banks",
-    "BANK MUAMALAT MALAYSIA BERHAD":"Islamic Banks","BANK OF AMERICA MALAYSIA BERHAD":"Foreign Banks",
-    "BANK OF CHINA (MALAYSIA) BERHAD":"Foreign Banks","BANK OF TOKYO-MITSUBISHI UFJ (MALAYSIA) BERHAD":"Foreign Banks",
-    "BANK PEMBANGUNAN MALAYSIA BERHAD":"DFI","BANK SIMPANAN NASIONAL":"DFI",
-    "BNP PARIBAS MALAYSIA BERHAD":"Foreign Banks","CHINA CONSTRUCTION BANK MALAYSIA BERHAD":"Foreign Banks",
-    "CIMB BANK BERHAD":"Commercial Banks","CIMB INVESTMENT BANK BERHAD":"Investment Banks",
-    "CIMB ISLAMIC BANK BERHAD":"Islamic Banks","CITIBANK BERHAD":"Foreign Banks",
+    "ALLIANCE BANK MALAYSIA BERHAD":"Commercial Banks",
+    "ALLIANCE INVESTMENT BANK BERHAD":"Investment Banks",
+    "ALLIANCE ISLAMIC BANK BERHAD":"Islamic Banks",
+    "AMBANK (M) BERHAD":"Commercial Banks",
+    "AMBANK ISLAMIC BERHAD":"Islamic Banks",
+    "AMINVESTMENT BANK BERHAD":"Investment Banks",
+    "MBSB BANK BERHAD":"Islamic Banks",
+    "BANGKOK BANK BERHAD":"Foreign Banks",
+    "BANK ISLAM MALAYSIA BERHAD":"Islamic Banks",
+    "BANK KERJASAMA RAKYAT MALAYSIA BERHAD":"Islamic Banks",
+    "BANK MUAMALAT MALAYSIA BERHAD":"Islamic Banks",
+    "BANK OF AMERICA MALAYSIA BERHAD":"Foreign Banks",
+    "BANK OF CHINA (MALAYSIA) BERHAD":"Foreign Banks",
+    "BANK OF TOKYO-MITSUBISHI UFJ (MALAYSIA) BERHAD":"Foreign Banks",
+    "BANK PEMBANGUNAN MALAYSIA BERHAD":"DFI",
+    "BANK SIMPANAN NASIONAL":"DFI",
+    "BNP PARIBAS MALAYSIA BERHAD":"Foreign Banks",
+    "CHINA CONSTRUCTION BANK MALAYSIA BERHAD":"Foreign Banks",
+    "CIMB BANK BERHAD":"Commercial Banks",
+    "CIMB INVESTMENT BANK BERHAD":"Investment Banks",
+    "CIMB ISLAMIC BANK BERHAD":"Islamic Banks",
+    "CITIBANK BERHAD":"Foreign Banks",
     "DEUTSCHE BANK (MALAYSIA) BERHAD":"Foreign Banks",
     "DEUTSCHE BANK AG, INTERNATIONAL ISLAMIC BANKING, MALAYSIA BRANCH":"International Islamic Banks",
-    "EXPORT-IMPORT BANK OF MALAYSIA BERHAD":"DFI","HONG LEONG BANK BERHAD":"Commercial Banks",
-    "HONG LEONG INVESTMENT BANK BERHAD":"Investment Banks","HONG LEONG ISLAMIC BANK BERHAD":"Islamic Banks",
-    "HSBC AMANAH MALAYSIA BERHAD":"Islamic Banks","HSBC BANK MALAYSIA BERHAD":"Commercial Banks",
-    "IBDAR BANK BSC":"International Islamic Banks","INDIA INTERNATIONAL BANK (MALAYSIA) BERHAD":"Foreign Banks",
+    "EXPORT-IMPORT BANK OF MALAYSIA BERHAD":"DFI",
+    "HONG LEONG BANK BERHAD":"Commercial Banks",
+    "HONG LEONG INVESTMENT BANK BERHAD":"Investment Banks",
+    "HONG LEONG ISLAMIC BANK BERHAD":"Islamic Banks",
+    "HSBC AMANAH MALAYSIA BERHAD":"Islamic Banks",
+    "HSBC BANK MALAYSIA BERHAD":"Commercial Banks",
+    "IBDAR BANK BSC":"International Islamic Banks",
+    "INDIA INTERNATIONAL BANK (MALAYSIA) BERHAD":"Foreign Banks",
     "INDUSTRIAL AND COMMERCIAL BANK OF CHINA (MALAYSIA) BERHAD":"Foreign Banks",
-    "J.P MORGAN CHASE BANK BERHAD":"Foreign Banks","KAF INVESTMENT BANK BERHAD":"Investment Banks",
-    "KENANGA INVESTMENT BANK BERHAD":"Investment Banks","KUWAIT FINANCE HOUSE (MALAYSIA) BERHAD":"Islamic Banks",
-    "MALAYAN BANKING BERHAD":"Commercial Banks","MAYBANK INVESTMENT BANK BERHAD":"Investment Banks",
-    "MAYBANK ISLAMIC BERHAD":"Islamic Banks","MIDF AMANAH INVESTMENT BANK BERHAD":"Investment Banks",
+    "J.P MORGAN CHASE BANK BERHAD":"Foreign Banks",
+    "KAF INVESTMENT BANK BERHAD":"Investment Banks",
+    "KENANGA INVESTMENT BANK BERHAD":"Investment Banks",
+    "KUWAIT FINANCE HOUSE (MALAYSIA) BERHAD":"Islamic Banks",
+    "MALAYAN BANKING BERHAD":"Commercial Banks",
+    "MAYBANK INVESTMENT BANK BERHAD":"Investment Banks",
+    "MAYBANK ISLAMIC BERHAD":"Islamic Banks",
+    "MIDF AMANAH INVESTMENT BANK BERHAD":"Investment Banks",
     "MIZUHO CORPORATE BANK (MALAYSIA) BERHAD":"Foreign Banks",
     "NATIONAL BANK OF ABU DHABI MALAYSIA BERHAD":"Foreign Banks",
-    "OCBC AL-AMIN BANK BERHAD":"Islamic Banks","OCBC BANK (MALAYSIA) BERHAD":"Commercial Banks",
+    "OCBC AL-AMIN BANK BERHAD":"Islamic Banks",
+    "OCBC BANK (MALAYSIA) BERHAD":"Commercial Banks",
     "PT. BANK SYARIAH MUALAMAT INDONESIA, TBK":"International Islamic Banks",
-    "PUBLIC BANK BERHAD":"Commercial Banks","PUBLIC INVESTMENT BANK BERHAD":"Investment Banks",
-    "PUBLIC ISLAMIC BANK BERHAD":"Islamic Banks","RHB BANK BERHAD":"Commercial Banks",
-    "RHB INVESTMENT BANK BERHAD":"Investment Banks","RHB ISLAMIC BANK BERHAD":"Islamic Banks",
+    "PUBLIC BANK BERHAD":"Commercial Banks",
+    "PUBLIC INVESTMENT BANK BERHAD":"Investment Banks",
+    "PUBLIC ISLAMIC BANK BERHAD":"Islamic Banks",
+    "RHB BANK BERHAD":"Commercial Banks",
+    "RHB INVESTMENT BANK BERHAD":"Investment Banks",
+    "RHB ISLAMIC BANK BERHAD":"Islamic Banks",
     "SMALL MEDIUM ENTERPRISE DEVELOPMENT BANK MALAYSIA BERHAD":"DFI",
-    "STANDARD CHARTERED BANK MALAYSIA BERHAD":"Commercial Banks","STANDARD CHARTERED SAADIQ BERHAD":"Islamic Banks",
+    "STANDARD CHARTERED BANK MALAYSIA BERHAD":"Commercial Banks",
+    "STANDARD CHARTERED SAADIQ BERHAD":"Islamic Banks",
     "SUMITOMO MITSUI BANKING CORPORATION MALAYSIA BERHAD":"Foreign Banks",
-    "THE BANK OF NOVA SCOTIA BERHAD":"Foreign Banks","THE ROYAL BANK OF SCOTLAND BERHAD":"Foreign Banks",
+    "THE BANK OF NOVA SCOTIA BERHAD":"Foreign Banks",
+    "THE ROYAL BANK OF SCOTLAND BERHAD":"Foreign Banks",
     "UNITED OVERSEAS BANK (MALAYSIA) BHD.":"Commercial Banks",
-    "BOOST BANK BERHAD":"Digital Banks","AEON BANK (M) BERHAD":"Digital Banks","KAF DIGITAL BERHAD":"Digital Banks",
-    "YTL DIGITAL BANK BERHAD":"Digital Banks","GX BANK BERHAD":"Digital Banks",
-    # Insurers & Takaful
-    "ACR RETAKAFUL BERHAD":"Takaful Operators","AIA BHD.":"Insurers","AIA GENERAL BERHAD":"Insurers",
-    "AIA PUBLIC TAKAFUL BHD.":"Takaful Operators","AIG MALAYSIA INSURANCE BERHAD":"Insurers",
+    "BOOST BANK BERHAD":"Digital Banks",
+    "AEON BANK (M) BERHAD":"Digital Banks",
+    "KAF DIGITAL BERHAD":"Digital Banks",
+    "YTL DIGITAL BANK BERHAD":"Digital Banks",
+    "GX BANK BERHAD":"Digital Banks",
+    # Insurance & Takaful
+    "ACR RETAKAFUL BERHAD":"Takaful Operators",
+    "AIA BHD.":"Insurers",
+    "AIA GENERAL BERHAD":"Insurers",
+    "AIA PUBLIC TAKAFUL BHD.":"Takaful Operators",
+    "AIG MALAYSIA INSURANCE BERHAD":"Insurers",
     "ALLIANZ GENERAL INSURANCE COMPANY (MALAYSIA) BERHAD":"Insurers",
-    "ALLIANZ LIFE INSURANCE MALAYSIA BERHAD":"Insurers","AMBRA VERSICHERUNG AG":"Insurers",
-    "AMMETLIFE INSURANCE BERHAD":"Insurers","AMMETLIFE TAKAFUL BERHAD":"Takaful Operators",
-    "ASIA CAPITAL REINSURANCE MALAYSIA SDN. BHD.":"Insurers","BERJAYA SOMPO INSURANCE BERHAD":"Insurers",
-    "CHUBB INSURANCE MALAYSIA BERHAD":"Insurers","DANAJAMIN NASIONAL BERHAD":"DFI",
-    "ETIQA GENERAL INSURANCE BERHAD":"Insurers","ETIQA LIFE INSURANCE BERHAD":"Insurers",
-    "ETIQA FAMILY TAKAFUL BERHAD":"Takaful Operators","ETIQA GENERAL TAKAFUL BERHAD":"Takaful Operators",
-    "FWD INSURANCE BERHAD":"Insurers","FWD TAKAFUL BERHAD":"Takaful Operators",
-    "GENERALI INSURANCE MALAYSIA BERHAD":"Insurers","GENERALI LIFE INSURANCE MALAYSIA BERHAD":"Insurers",
+    "ALLIANZ LIFE INSURANCE MALAYSIA BERHAD":"Insurers",
+    "AMBRA VERSICHERUNG AG":"Insurers",
+    "AMMETLIFE INSURANCE BERHAD":"Insurers",
+    "AMMETLIFE TAKAFUL BERHAD":"Takaful Operators",
+    "ASIA CAPITAL REINSURANCE MALAYSIA SDN. BHD.":"Insurers",
+    "BERJAYA SOMPO INSURANCE BERHAD":"Insurers",
+    "CHUBB INSURANCE MALAYSIA BERHAD":"Insurers",
+    "DANAJAMIN NASIONAL BERHAD":"DFI",
+    "ETIQA GENERAL INSURANCE BERHAD":"Insurers",
+    "ETIQA LIFE INSURANCE BERHAD":"Insurers",
+    "ETIQA FAMILY TAKAFUL BERHAD":"Takaful Operators",
+    "ETIQA GENERAL TAKAFUL BERHAD":"Takaful Operators",
+    "FWD INSURANCE BERHAD":"Insurers",
+    "FWD TAKAFUL BERHAD":"Takaful Operators",
+    "GENERALI INSURANCE MALAYSIA BERHAD":"Insurers",
+    "GENERALI LIFE INSURANCE MALAYSIA BERHAD":"Insurers",
     "GREAT EASTERN GENERAL INSURANCE (MALAYSIA) BERHAD":"Insurers",
-    "GREAT EASTERN LIFE ASSURANCE (MALAYSIA) BERHAD":"Insurers","GREAT EASTERN TAKAFUL BERHAD":"Takaful Operators",
-    "HANNOVER RUECKVERSICHERUNG AG, MALAYSIAN BRANCH":"Insurers","HONG LEONG ASSURANCE BERHAD":"Insurers",
-    "HONG LEONG MSIG TAKAFUL BERHAD":"Takaful Operators","LIBERTY GENERAL INSURANCE BERHAD":"Insurers",
-    "LONPAC INSURANCE BHD.":"Insurers","MALAYSIAN LIFE REINSURANCE GROUP BERHAD":"Insurers",
-    "MALAYSIAN REINSURANCE BERHAD":"Insurers","MANULIFE INSURANCE BERHAD":"Insurers",
-    "MCIS INSURANCE BERHAD":"Insurers","MSIG INSURANCE (MALAYSIA) BHD":"Insurers",
+    "GREAT EASTERN LIFE ASSURANCE (MALAYSIA) BERHAD":"Insurers",
+    "GREAT EASTERN TAKAFUL BERHAD":"Takaful Operators",
+    "HANNOVER RUECKVERSICHERUNG AG, MALAYSIAN BRANCH":"Insurers",
+    "HONG LEONG ASSURANCE BERHAD":"Insurers",
+    "HONG LEONG MSIG TAKAFUL BERHAD":"Takaful Operators",
+    "LIBERTY GENERAL INSURANCE BERHAD":"Insurers",
+    "LONPAC INSURANCE BHD.":"Insurers",
+    "MALAYSIAN LIFE REINSURANCE GROUP BERHAD":"Insurers",
+    "MALAYSIAN REINSURANCE BERHAD":"Insurers",
+    "MANULIFE INSURANCE BERHAD":"Insurers",
+    "MCIS INSURANCE BERHAD":"Insurers",
+    "MSIG INSURANCE (MALAYSIA) BHD":"Insurers",
     "MUNCHENER RUCKVERSICHERUNGS-GESELLSCHAFT (Munich Re Retakaful)":"Takaful Operators",
-    "PACIFIC & ORIENT INSURANCE CO. BERHAD":"Insurers","PROGRESSIVE INSURANCE BHD.":"Insurers",
-    "PRUDENTIAL ASSURANCE MALAYSIA BERHAD":"Insurers","PRUDENTIAL BSN TAKAFUL BERHAD":"Takaful Operators",
-    "QBE INSURANCE (MALAYSIA) BERHAD":"Insurers","RHB INSURANCE BERHAD":"Insurers",
-    "SUN LIFE MALAYSIA ASSURANCE BERHAD":"Insurers","SUN LIFE MALAYSIA TAKAFUL BERHAD":"Takaful Operators",
+    "PACIFIC & ORIENT INSURANCE CO. BERHAD":"Insurers",
+    "PROGRESSIVE INSURANCE BHD.":"Insurers",
+    "PRUDENTIAL ASSURANCE MALAYSIA BERHAD":"Insurers",
+    "PRUDENTIAL BSN TAKAFUL BERHAD":"Takaful Operators",
+    "QBE INSURANCE (MALAYSIA) BERHAD":"Insurers",
+    "RHB INSURANCE BERHAD":"Insurers",
+    "SUN LIFE MALAYSIA ASSURANCE BERHAD":"Insurers",
+    "SUN LIFE MALAYSIA TAKAFUL BERHAD":"Takaful Operators",
     "SWISS RE ASIA PTE LTD":"Insurers",
     "SWISS REINSURANCE COMPANY LTD (SWISS RE RETAKAFUL)":"Takaful Operators",
     "SYARIKAT TAKAFUL MALAYSIA AM BERHAD":"Takaful Operators",
     "SYARIKAT TAKAFUL MALAYSIA KELUARGA BERHAD":"Takaful Operators",
-    "TAKAFUL IKHLAS FAMILY BERHAD":"Takaful Operators","TAKAFUL IKHLAS GENERAL BERHAD":"Takaful Operators",
-    "THE PACIFIC INSURANCE BERHAD":"Insurers","THE TOA REINSURANCE COMPANY LTD.":"Insurers",
-    "TOKIO MARINE INSURANS (MALAYSIA) BERHAD":"Insurers","TOKIO MARINE LIFE INSURANCE MALAYSIA BHD":"Insurers",
-    "TUNE INSURANCE MALAYSIA BERHAD":"Insurers","ZURICH GENERAL INSURANCE MALAYSIA BERHAD":"Insurers",
-    "ZURICH LIFE INSURANCE MALAYSIA BERHAD":"Insurers","ZURICH GENERAL TAKAFUL MALAYSIA BERHAD":"Takaful Operators",
+    "TAKAFUL IKHLAS FAMILY BERHAD":"Takaful Operators",
+    "TAKAFUL IKHLAS GENERAL BERHAD":"Takaful Operators",
+    "THE PACIFIC INSURANCE BERHAD":"Insurers",
+    "THE TOA REINSURANCE COMPANY LTD.":"Insurers",
+    "TOKIO MARINE INSURANS (MALAYSIA) BERHAD":"Insurers",
+    "TOKIO MARINE LIFE INSURANCE MALAYSIA BHD":"Insurers",
+    "TUNE INSURANCE MALAYSIA BERHAD":"Insurers",
+    "ZURICH GENERAL INSURANCE MALAYSIA BERHAD":"Insurers",
+    "ZURICH LIFE INSURANCE MALAYSIA BERHAD":"Insurers",
+    "ZURICH GENERAL TAKAFUL MALAYSIA BERHAD":"Takaful Operators",
     "ZURICH TAKAFUL MALAYSIA BERHAD":"Takaful Operators",
 }
 
-# ========= Optional config loader (YAML or JSON) =========
-def load_config(path: Optional[str]) -> tuple[Dict[str,List[str]], List[str], Dict[str,str]]:
-    if not path:
-        return DEFAULT_ROLLUPS, DEFAULT_ROLLUP_ORDER, DEFAULT_ENTITY_TO_TYPE
-    p = Path(path)
-    if not p.exists():
-        print(f"[WARN] Config file not found: {p} (using built-ins)")
-        return DEFAULT_ROLLUPS, DEFAULT_ROLLUP_ORDER, DEFAULT_ENTITY_TO_TYPE
-    try:
-        if p.suffix.lower() in {".yml",".yaml"}:
-            import yaml
-            cfg = yaml.safe_load(p.read_text(encoding="utf-8"))
-        else:
-            cfg = json.loads(p.read_text(encoding="utf-8"))
-        rollups = cfg.get("rollups", DEFAULT_ROLLUPS)
-        order   = cfg.get("rollup_order", DEFAULT_ROLLUP_ORDER)
-        mapping = cfg.get("entity_to_type", cfg.get("fi_types", DEFAULT_ENTITY_TO_TYPE))
-        return rollups, order, mapping
-    except Exception as e:
-        print(f"[WARN] Failed to read config {p}: {e} (using built-ins)")
-        return DEFAULT_ROLLUPS, DEFAULT_ROLLUP_ORDER, DEFAULT_ENTITY_TO_TYPE
-
-# ========= Helpers =========
+# ========= Helper functions =========
 def months_upto(q: str) -> List[str]:
     out=[]
     for oq in ["Q1","Q2","Q3","Q4"]:
@@ -173,27 +215,27 @@ def detect_current_q_from_df(df: pd.DataFrame) -> str:
     if pd.isna(q): return "Q1"
     return [k for k,v in rank.items() if v==int(q)][0]
 
-def build_fi_groups(entities: pd.Series, entity_to_type: Dict[str,str], rollups: Dict[str,List[str]]) -> Dict[str,List[str]]:
-    df=pd.DataFrame({"entity_name":entities.astype(str)})
-    df["fi_type"]=df["entity_name"].map(entity_to_type)
-    out={}
+def build_fi_groups(entities: pd.Series) -> Dict[str, List[str]]:
+    df = pd.DataFrame({"entity_name": entities.astype(str)})
+    df["fi_type"] = df["entity_name"].map(ENTITY_TO_TYPE)
+    out: Dict[str,List[str]] = {}
     # leaf groups
-    for t in set(entity_to_type.values()):
-        out[t]=sorted(df.loc[df["fi_type"]==t,"entity_name"].unique().tolist())
-    # composites
-    for rname, members in rollups.items():
-        rows=df.loc[df["fi_type"].isin(set(members)),"entity_name"].unique().tolist()
-        out[rname]=sorted(rows)
+    for typ in sorted(set(ENTITY_TO_TYPE.values())):
+        out[typ] = sorted(df.loc[df["fi_type"]==typ,"entity_name"].unique().tolist())
+    # composite
+    for rname, members in ROLLUPS.items():
+        rows = df.loc[df["fi_type"].isin(set(members)), "entity_name"].unique().tolist()
+        out[rname] = sorted(rows)
     return out
 
-def add_rollups_q5(stage: pd.DataFrame, fi_groups: Dict[str,List[str]], entity_to_type: Dict[str,str]) -> pd.DataFrame:
+def add_rollups_q5(stage: pd.DataFrame, fi_groups: Dict[str,List[str]]) -> pd.DataFrame:
     stage=stage.copy()
     base_dims=["year","quarter"]
     facets=[c for c in ["question","subquestion","worker_category","job_function"] if c in stage.columns]
     vals=[c for c in MONTHS if c in stage.columns]
-    # institution rows → grouped by FI type
+    # institution rows
     inst=stage.copy()
-    inst["entity_group"]=inst["entity_name"].map(entity_to_type)
+    inst["entity_group"]=inst["entity_name"].map(ENTITY_TO_TYPE)
     inst["institution"]=inst["entity_name"]
     inst=inst.drop(columns=["entity_name"])
     def _sum(df):
@@ -224,7 +266,7 @@ def pivot_monthly(big: pd.DataFrame, year:int, current_q:str)->pd.DataFrame:
     base["Q3"]=base[QMAP["Q3"]].sum(axis=1); base["Q4"]=base[QMAP["Q4"]].sum(axis=1)
     return base
 
-# ========= Excel writer (styled, MoM/QoQ thresholds) =========
+# ========= Excel writer (with YoY using hidden prior sheet) =========
 def write_q5_sheet(
     wb: Workbook, ws_title: str, df: pd.DataFrame, year:int, current_q:str,
     *, mom_thr: float, qoq_thr: float, abs_cut: float, rollup_order: List[str],
@@ -340,7 +382,7 @@ def write_q5_sheet(
                         f"IF(AND({addr(r,m)}<>0,{addr(r,prev)}=0),\"N/A\","
                         f"({addr(r,m)}-{addr(r,prev)})/{addr(r,prev)}))"
                     )
-        # QoQ
+        # QoQ Diff & %Diff
         for r in range(first,last+1):
             for i,q in enumerate(["Q1","Q2","Q3","Q4"]):
                 if i==0: continue
@@ -355,8 +397,89 @@ def write_q5_sheet(
                             f"({addr(r,q)}-{addr(r,prev)})/{addr(r,prev)}))"
                         )
 
+    # YoY & Prior via hidden prior sheet (if provided)
+    if prior_df is not None and not prior_df.empty and df.shape[0]>0:
+        prior_sheet = f"_{ws_title}_PRIOR"
+        if prior_sheet in [s.title for s in wb.worksheets]:
+            del wb[prior_sheet]
+        ws_prior = wb.create_sheet(prior_sheet)
+
+        # Ensure dims
+        dim_keys = ["entity_group","institution","question","subquestion","worker_category","job_function"]
+        for d in dim_keys:
+            if d not in prior_df.columns: prior_df[d] = ""
+        for q in ["Q1","Q2","Q3","Q4"]:
+            if q not in prior_df.columns: prior_df[q] = 0
+
+        ws_prior.cell(1,1,"KEY").font = Font(bold=True)
+        for j,q in enumerate(["Q1","Q2","Q3","Q4"], start=2):
+            ws_prior.cell(1,j,q).font = Font(bold=True)
+
+        for i, row in prior_df.iterrows():
+            key = "|".join(str(row.get(k,"") or "") for k in dim_keys)
+            ws_prior.cell(i+2, 1, key)
+            ws_prior.cell(i+2, 2, row.get("Q1",0))
+            ws_prior.cell(i+2, 3, row.get("Q2",0))
+            ws_prior.cell(i+2, 4, row.get("Q3",0))
+            ws_prior.cell(i+2, 5, row.get("Q4",0))
+        ws_prior.sheet_state = "hidden"
+
+        # add _KEY column on current sheet if missing
+        if "_KEY" not in [ws.cell(header_row, c).value for c in range(1, ws.max_column+1)]:
+            key_col_idx = ws.max_column + 1
+            ws.cell(header_row, key_col_idx, "_KEY").font = bold
+            dim_headers = ["Entity / Group","Institution","Question","Subquestion","Worker Category","Job Function"]
+            for r in range(first, last + 1):
+                parts = []
+                for h in dim_headers:
+                    found = None
+                    for c in range(1, ws.max_column+1):
+                        if ws.cell(header_row, c).value == h:
+                            found = c; break
+                    parts.append(ws.cell(r, found).coordinate if found else '""')
+                ws.cell(r, key_col_idx).value = f'={ "&".join([f"{p}&\"|\"" for p in parts[:-1]]) }{parts[-1]}'
+            # hide column
+            ws.column_dimensions[ws.cell(header_row, key_col_idx).column_letter].hidden = True
+
+        # fill Prior & YoY (Q1..Q4)
+        # Build indexes
+        ci={ws.cell(header_row,c).value:c for c in range(1,ws.max_column+1) if ws.cell(header_row,c).value}
+        key_col=None
+        for c in range(1, ws.max_column+1):
+            if ws.cell(header_row,c).value == "_KEY":
+                key_col=c; break
+        if key_col:
+            for q in ["Q1","Q2","Q3","Q4"]:
+                yoy_hdr=f"YoY {q}"; prior_hdr=f"Prior {q}"
+                if q not in ci or yoy_hdr not in ci or prior_hdr not in ci: continue
+                curr_col=ci[q]; yoy_col=ci[yoy_hdr]; prior_col=ci[prior_hdr]
+                prior_letter = {"Q1":"B","Q2":"C","Q3":"D","Q4":"E"}[q]
+                prior_range = f"{prior_sheet}!${prior_letter}:${prior_letter}"
+                key_range   = f"{prior_sheet}!$A:$A"
+                for r in range(first, last+1):
+                    key_addr = ws.cell(r, key_col).coordinate
+                    curr_addr= ws.cell(r, curr_col).coordinate
+                    prior_expr = f"INDEX({prior_range},MATCH({key_addr},{key_range},0))"
+                    ws.cell(r, prior_col).value = f"=IFERROR({prior_expr},\"\")"
+                    ws.cell(r, yoy_col).value = (
+                        f'=IFERROR('
+                        f'IF({prior_expr}="","N/A",'
+                        f'IF(AND({prior_expr}=0,{curr_addr}=0),0,'
+                        f'IF(AND({prior_expr}=0,{curr_addr}>0),"N/A",'
+                        f'({curr_addr}-{prior_expr})/{prior_expr}))),'
+                        f'"N/A")'
+                    )
+            # format
+            for h, c in ci.items():
+                if str(h).startswith("YoY "):
+                    for r in range(first, last+1):
+                        ws.cell(r, c).number_format = "0.0%"
+                if str(h).startswith("Prior "):
+                    for r in range(first, last+1):
+                        ws.cell(r, c).number_format = "#,##0"
+
     # Bold rollups & TOTAL rows
-    roll_names=set(rollup_order)
+    roll_names=set(ROLLUP_ORDER+list(ROLLUPS.keys()))
     wc_col=None
     for c in range(1, ws.max_column+1):
         if ws.cell(header_row,c).value=="Worker Category": wc_col=c; break
@@ -368,7 +491,6 @@ def write_q5_sheet(
 
     # Freeze/filter/table
     if df.shape[0]>0:
-        # dims count
         dims_present = [h for h in ["Entity / Group","Institution","Question","Subquestion","Worker Category","Job Function"]
                         if h in [ws.cell(header_row,c).value for c in range(1,ws.max_column+1)]]
         first_metric_col = len(dims_present) + 1
@@ -422,23 +544,15 @@ def write_q5_sheet(
             ws.conditional_formatting.add(rng, FormulaRule(formula=[red], fill=FILL_RED))
             ws.conditional_formatting.add(rng, FormulaRule(formula=[yel], fill=FILL_YEL))
 
-def main():
-    ap = argparse.ArgumentParser(description="QC for Q5 (styled, MoM/QoQ thresholds, optional YoY)")
-    ap.add_argument("--stage", required=True, help="Path to staging_all.xlsx")
-    ap.add_argument("--out", default="QC_Q5.xlsx")
-    ap.add_argument("--prior-stage", help="Optional prior-year staging_all.xlsx for YoY")
-    ap.add_argument("--mom-threshold", type=float, default=0.25, help="MoM percent threshold (e.g. 0.25)")
-    ap.add_argument("--qoq-threshold", type=float, default=0.25, help="QoQ percent threshold (e.g. 0.25)")
-    ap.add_argument("--abs-cutoff", type=float, default=50, help="Absolute difference cutoff")
-    ap.add_argument("--config", help="Optional YAML/JSON to override rollups and FI mapping")
-    args = ap.parse_args()
-
-    stage_path = Path(args.stage)
+# ========= Build & save =========
+def build_and_save_q5(stage_path: str, out_path: str,
+                      *, mom_threshold: float, qoq_threshold: float, abs_cutoff: float,
+                      prior_stage_path: Optional[str]=None):
+    stage_path = Path(stage_path)
     if not stage_path.exists():
         print(f"[ERROR] Stage not found: {stage_path}")
         sys.exit(2)
 
-    # Load Q5 sheet
     try:
         xl = pd.ExcelFile(stage_path, engine="openpyxl")
         if "Q5" not in xl.sheet_names:
@@ -453,39 +567,35 @@ def main():
         sys.exit(2)
 
     df = norm_quarter(df)
-    if "entity_name" not in df.columns or "year" not in df.columns or "quarter" not in df.columns:
+    required = {"entity_name","year","quarter"}
+    if not required.issubset(df.columns):
         print("[ERROR] Q5 sheet must have columns: entity_name, year, quarter, (plus months).")
         sys.exit(1)
 
     year = int(pd.Series(df["year"]).mode().iat[0])
     current_q = detect_current_q_from_df(df)
 
-    # load/override config
-    rollups, rollup_order, entity_to_type = load_config(args.config)
-
-    # Build rollups on actually-present entities
-    fi_groups = build_fi_groups(df["entity_name"], entity_to_type, rollups)
-    big = add_rollups_q5(df, fi_groups, entity_to_type)
+    fi_groups = build_fi_groups(df["entity_name"])
+    big = add_rollups_q5(df, fi_groups)
     piv = pivot_monthly(big, year, current_q)
 
-    # Optional prior YoY
+    # Prepare prior piv for YoY (if provided)
     prior_piv = None
-    if args.prior_stage:
+    if prior_stage_path:
         try:
-            xl_prev = pd.ExcelFile(args.prior_stage, engine="openpyxl")
+            xl_prev = pd.ExcelFile(prior_stage_path, engine="openpyxl")
             if "Q5" in xl_prev.sheet_names:
                 prev = norm_quarter(xl_prev.parse("Q5"))
-                prev_big = add_rollups_q5(prev, fi_groups, entity_to_type)
+                prev_big = add_rollups_q5(prev, fi_groups)
                 prior_piv = pivot_monthly(prev_big, year-1, current_q)
         except Exception as e:
             print(f"[WARN] Could not load prior-stage for YoY: {e}")
 
-    # Build workbook
     wb = Workbook(); wb.remove(wb.active)
     write_q5_sheet(
         wb, "QC_Q5", piv, year, current_q,
-        mom_thr=args.mom_threshold, qoq_thr=args.qoq_threshold, abs_cut=args.abs_cutoff,
-        rollup_order=rollup_order, prior_df=prior_piv
+        mom_thr=mom_threshold, qoq_thr=qoq_threshold, abs_cut=abs_cutoff,
+        rollup_order=ROLLUP_ORDER, prior_df=prior_piv
     )
 
     # About tab
@@ -494,14 +604,31 @@ def main():
     about["A2"]="Year"; about["B2"]=year
     about["A3"]="Up to Quarter"; about["B3"]=current_q
     about["A4"]="Generated at"; about["B4"]=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    about["A6"]="MoM threshold"; about["B6"]=args.mom_threshold
-    about["A7"]="QoQ threshold"; about["B7"]=args.qoq_threshold
-    about["A8"]="Abs cutoff"; about["B8"]=args.abs_cutoff
+    about["A6"]="MoM threshold"; about["B6"]=mom_threshold
+    about["A7"]="QoQ threshold"; about["B7"]=qoq_threshold
+    about["A8"]="Abs cutoff"; about["B8"]=abs_cutoff
 
-    out_path = Path(args.out)
+    out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out_path)
     print(f"[DONE] Wrote {out_path}")
+
+# ========= CLI =========
+def main():
+    ap = argparse.ArgumentParser(description="QC for Q5 (styled, MoM/QoQ highlights, optional YoY)")
+    ap.add_argument("--stage", required=True, help="Path to staging_all.xlsx")
+    ap.add_argument("--out", default="QC_Q5.xlsx")
+    ap.add_argument("--prior-stage", help="Optional prior-year staging_all.xlsx for YoY")
+    ap.add_argument("--mom-threshold", type=float, default=0.25, help="MoM percent threshold (e.g. 0.25)")
+    ap.add_argument("--qoq-threshold", type=float, default=0.25, help="QoQ percent threshold (e.g. 0.25)")
+    ap.add_argument("--abs-cutoff", type=float, default=50, help="Absolute difference cutoff")
+    a = ap.parse_args()
+
+    build_and_save_q5(
+        a.stage, a.out,
+        mom_threshold=a.mom_threshold, qoq_threshold=a.qoq_threshold, abs_cutoff=a.abs_cutoff,
+        prior_stage_path=a.prior_stage
+    )
 
 if __name__ == "__main__":
     main()
