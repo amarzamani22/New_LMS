@@ -1,1 +1,100 @@
+# qc_q1.py
+from __future__ import annotations
+import argparse
+from pathlib import Path
+import pandas as pd
+from qc_common import write_qc_sheet, new_workbook_with_about, normalize_quarter_label, months_up_to_quarter
 
+def load_stage_sheet(path: Path, sheet: str) -> pd.DataFrame:
+    try:
+        return pd.read_excel(path, sheet_name=sheet, engine="openpyxl")
+    except Exception:
+        return pd.DataFrame()
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="QC for Question 1 (A Main, A Job Function, B) from staging.")
+    ap.add_argument("--stage", required=True, help="Staging workbook (.xlsx)")
+    ap.add_argument("--out", required=True, help="Output QC workbook (.xlsx)")
+    ap.add_argument("--prior-stage", default=None, help="Optional prior-year staging for YoY")
+    ap.add_argument("--year", type=int, default=None, help="Target year (default: mode in staging)")
+    args = ap.parse_args()
+
+    stage = Path(args.stage)
+    df_main = load_stage_sheet(stage, "Q1A_Main")
+    df_jf   = load_stage_sheet(stage, "Q1A_JobFunc_Q4")
+    df_b    = load_stage_sheet(stage, "Q1B")
+
+    if df_main.empty and df_jf.empty and df_b.empty:
+        print("[WARN] No Q1 sheets found in staging.")
+        return 0
+
+    # Year detection
+    if args.year is None:
+        years = pd.concat([d[["year"]] for d in [df_main, df_jf, df_b] if not d.empty], ignore_index=True)
+        year = int(years["year"].mode().iat[0])
+    else:
+        year = int(args.year)
+
+    # Current quarter by union
+    qseries = pd.concat([d["quarter"] for d in [df_main, df_jf, df_b] if (not d.empty and "quarter" in d.columns)], ignore_index=True)
+    current_q = normalize_quarter_label(qseries)
+
+    # Filter to year
+    if not df_main.empty: df_main = df_main[df_main["year"] == year]
+    if not df_jf.empty:   df_jf   = df_jf[df_jf["year"] == year]
+    if not df_b.empty:    df_b    = df_b[df_b["year"] == year]
+
+    # Prior (optional)
+    prior_main = prior_jf = prior_b = None
+    if args.prior_stage:
+        p = Path(args.prior_stage)
+        pm = load_stage_sheet(p, "Q1A_Main")
+        pj = load_stage_sheet(p, "Q1A_JobFunc_Q4")
+        pb = load_stage_sheet(p, "Q1B")
+        if not pm.empty: prior_main = pm[pm["year"] == (year-1)]
+        if not pj.empty: prior_jf   = pj[pj["year"] == (year-1)]
+        if not pb.empty: prior_b    = pb[pb["year"] == (year-1)]
+
+    # Build workbook
+    wb = new_workbook_with_about("RLMS – QC (Q1)", year, current_q)
+
+    # Q1A Main (monthly table)
+    if not df_main.empty:
+        write_qc_sheet(
+            wb, "QC_Q1A_Main", df_main,
+            id_cols=["entity_name","subquestion","worker_category"],
+            month_cols_in_df=months_up_to_quarter(current_q),
+            add_job_function=False,
+            current_q=current_q, year=year,
+            prior_df=prior_main
+        )
+
+    # Q1A Job Function (value table), now includes subquestion
+    if not df_jf.empty:
+        write_qc_sheet(
+            wb, "QC_Q1A_JobFunc_Q4", df_jf,
+            id_cols=["entity_name","subquestion","worker_category","job_function"],
+            month_cols_in_df=[],  # value-based
+            add_job_function=True,
+            current_q=current_q, year=year,
+            prior_df=None  # typically no YoY for job-function (can be added if you want)
+        )
+
+    # Q1B (Jun/Dec only – staging already holds Jun/Dec columns only)
+    if not df_b.empty:
+        write_qc_sheet(
+            wb, "QC_Q1B", df_b,
+            id_cols=["entity_name","subquestion","worker_category"],
+            month_cols_in_df=months_up_to_quarter(current_q),
+            add_job_function=False,
+            current_q=current_q, year=year,
+            prior_df=prior_b
+        )
+
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    wb.save(args.out)
+    print(f"[DONE] {args.out}")
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
