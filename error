@@ -1,0 +1,38 @@
+Traceback (most recent call last):
+  File "C:\Users\ttamarz\OneDrive - Bank Negara Malaysia\RLMS\qc_template\qc_q5.py", line 634, in <module>
+    main()
+    ~~~~^^
+  File "C:\Users\ttamarz\OneDrive - Bank Negara Malaysia\RLMS\qc_template\qc_q5.py", line 627, in main
+    build_and_save_q5(
+    ~~~~~~~~~~~~~~~~~^
+        a.stage, a.out,
+        ^^^^^^^^^^^^^^^
+        mom_threshold=a.mom_threshold, qoq_threshold=a.qoq_threshold, abs_cutoff=a.abs_cutoff,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        prior_stage_path=a.prior_stage
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\ttamarz\OneDrive - Bank Negara Malaysia\RLMS\qc_template\qc_q5.py", line 595, in build_and_save_q5        
+    write_q5_sheet(
+    ~~~~~~~~~~~~~~^
+        wb, "QC_Q5", piv, year, current_q,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        mom_thr=mom_threshold, qoq_thr=qoq_threshold, abs_cut=abs_cutoff,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        rollup_order=ROLLUP_ORDER, prior_df=prior_piv
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\ttamarz\OneDrive - Bank Negara Malaysia\RLMS\qc_template\qc_q5.py", line 313, in write_q5_sheet
+    ws.merge_cells(banner_row,1,banner_row,len(dims))
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\ttamarz\AppData\Roaming\Python\Python313\site-packages\openpyxl\worksheet\worksheet.py", line 600, in merge_cells
+    mcr = MergedCellRange(self, range_string)
+  File "C:\Users\ttamarz\AppData\Roaming\Python\Python313\site-packages\openpyxl\worksheet\merge.py", line 68, in __init__ 
+    super().__init__(range_string=coord)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\ttamarz\AppData\Roaming\Python\Python313\site-packages\openpyxl\worksheet\cell_range.py", line 51, in __init__
+    if "!" in range_string:
+       ^^^^^^^^^^^^^^^^^^^
+TypeError: argument of type 'int' is not iterable
