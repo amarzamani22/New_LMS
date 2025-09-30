@@ -3,10 +3,13 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import pandas as pd
-from qc_common import write_qc_sheet, new_workbook_with_about, normalize_quarter_label, months_up_to_quarter
+from qc_common import new_empty_workbook, append_about_sheet_last, write_qc_sheet, normalize_quarter_label, MONTHS_FULL
+
+def months_in_df(df: pd.DataFrame) -> list:
+    return [m for m in MONTHS_FULL if m in df.columns]
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="QC for Question 3 from staging.")
+    ap = argparse.ArgumentParser(description="QC for Question 3")
     ap.add_argument("--stage", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--prior-stage", default=None)
@@ -35,17 +38,17 @@ def main() -> int:
             prev = pd.read_excel(p, sheet_name="Q3", engine="openpyxl")
             prior_df = prev[prev["year"]==(year-1)]
         except Exception:
-            prior_df = None
+            pass
 
-    wb = new_workbook_with_about("RLMS – QC (Q3)", year, current_q)
+    wb = new_empty_workbook()
     write_qc_sheet(
         wb, "QC_Q3", df,
-        id_cols=["entity_name","worker_category"],  # Q3 has 'question' fixed; we don't need it in row id
-        month_cols_in_df=months_up_to_quarter(current_q),
-        add_job_function=False,
+        include_job_function=False,
+        months_to_show=months_in_df(df),
         current_q=current_q, year=year,
         prior_df=prior_df
     )
+    append_about_sheet_last(wb, "RLMS – QC (Q3)", year, current_q)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     wb.save(args.out)
     print(f"[DONE] {args.out}")
