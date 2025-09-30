@@ -1,3 +1,32 @@
-C:\Users\ttamarz\AppData\Roaming\Python\Python313\site-packages\openpyxl\worksheet\_writer.py:274: UserWarning: File may not be readable: column headings must be strings.
-  warn("File may not be readable: column headings must be strings.")
-[DONE] Wrote C:\Users\ttamarz\OneDrive - Bank Negara Malaysia\RLMS\Submission\QC Template\qc_q5_2025.xlsx
+for qc_q1.py:
+
+-about must at the last tab
+-for QC_Q1A_Main :
+   -should not have job function column, it caused scan a wrong value. Job function column there took Q1, January data, lead to wrong value for the next month and above
+   -make sure MoM diff% use correct calculation (current-prev/prev)x100
+-for QC_Q1A_JobFunc_Q4 :
+   -no data show, all zero
+   -job function column in this sheet already list a correct one
+-for QC_Q1B :
+   -should not have job function column, lead to scanning a wrong month value
+
+for qc_q2.py:
+
+-terminal said no q2 sheets in stagging
+
+for qc_q3.py:
+
+-subquestion column show worker category list
+-worker category show institution list
+-institution column list show value (maybe it take January value)
+-job function column show value (this question didn't have job function column) (maybe the column filled with February value)
+
+For qc_q4.py:
+
+-worker category list have one subquestion appear
+-should not have job function column, leading to wrong value on every month data
+
+For qc_q5.py:
+
+-should not have job function column 
+-job function column filled January data, and lead to wrong data filled on all of the next column
