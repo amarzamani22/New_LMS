@@ -1,32 +1,21 @@
 for qc_q1.py:
 
--about must at the last tab
--for QC_Q1A_Main :
-   -should not have job function column, it caused scan a wrong value. Job function column there took Q1, January data, lead to wrong value for the next month and above
-   -make sure MoM diff% use correct calculation (current-prev/prev)x100
--for QC_Q1A_JobFunc_Q4 :
-   -no data show, all zero
-   -job function column in this sheet already list a correct one
--for QC_Q1B :
-   -should not have job function column, lead to scanning a wrong month value
+-qc_q1A_main already correct
+-qc_q1a_jobfunc: only show dimension column, no value column. Suggest to compare with prior job function on quarter 4 value. (apply yoy column back to all question, based on the question suitability)
+-qc_q1b:show correct value. suggest to compare with prior value, Jun with Jun, Dec with Dec, and show the diff and diff% 
 
-for qc_q2.py:
+For qc_q2.py:
 
--terminal said no q2 sheets in stagging
+-still no q2 sheets in staging, please fix carefully
 
-for qc_q3.py:
+For qc_q3.py:
 
--subquestion column show worker category list
--worker category show institution list
--institution column list show value (maybe it take January value)
--job function column show value (this question didn't have job function column) (maybe the column filled with February value)
+-subquestion not in index error
+-it is because of this question have no subquestion, it only have one question, so no subquestion column
 
-For qc_q4.py:
+q4 and q5 already correct.
 
--worker category list have one subquestion appear
--should not have job function column, leading to wrong value on every month data
+please apply highlighted rules for threshold and abs cutoff too, but based on question, and make sure it can tune or can ask for user input for that. 
 
-For qc_q5.py:
 
--should not have job function column 
--job function column filled January data, and lead to wrong data filled on all of the next column
+
