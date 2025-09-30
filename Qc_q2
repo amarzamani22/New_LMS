@@ -3,14 +3,35 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import pandas as pd
-from qc_common import write_qc_sheet, new_workbook_with_about, normalize_quarter_label, months_up_to_quarter
+from qc_common import (
+    new_empty_workbook, append_about_sheet_last, write_qc_sheet,
+    normalize_quarter_label, MONTHS_FULL
+)
 
-def load(path: Path, sheet: str) -> pd.DataFrame:
-    try: return pd.read_excel(path, sheet_name=sheet, engine="openpyxl")
-    except Exception: return pd.DataFrame()
+def load(path: Path, preferred: str, fallbacks=None) -> pd.DataFrame:
+    if fallbacks is None: fallbacks = []
+    try:
+        return pd.read_excel(path, sheet_name=preferred, engine="openpyxl")
+    except Exception:
+        # try fuzzy match
+        try:
+            xls = pd.ExcelFile(path, engine="openpyxl")
+            for name in xls.sheet_names:
+                if preferred.lower() == name.lower():
+                    return pd.read_excel(path, sheet_name=name, engine="openpyxl")
+            for f in fallbacks:
+                for name in xls.sheet_names:
+                    if f.lower() == name.lower():
+                        return pd.read_excel(path, sheet_name=name, engine="openpyxl")
+        except Exception:
+            pass
+    return pd.DataFrame()
+
+def months_in_df(df: pd.DataFrame) -> list:
+    return [m for m in MONTHS_FULL if m in df.columns]
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="QC for Question 2 (A Main, A Job Function, B) from staging.")
+    ap = argparse.ArgumentParser(description="QC for Question 2")
     ap.add_argument("--stage", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--prior-stage", default=None)
@@ -18,67 +39,69 @@ def main() -> int:
     args = ap.parse_args()
 
     stage = Path(args.stage)
-    a  = load(stage, "Q2A_Main")
-    jf = load(stage, "Q2A_JobFunc_Q4")
-    b  = load(stage, "Q2B")
+    q2a  = load(stage, "Q2A_Main")
+    q2jf = load(stage, "Q2A_JobFunc_Q4")
+    q2b  = load(stage, "Q2B")
 
-    if a.empty and jf.empty and b.empty:
+    if q2a.empty and q2jf.empty and q2b.empty:
         print("[WARN] No Q2 sheets in staging.")
         return 0
 
     if args.year is None:
-        years = pd.concat([d[["year"]] for d in [a,jf,b] if not d.empty], ignore_index=True)
+        years = pd.concat([d[["year"]] for d in [q2a,q2jf,q2b] if not d.empty], ignore_index=True)
         year = int(years["year"].mode().iat[0])
     else:
         year = int(args.year)
 
-    qseries = pd.concat([d["quarter"] for d in [a,jf,b] if not d.empty], ignore_index=True)
+    qseries = pd.concat([d["quarter"] for d in [q2a,q2jf,q2b] if not d.empty], ignore_index=True)
     current_q = normalize_quarter_label(qseries)
 
-    if not a.empty:  a  = a[a["year"]==year]
-    if not jf.empty: jf = jf[jf["year"]==year]
-    if not b.empty:  b  = b[b["year"]==year]
+    if not q2a.empty:  q2a  = q2a[q2a["year"]==year]
+    if not q2jf.empty: q2jf = q2jf[q2jf["year"]==year]
+    if not q2b.empty:  q2b  = q2b[q2b["year"]==year]
 
-    prior_a = prior_jf = prior_b = None
+    # Keep only FIs with any non-zero data for Q2B (as requested)
+    if not q2b.empty:
+        valcols = [c for c in q2b.columns if c in MONTHS_FULL]
+        grp = q2b.groupby("entity_name")[valcols].sum().sum(axis=1)
+        keep = set(grp[grp != 0].index)
+        q2b = q2b[q2b["entity_name"].isin(keep)]
+
+    prior_a = prior_b = None
     if args.prior_stage:
         p = Path(args.prior_stage)
-        pa = load(p, "Q2A_Main")
-        pj = load(p, "Q2A_JobFunc_Q4")
-        pb = load(p, "Q2B")
+        pa = load(p, "Q2A_Main"); pb = load(p, "Q2B")
         if not pa.empty: prior_a = pa[pa["year"]==(year-1)]
-        if not pj.empty: prior_jf = pj[pj["year"]==(year-1)]
         if not pb.empty: prior_b = pb[pb["year"]==(year-1)]
 
-    wb = new_workbook_with_about("RLMS – QC (Q2)", year, current_q)
+    wb = new_empty_workbook()
 
-    if not a.empty:
+    if not q2a.empty:
         write_qc_sheet(
-            wb, "QC_Q2A_Main", a,
-            id_cols=["entity_name","subquestion","worker_category"],
-            month_cols_in_df=months_up_to_quarter(current_q),
-            add_job_function=False,
+            wb, "QC_Q2A_Main", q2a,
+            include_job_function=False,
+            months_to_show=months_in_df(q2a),
             current_q=current_q, year=year,
             prior_df=prior_a
         )
-    if not jf.empty:
+    if not q2jf.empty:
         write_qc_sheet(
-            wb, "QC_Q2A_JobFunc_Q4", jf,
-            id_cols=["entity_name","subquestion","worker_category","job_function"],
-            month_cols_in_df=[],
-            add_job_function=True,
+            wb, "QC_Q2A_JobFunc_Q4", q2jf,
+            include_job_function=True,
+            months_to_show=[],  # value-only
             current_q=current_q, year=year,
             prior_df=None
         )
-    if not b.empty:
+    if not q2b.empty:
         write_qc_sheet(
-            wb, "QC_Q2B", b,
-            id_cols=["entity_name","subquestion","worker_category"],
-            month_cols_in_df=months_up_to_quarter(current_q),
-            add_job_function=False,
+            wb, "QC_Q2B", q2b,
+            include_job_function=False,
+            months_to_show=months_in_df(q2b),  # typically ["Jun"] or ["Dec"]
             current_q=current_q, year=year,
             prior_df=prior_b
         )
 
+    append_about_sheet_last(wb, "RLMS – QC (Q2)", year, current_q)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     wb.save(args.out)
     print(f"[DONE] {args.out}")
