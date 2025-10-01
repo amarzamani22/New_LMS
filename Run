@@ -1,574 +1,351 @@
-# qc_builder.py
-from __future__ import annotations
+# =============================================================================
 
+# qc_q1.py
+
+# =============================================================================
+
+from **future** import annotations
 import argparse
-from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
-
 import pandas as pd
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment
-from openpyxl.worksheet.table import Table, TableStyleInfo
-from openpyxl.formatting.rule import DataBarRule, FormulaRule
+from qc_common import (
+new_empty_workbook, append_about_sheet_last, write_qc_sheet,
+normalize_quarter_label, MONTHS_FULL
+)
 
-# ----------------------------
-# Config you can tweak
-# ----------------------------
-ROLLUPS: Dict[str, List[str]] = {
-    "All Financial Institutions": [
-        "Commercial Banks", "Investment Banks", "Islamic Banks", "DFI",
-        "Insurers", "Takaful Operators", "Foreign Banks",
-        "International Islamic Banks", "Digital Banks"
-    ],
-    "Banking Institutions": [
-        "Commercial Banks", "Investment Banks", "Islamic Banks",
-        "Digital Banks", "International Islamic Banks", "Foreign Banks"
-    ],
-    "Commercial Banks": ["Commercial Banks", "Foreign Banks"],
-    "Investment Banks": ["Investment Banks"],
-    "Islamic Banks": ["Islamic Banks"],
-    "Digital Banks": ["Digital Banks"],
-    "International Islamic Banks": ["International Islamic Banks"],
-    "Foreign Banks": ["Foreign Banks"],
-    "DFI": ["DFI"],
-    "Insurers": ["Insurers"],
-    "Takaful Operators": ["Takaful Operators"],
-}
+def months_in_df(df: pd.DataFrame) -> list:
+return [m for m in MONTHS_FULL if m in df.columns]
 
-ROLLUP_ORDER = [
-    "All Financial Institutions",
-    "Banking Institutions",
-    "Commercial Banks",
-    "Investment Banks",
-    "Islamic Banks",
-    "Foreign Banks",
-    "Digital Banks",
-    "International Islamic Banks",
-    "DFI",
-    "Insurers",
-    "Takaful Operators",
-]
-
-Q_TO_MONTHS = {
-    "Q1": ["Jan", "Feb", "Mar"],
-    "Q2": ["Apr", "May", "Jun"],
-    "Q3": ["Jul", "Aug", "Sep"],
-    "Q4": ["Oct", "Nov", "Dec"],
-}
-MONTHS_FULL = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
-
-# Palette
-FILL_Q1 = PatternFill(start_color="E8F3FF", end_color="E8F3FF", fill_type="solid")
-FILL_Q2 = PatternFill(start_color="E8F8E8", end_color="E8F8E8", fill_type="solid")
-FILL_Q3 = PatternFill(start_color="FFF3E0", end_color="FFF3E0", fill_type="solid")
-FILL_Q4 = PatternFill(start_color="F3E5F5", end_color="F3E5F5", fill_type="solid")
-FILL_RAW = PatternFill(start_color="E6EEF7", end_color="E6EEF7", fill_type="solid")
-FILL_TOTAL_ROW = PatternFill(start_color="F7F7F7", end_color="F7F7F7", fill_type="solid")
-FILL_RED = PatternFill(start_color="FFE5E5", end_color="FFE5E5", fill_type="solid")
-FILL_YELLOW = PatternFill(start_color="FFF7CC", end_color="FFF7CC", fill_type="solid")
-QFILL = {"Q1": FILL_Q1, "Q2": FILL_Q2, "Q3": FILL_Q3, "Q4": FILL_Q4}
-
-
-# ----------------------------
-# Helpers
-# ----------------------------
-def months_up_to_quarter(q_label: str) -> List[str]:
-    order = ["Q1","Q2","Q3","Q4"]
-    out: List[str] = []
-    for q in order:
-        out += Q_TO_MONTHS[q]
-        if q == q_label:
-            break
-    return out
-
-def pick_current_quarter_from_staging(stag: pd.DataFrame) -> str:
-    mapping = {"Quarter 1":"Q1","Quarter 2":"Q2","Quarter 3":"Q3","Quarter 4":"Q4",
-               "Q1":"Q1","Q2":"Q2","Q3":"Q3","Q4":"Q4"}
-    s = stag.copy()
-    s["Q"] = s["quarter"].map(mapping).fillna(s["quarter"])
-    order = {"Q1":1,"Q2":2,"Q3":3,"Q4":4}
-    idx = s["Q"].map(order).idxmax()
-    return str(s.loc[idx, "Q"])
-
-def build_rollups_from_stage(stage: pd.DataFrame) -> pd.DataFrame:
-    base = ["year","quarter","month","employment_detail","worker_category"]
-    frames = []
-
-    # rollups
-    for label, groups in ROLLUPS.items():
-        sub = stage[stage["fi_group"].isin(groups)]
-        if sub.empty: 
-            continue
-        agg = sub.groupby(base, dropna=False)["value"].sum().reset_index()
-        agg["entity_group"] = label
-        agg["institution"] = ""
-        frames.append(agg)
-
-    # institutions
-    inst = stage.groupby(base + ["entity_name"], dropna=False)["value"].sum().reset_index()
-    inst["entity_group"] = inst["entity_name"]
-    inst["institution"] = inst["entity_name"]
-    inst = inst.drop(columns=["entity_name"])
-    frames.append(inst)
-
-    out = pd.concat(frames, ignore_index=True)
-    return out[["entity_group","institution","employment_detail","worker_category","year","quarter","month","value"]]
-
-def sort_qc_rows(df: pd.DataFrame) -> pd.DataFrame:
-    roll_rank = {n:i for i,n in enumerate(ROLLUP_ORDER)}
-    df["entity_rank"] = df["entity_group"].map(lambda x: roll_rank.get(x, 10_000))
-    wc_order = {
-        "Managers":0,"Professional":1,"Technicians & Associate Professionals":2,
-        "Clerical Occupations":3,"Operative Workers":4,"Elementary Occupations":5,"TOTAL":6
-    }
-    df["wc_rank"] = df["worker_category"].map(lambda x: wc_order.get(str(x), 99))
-    ed_order = {
-        "New Hires and Recalls":0, "Separations":1,
-        "Quits & Resignations (except retirements)":2,
-        "Layoffs and Discharges":3,
-        "Layoffs of which: VSS/MSS":4,
-        "Other Separations":5
-    }
-    df["ed_rank"] = df["employment_detail"].map(lambda x: ed_order.get(str(x), 99))
-    df = df.sort_values(["entity_rank","entity_group","ed_rank","wc_rank","institution"], kind="mergesort")
-    return df.drop(columns=["entity_rank","wc_rank","ed_rank"])
-
-def pivot_current_year(big: pd.DataFrame, year: int, current_q: str) -> pd.DataFrame:
-    months = months_up_to_quarter(current_q)
-    subset = big[big["year"] == year].copy()
-    subset = sort_qc_rows(subset)
-    pivot = subset.pivot_table(
-        index=["entity_group","employment_detail","worker_category","institution"],
-        columns="month", values="value", aggfunc="sum", fill_value=0
-    ).reindex(columns=months, fill_value=0).reset_index()
-
-    def sum_cols(cols: List[str]) -> pd.Series:
-        ok = [c for c in cols if c in pivot.columns]
-        return pivot[ok].sum(axis=1) if ok else 0
-
-    if set(["Jan","Feb","Mar"]).issubset(pivot.columns): pivot["Q1"] = sum_cols(["Jan","Feb","Mar"])
-    if set(["Apr","May","Jun"]).issubset(pivot.columns): pivot["Q2"] = sum_cols(["Apr","May","Jun"])
-    if set(["Jul","Aug","Sep"]).issubset(pivot.columns): pivot["Q3"] = sum_cols(["Jul","Aug","Sep"])
-    if set(["Oct","Nov","Dec"]).issubset(pivot.columns): pivot["Q4"] = sum_cols(["Oct","Nov","Dec"])
-
-    base = ["entity_group","employment_detail","worker_category","institution"]
-    qcols = [c for c in ["Q1","Q2","Q3","Q4"] if c in pivot.columns]
-    return pivot[base + months + qcols]
-
-def load_stage(path: Path) -> pd.DataFrame:
-    if path.suffix.lower() in (".parquet",".pq"):
-        return pd.read_parquet(path)
-    return pd.read_excel(path, sheet_name=0, engine="openpyxl")
-
-def stage_to_big(stage: pd.DataFrame) -> pd.DataFrame:
-    needed = ["year","quarter","month","entity_name","fi_group","employment_detail","worker_category","value"]
-    for c in needed:
-        if c not in stage.columns:
-            raise ValueError(f"Staging missing column: {c}")
-    s = stage.copy()
-    s["month"] = s["month"].astype(str)
-    return build_rollups_from_stage(s)
-
-
-# ----------------------------
-# Excel writer (styled, fast) — FIXED YoY
-# ----------------------------
-def write_qc(
-    df: pd.DataFrame,
-    out_path: Path,
-    year: int,
-    current_q: str,
-    prior_qc_df: Optional[pd.DataFrame] = None,
-    mom_pct_threshold: float = 0.25,
-    mom_abs_cutoff: float = 50,
-    qoq_pct_threshold: float = 0.25,
-) -> Path:
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "QC_Data"
-
-    # Header rows
-    banner_row = 7
-    header_row = 8
-    bold = Font(bold=True)
-    center = Alignment(horizontal="center", vertical="center")
-
-    months = months_up_to_quarter(current_q)
-    base_cols = ["Entity / Group","Employment Detail","Worker Category","Institution"]
-
-    # Monthly diff + MoM%
-    month_diff_headers: List[str] = []
-    month_mom_headers: List[str] = []
-    for m in months:
-        i = MONTHS_FULL.index(m)
-        prev = MONTHS_FULL[i-1] if i > 0 else None
-        if prev and prev in months:
-            month_diff_headers.append(f"Diff {m}")
-            month_mom_headers.append(f"MoM {m}")
-
-    q_sums = [q for q in ["Q1","Q2","Q3","Q4"] if q in df.columns]
-    q_diff_headers: List[str] = []
-    for i, q in enumerate(q_sums):
-        if i == 0:
-            continue
-        q_diff_headers += [f"Diff {q}", f"%Diff {q}"]
-
-    yoy_headers   = [f"YoY {q}" for q in q_sums]      # percent vs prior year
-    prior_headers = [f"Prior {q}" for q in q_sums]    # prior-year totals
-
-    # spacers
-    s1, s2, s3, s4 = " ", "  ", "   ", "    "
-    headers = (
-        base_cols + months + [s1] + month_diff_headers + [s2] + month_mom_headers +
-        [s3] + q_sums + q_diff_headers + [s4] + yoy_headers + prior_headers
-    )
-
-    # banner blanks
-    for c in range(1, len(headers)+1):
-        ws.cell(banner_row, c, None)
-
-    # write header row
-    for idx, h in enumerate(headers, start=1):
-        ws.cell(header_row, idx, h).font = bold
-        if h in months:
-            ws.cell(header_row, idx).fill = FILL_RAW
-
-    col_index = {h: i+1 for i, h in enumerate(headers)}
-
-    # banner blocks
-    ws.merge_cells(start_row=banner_row, start_column=1, end_row=banner_row, end_column=len(base_cols))
-    ws.cell(banner_row, 1, "Dimensions").font = bold
-    ws.cell(banner_row, 1).alignment = center
-
-    def _cols_for(names: List[str]) -> List[int]:
-        return [col_index[n] for n in names if n in col_index]
-
-    for qlbl, q_months in Q_TO_MONTHS.items():
-        include = [m for m in months if m in q_months]
-        if not include:
-            continue
-        cols = _cols_for(include)
-        ws.merge_cells(start_row=banner_row, start_column=cols[0], end_row=banner_row, end_column=cols[-1])
-        ws.cell(banner_row, cols[0], f"{qlbl} {year}").font = bold
-        ws.cell(banner_row, cols[0]).alignment = center
-        for c in cols:
-            ws.cell(header_row, c).fill = QFILL[qlbl]
-            ws.cell(banner_row,  c).fill = QFILL[qlbl]
-
-    by_q_diff = {q:[h for h in month_diff_headers if any(h.endswith(m) for m in Q_TO_MONTHS[q])] for q in ["Q1","Q2","Q3","Q4"]}
-    by_q_mom  = {q:[h for h in month_mom_headers  if any(h.endswith(m) for m in Q_TO_MONTHS[q])] for q in ["Q1","Q2","Q3","Q4"]}
-    for q in ["Q1","Q2","Q3","Q4"]:
-        cols = _cols_for(by_q_diff[q])
-        if cols:
-            ws.merge_cells(start_row=banner_row, start_column=cols[0], end_row=banner_row, end_column=cols[-1])
-            ws.cell(banner_row, cols[0], f"{q} – Differences").font = bold
-            ws.cell(banner_row, cols[0]).alignment = center
-            for c in cols:
-                ws.cell(header_row, c).fill = QFILL[q]; ws.cell(banner_row, c).fill = QFILL[q]
-        cols = _cols_for(by_q_mom[q])
-        if cols:
-            ws.merge_cells(start_row=banner_row, start_column=cols[0], end_row=banner_row, end_column=cols[-1])
-            ws.cell(banner_row, cols[0], f"{q} – MoM%").font = bold
-            ws.cell(banner_row, cols[0]).alignment = center
-            for c in cols:
-                ws.cell(header_row, c).fill = QFILL[q]; ws.cell(banner_row, c).fill = QFILL[q]
-
-    q_block = q_sums + q_diff_headers
-    if q_block:
-        cols = _cols_for(q_block)
-        ws.merge_cells(start_row=banner_row, start_column=cols[0], end_row=banner_row, end_column=cols[-1])
-        ws.cell(banner_row, cols[0], "Quarterly (Sums, Δ, %Δ)").font = bold
-        ws.cell(banner_row, cols[0]).alignment = center
-
-    if yoy_headers:
-        cols = _cols_for(yoy_headers + prior_headers)
-        if cols:
-            ws.merge_cells(start_row=banner_row, start_column=cols[0], end_row=banner_row, end_column=cols[-1])
-            ws.cell(banner_row, cols[0], "YoY vs same quarter last year").font = bold
-            ws.cell(banner_row, cols[0]).alignment = center
-
-    # ensure numeric columns exist
-    for c in months + q_sums:
-        if c not in df.columns:
-            df[c] = 0
-
-    # data rows
-    first_data_row = header_row + 1
-    for _, row in df.iterrows():
-        vals = [
-            row["entity_group"], row["employment_detail"], row["worker_category"], row["institution"],
-        ]
-        vals += [row.get(m, 0) for m in months] + [""]                           # spacer
-        vals += [""] * len(month_diff_headers) + [""]                            # spacer
-        vals += [""] * len(month_mom_headers) + [""]                             # spacer
-        vals += [row.get(q, 0) for q in q_sums] + [""] * len(q_diff_headers) + [""]  # spacer
-        vals += [""] * len(yoy_headers) + [""] * len(prior_headers)             # YoY + Prior placeholders
-        ws.append(vals)
-
-    last_data_row = first_data_row + df.shape[0] - 1
-
-    # quarter sum formulas (safety)
-    if "Q1" in q_sums:
-        for r in range(first_data_row, last_data_row + 1):
-            ws.cell(r, col_index["Q1"]).value = f"=SUM({ws.cell(r,col_index['Jan']).coordinate}:{ws.cell(r,col_index['Mar']).coordinate})"
-    if "Q2" in q_sums:
-        for r in range(first_data_row, last_data_row + 1):
-            ws.cell(r, col_index["Q2"]).value = f"=SUM({ws.cell(r,col_index['Apr']).coordinate}:{ws.cell(r,col_index['Jun']).coordinate})"
-    if "Q3" in q_sums:
-        for r in range(first_data_row, last_data_row + 1):
-            ws.cell(r, col_index["Q3"]).value = f"=SUM({ws.cell(r,col_index['Jul']).coordinate}:{ws.cell(r,col_index['Sep']).coordinate})"
-    if "Q4" in q_sums:
-        for r in range(first_data_row, last_data_row + 1):
-            ws.cell(r, col_index["Q4"]).value = f"=SUM({ws.cell(r,col_index['Oct']).coordinate}:{ws.cell(r,col_index['Dec']).coordinate})"
-
-    # monthly diff + mom%
-    for r in range(first_data_row, last_data_row + 1):
-        for m in months:
-            i = MONTHS_FULL.index(m)
-            prev = MONTHS_FULL[i-1] if i > 0 else None
-            if not prev or prev not in months:
-                continue
-            if f"Diff {m}" in col_index:
-                ws.cell(r, col_index[f"Diff {m}"]).value = f"={ws.cell(r,col_index[m]).coordinate}-{ws.cell(r,col_index[prev]).coordinate}"
-            if f"MoM {m}" in col_index:
-                num = ws.cell(r, col_index[m]).coordinate
-                den = ws.cell(r, col_index[prev]).coordinate
-                ws.cell(r, col_index[f"MoM {m}"]).value = (
-                    f"=IF(AND({num}=0,{den}=0),0,IF(AND({num}<>0,{den}=0),\"N/A\",({num}-{den})/{den}))"
-                )
-
-    # QoQ diff + %diff
-    for r in range(first_data_row, last_data_row + 1):
-        for i, q in enumerate(q_sums):
-            if i == 0: continue
-            prev_q = q_sums[i-1]
-            if f"Diff {q}" in col_index:
-                ws.cell(r, col_index[f"Diff {q}"]).value = f"={ws.cell(r,col_index[q]).coordinate}-{ws.cell(r,col_index[prev_q]).coordinate}"
-            if f"%Diff {q}" in col_index:
-                curr = ws.cell(r, col_index[q]).coordinate
-                prev = ws.cell(r, col_index[prev_q]).coordinate
-                ws.cell(r, col_index[f"%Diff {q}"]).value = (
-                    f"=IF(AND({curr}=0,{prev}=0),0,IF(AND({curr}<>0,{prev}=0),\"N/A\",({curr}-{prev})/{prev}))"
-                )
-
-    # styling
-    rollup_set = set(ROLLUP_ORDER)
-    for r in range(first_data_row, last_data_row + 1):
-        if ws.cell(r, 1).value in rollup_set:
-            ws.cell(r, 1).font = Font(bold=True)
-        if str(ws.cell(r, 3).value).strip().upper() == "TOTAL":
-            for c in range(1, len(headers)+1):
-                ws.cell(r, c).font = Font(bold=True)
-                ws.cell(r, c).fill = FILL_TOTAL_ROW
-
-    # freeze/filter/table
-    first_month_col = col_index[months[0]] if months else len(base_cols)+1
-    ws.freeze_panes = ws.cell(first_data_row, first_month_col)
-    ws.auto_filter.ref = f"A{header_row}:{ws.cell(last_data_row, len(headers)).coordinate}"
-    table_ref = f"A{header_row}:{ws.cell(last_data_row, len(headers)).coordinate}"
-    table = Table(displayName=ws.title, ref=table_ref)
-    table.tableStyleInfo = TableStyleInfo(name="TableStyleLight9", showRowStripes=True, showColumnStripes=False)
-    ws.add_table(table)
-
-    # subtotal
-    totals_row = last_data_row + 2
-    ws.cell(totals_row, 1, "TOTALS (visible rows)").font = Font(bold=True)
-    for h, c in col_index.items():
-        if (h in months) or h.startswith("Diff ") or h.startswith("MoM ") or h.startswith("%Diff ") or (h in q_sums) or h.startswith("YoY ") or h.startswith("Prior "):
-            ws.cell(totals_row, c).value = f"=SUBTOTAL(9,{ws.cell(first_data_row,c).coordinate}:{ws.cell(last_data_row,c).coordinate})"
-            ws.cell(totals_row, c).font = Font(bold=True)
-
-    # data bars
-    if months:
-        m0 = col_index[months[0]]; mN = col_index[months[-1]]
-        ws.conditional_formatting.add(
-            f"{ws.cell(first_data_row, m0).coordinate}:{ws.cell(last_data_row, mN).coordinate}",
-            DataBarRule(start_type='min', end_type='max', color="63BE7B")
-        )
-
-    # MoM highlight
-    for h, col_idx_pct in col_index.items():
-        if not h.startswith("MoM "): continue
-        m = h.replace("MoM ","",1)
-        diff_h = f"Diff {m}"
-        if diff_h not in col_index: continue
-        col_idx_diff = col_index[diff_h]
-        pctL  = ws.cell(1, col_idx_pct).column_letter
-        diffL = ws.cell(1, col_idx_diff).column_letter
-        rng = f"{pctL}{first_data_row}:{pctL}{last_data_row}"
-        red = f"=AND(ISNUMBER({pctL}{first_data_row}),ABS({pctL}{first_data_row})>={mom_pct_threshold},ABS({diffL}{first_data_row})>={mom_abs_cutoff})"
-        yel = f"=AND(ISNUMBER({pctL}{first_data_row}),ABS({pctL}{first_data_row})>={mom_pct_threshold},ABS({diffL}{first_data_row})<{mom_abs_cutoff})"
-        ws.conditional_formatting.add(rng, FormulaRule(formula=[red], fill=FILL_RED))
-        ws.conditional_formatting.add(rng, FormulaRule(formula=[yel], fill=FILL_YELLOW))
-
-    # QoQ highlight
-    for h, col_idx_pct in col_index.items():
-        if not h.startswith("%Diff "): continue
-        qlbl = h.replace("%Diff ","",1).strip()
-        diff_h = f"Diff {qlbl}"
-        if diff_h not in col_index: continue
-        col_idx_diff = col_index[diff_h]
-        pctL  = ws.cell(1, col_idx_pct).column_letter
-        diffL = ws.cell(1, col_idx_diff).column_letter
-        rng = f"{pctL}{first_data_row}:{pctL}{last_data_row}"
-        red = f"=AND(ISNUMBER({pctL}{first_data_row}),ABS({pctL}{first_data_row})>={qoq_pct_threshold},ABS({diffL}{first_data_row})>={mom_abs_cutoff})"
-        yel = f"=AND(ISNUMBER({pctL}{first_data_row}),ABS({pctL}{first_data_row})>={qoq_pct_threshold},ABS({diffL}{first_data_row})<{mom_abs_cutoff})"
-        ws.conditional_formatting.add(rng, FormulaRule(formula=[red], fill=FILL_RED))
-        ws.conditional_formatting.add(rng, FormulaRule(formula=[yel], fill=FILL_YELLOW))
-
-    # ---------------- YoY block (FIXED) ----------------
-    if prior_qc_df is not None and not prior_qc_df.empty:
-        # align prior columns to the same quarters we’re showing now
-        for q in q_sums:
-            if q not in prior_qc_df.columns:
-                prior_qc_df[q] = 0
-
-        prior_sheet = "_PRIOR_YOY"
-        if prior_sheet in wb.sheetnames:
-            del wb[prior_sheet]
-        ws_prior = wb.create_sheet(title=prior_sheet)
-
-        prior_q_cols = list(q_sums)  # ensure same order as current
-        ws_prior.cell(1, 1, "KEY").font = Font(bold=True)
-
-        # map: quarter -> column letter (DON’T reuse the name later)
-        prior_col_letter_map: Dict[str, str] = {}
-        for j, qh in enumerate(prior_q_cols, start=2):
-            ws_prior.cell(1, j, qh).font = Font(bold=True)
-            prior_col_letter_map[qh] = ws_prior.cell(1, j).column_letter
-
-        # rows
-        for i, prow in prior_qc_df.iterrows():
-            key = f"{prow['entity_group']}|{prow['employment_detail']}|{prow['worker_category']}|{prow['institution']}"
-            ws_prior.cell(i + 2, 1, key)
-            for j, qh in enumerate(prior_q_cols, start=2):
-                ws_prior.cell(i + 2, j, prow.get(qh, 0))
-
-        ws_prior.sheet_state = "hidden"
-
-        # add hidden KEY column on QC sheet if missing
-        if "_KEY" not in col_index:
-            key_col_idx = len(headers) + 1
-            col_index["_KEY"] = key_col_idx
-            ws.cell(header_row, key_col_idx, "_KEY").font = Font(bold=True)
-            for r in range(first_data_row, last_data_row + 1):
-                ws.cell(r, key_col_idx).value = f'=A{r}&"|"&B{r}&"|"&C{r}&"|"&D{r}'
-            ws.column_dimensions[ws.cell(header_row, key_col_idx).column_letter].hidden = True
-
-        # write Prior Qx and YoY% using INDEX/MATCH
-        A_col = "A"
-        for qh in q_sums:
-            yoy_hdr   = f"YoY {qh}"
-            prior_hdr = f"Prior {qh}"
-            if yoy_hdr not in col_index or prior_hdr not in col_index:
-                continue
-            if qh not in prior_col_letter_map:
-                continue
-
-            curr_col  = col_index[qh]
-            yoy_col   = col_index[yoy_hdr]
-            prior_col = col_index[prior_hdr]
-
-            prior_letter = prior_col_letter_map[qh]              # e.g., 'C' for Q2
-            prior_range  = f"{prior_sheet}!${prior_letter}:${prior_letter}"
-            key_range    = f"{prior_sheet}!${A_col}:${A_col}"
-
-            for r in range(first_data_row, last_data_row + 1):
-                key_addr  = ws.cell(r, col_index["_KEY"]).coordinate
-                curr_addr = ws.cell(r, curr_col).coordinate
-                prior_expr = f"INDEX({prior_range},MATCH({key_addr},{key_range},0))"
-
-                ws.cell(r, prior_col).value = f"=IFERROR({prior_expr},\"\")"
-                ws.cell(r, yoy_col).value = (
-                    f'=IFERROR('
-                    f'IF({prior_expr}="","N/A",'
-                    f'IF(AND({prior_expr}=0,{curr_addr}=0),0,'
-                    f'IF(AND({prior_expr}=0,{curr_addr}>0),"N/A",'
-                    f'({curr_addr}-{prior_expr})/{prior_expr}))),'
-                    f'"N/A")'
-                )
-
-        # formats for these
-        for h, c in col_index.items():
-            if h.startswith("YoY "):
-                for r in range(first_data_row, last_data_row + 1):
-                    ws.cell(r, c).number_format = "0.0%"
-            if h.startswith("Prior "):
-                for r in range(first_data_row, last_data_row + 1):
-                    ws.cell(r, c).number_format = "#,##0"
-
-    # number formats (general)
-    percent_headers = [h for h in col_index if h.startswith("MoM ") or h.startswith("%Diff ") or h.startswith("YoY ")]
-    value_headers = months + [h for h in col_index if h.startswith("Diff ")] + q_sums
-    for r in range(first_data_row, last_data_row + 1):
-        for h in percent_headers:
-            ws.cell(r, col_index[h]).number_format = "0.0%"
-        for h in value_headers:
-            ws.cell(r, col_index[h]).number_format = "#,##0"
-
-    # About
-    about = wb.create_sheet("About")
-    about["A1"] = "RLMS – QC Workbook"
-    about["A2"] = "Year";          about["B2"] = year
-    about["A3"] = "Up to Quarter"; about["B3"] = current_q
-    about["A4"] = "Generated at";  about["B4"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(str(out_path))
-    return out_path
-
-
-# ----------------------------
-# CLI
-# ----------------------------
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Build styled QC workbook from staging data (YoY fixed).")
-    ap.add_argument("--stage", required=True, help="Path to staging (.parquet or .xlsx)")
-    ap.add_argument("--out",   required=True, help="Output QC workbook (.xlsx)")
-    ap.add_argument("--year",  type=int, default=None, help="Target year (default: mode of staging year)")
-    ap.add_argument("--mom-threshold", type=float, default=0.25)
-    ap.add_argument("--abs-cutoff",    type=float, default=50)
-    ap.add_argument("--qoq-threshold", type=float, default=0.25)
-    ap.add_argument("--prior-stage",   type=str, default=None, help="Optional prior-year staging/parquet to enable YoY")
-    args = ap.parse_args()
+ap = argparse.ArgumentParser(description=“QC for Question 1”)
+ap.add_argument(”–stage”, required=True)
+ap.add_argument(”–out”, required=True)
+ap.add_argument(”–prior-stage”, default=None)
+ap.add_argument(”–year”, type=int, default=None)
+args = ap.parse_args()
 
-    stage_path = Path(args.stage)
-    if not stage_path.exists():
-        print(f"[ERROR] Stage not found: {stage_path}")
-        return 2
-
-    stage = load_stage(stage_path)
-
-    # choose year
-    year = int(args.year) if args.year is not None else int(pd.Series(stage["year"]).mode().iat[0])
-    current_q = pick_current_quarter_from_staging(stage)
-
-    # build pivot for current
-    big = stage_to_big(stage)
-    qc_df = pivot_current_year(big, year=year, current_q=current_q)
-
-    # prior
-    prior_qc_df = None
-    if args.prior_stage:
-        prior = load_stage(Path(args.prior_stage))
-        prior_big = stage_to_big(prior)
-        prior_qc_df = pivot_current_year(prior_big, year=year-1, current_q=current_q)
-
-    # write
-    write_qc(
-        qc_df,
-        out_path=Path(args.out),
-        year=year,
-        current_q=current_q,
-        prior_qc_df=prior_qc_df,
-        mom_pct_threshold=args.mom_threshold,
-        mom_abs_cutoff=args.abs_cutoff,
-        qoq_pct_threshold=args.qoq_threshold,
-    )
-    print(f"[DONE] Wrote QC workbook → {args.out}")
+```
+stage = Path(args.stage)
+try:
+    df = pd.read_excel(stage, sheet_name="Q1", engine="openpyxl")
+    print(f"[INFO] Loaded {len(df)} rows from Q1")
+except Exception as e:
+    print(f"[WARN] Q1 sheet not found: {e}")
     return 0
 
+year = int(args.year if args.year is not None else df["year"].mode().iat[0])
+current_q = normalize_quarter_label(df["quarter"])
+df = df[df["year"] == year].copy()
+print(f"[INFO] Processing year {year}, quarter {current_q}")
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+prior_df = None
+if args.prior_stage:
+    try:
+        prev = pd.read_excel(Path(args.prior_stage), sheet_name="Q1", engine="openpyxl")
+        prior_df = prev[prev["year"] == (year - 1)].copy()
+        print(f"[INFO] Loaded {len(prior_df)} prior year rows")
+    except Exception as e:
+        print(f"[WARN] Prior data not available: {e}")
+
+wb = new_empty_workbook()
+write_qc_sheet(
+    wb, "QC_Q1", df,
+    include_job_function=False,
+    months_to_show=months_in_df(df),
+    current_q=current_q, year=year, prior_df=prior_df
+)
+append_about_sheet_last(wb, "RLMS – QC (Q1)", year, current_q)
+
+out_path = Path(args.out)
+out_path.parent.mkdir(parents=True, exist_ok=True)
+if "Sheet" in wb.sheetnames:
+    del wb["Sheet"]
+wb.save(str(out_path))
+print(f"[DONE] {out_path}")
+return 0
+```
+
+if **name** == “**main**”:
+raise SystemExit(main())
+
+# =============================================================================
+
+# qc_q2.py
+
+# =============================================================================
+
+from **future** import annotations
+import argparse
+from pathlib import Path
+import pandas as pd
+from qc_common import (
+new_empty_workbook, append_about_sheet_last, write_qc_sheet,
+normalize_quarter_label, MONTHS_FULL
+)
+
+def months_in_df(df: pd.DataFrame) -> list:
+return [m for m in MONTHS_FULL if m in df.columns]
+
+def main() -> int:
+ap = argparse.ArgumentParser(description=“QC for Question 2”)
+ap.add_argument(”–stage”, required=True)
+ap.add_argument(”–out”, required=True)
+ap.add_argument(”–prior-stage”, default=None)
+ap.add_argument(”–year”, type=int, default=None)
+args = ap.parse_args()
+
+```
+stage = Path(args.stage)
+try:
+    df = pd.read_excel(stage, sheet_name="Q2", engine="openpyxl")
+    print(f"[INFO] Loaded {len(df)} rows from Q2")
+except Exception as e:
+    print(f"[WARN] Q2 sheet not found: {e}")
+    return 0
+
+year = int(args.year if args.year is not None else df["year"].mode().iat[0])
+current_q = normalize_quarter_label(df["quarter"])
+df = df[df["year"] == year].copy()
+print(f"[INFO] Processing year {year}, quarter {current_q}")
+
+prior_df = None
+if args.prior_stage:
+    try:
+        prev = pd.read_excel(Path(args.prior_stage), sheet_name="Q2", engine="openpyxl")
+        prior_df = prev[prev["year"] == (year - 1)].copy()
+        print(f"[INFO] Loaded {len(prior_df)} prior year rows")
+    except Exception as e:
+        print(f"[WARN] Prior data not available: {e}")
+
+wb = new_empty_workbook()
+write_qc_sheet(
+    wb, "QC_Q2", df,
+    include_job_function=False,
+    months_to_show=months_in_df(df),
+    current_q=current_q, year=year, prior_df=prior_df
+)
+append_about_sheet_last(wb, "RLMS – QC (Q2)", year, current_q)
+
+out_path = Path(args.out)
+out_path.parent.mkdir(parents=True, exist_ok=True)
+if "Sheet" in wb.sheetnames:
+    del wb["Sheet"]
+wb.save(str(out_path))
+print(f"[DONE] {out_path}")
+return 0
+```
+
+if **name** == “**main**”:
+raise SystemExit(main())
+
+# =============================================================================
+
+# qc_q3.py
+
+# =============================================================================
+
+from **future** import annotations
+import argparse
+from pathlib import Path
+import pandas as pd
+from qc_common import (
+new_empty_workbook, append_about_sheet_last, write_qc_sheet,
+normalize_quarter_label, MONTHS_FULL
+)
+
+def months_in_df(df: pd.DataFrame) -> list:
+return [m for m in MONTHS_FULL if m in df.columns]
+
+def main() -> int:
+ap = argparse.ArgumentParser(description=“QC for Question 3”)
+ap.add_argument(”–stage”, required=True)
+ap.add_argument(”–out”, required=True)
+ap.add_argument(”–prior-stage”, default=None)
+ap.add_argument(”–year”, type=int, default=None)
+args = ap.parse_args()
+
+```
+stage = Path(args.stage)
+try:
+    df = pd.read_excel(stage, sheet_name="Q3", engine="openpyxl")
+    print(f"[INFO] Loaded {len(df)} rows from Q3")
+except Exception as e:
+    print(f"[WARN] Q3 sheet not found: {e}")
+    return 0
+
+year = int(args.year if args.year is not None else df["year"].mode().iat[0])
+current_q = normalize_quarter_label(df["quarter"])
+df = df[df["year"] == year].copy()
+print(f"[INFO] Processing year {year}, quarter {current_q}")
+
+prior_df = None
+if args.prior_stage:
+    try:
+        prev = pd.read_excel(Path(args.prior_stage), sheet_name="Q3", engine="openpyxl")
+        prior_df = prev[prev["year"] == (year - 1)].copy()
+        print(f"[INFO] Loaded {len(prior_df)} prior year rows")
+    except Exception as e:
+        print(f"[WARN] Prior data not available: {e}")
+
+wb = new_empty_workbook()
+write_qc_sheet(
+    wb, "QC_Q3", df,
+    include_job_function=False,
+    months_to_show=months_in_df(df),
+    current_q=current_q, year=year, prior_df=prior_df
+)
+append_about_sheet_last(wb, "RLMS – QC (Q3)", year, current_q)
+
+out_path = Path(args.out)
+out_path.parent.mkdir(parents=True, exist_ok=True)
+if "Sheet" in wb.sheetnames:
+    del wb["Sheet"]
+wb.save(str(out_path))
+print(f"[DONE] {out_path}")
+return 0
+```
+
+if **name** == “**main**”:
+raise SystemExit(main())
+
+# =============================================================================
+
+# qc_q4.py
+
+# =============================================================================
+
+from **future** import annotations
+import argparse
+from pathlib import Path
+import pandas as pd
+from qc_common import (
+new_empty_workbook, append_about_sheet_last, write_qc_sheet,
+normalize_quarter_label, MONTHS_FULL
+)
+
+def months_in_df(df: pd.DataFrame) -> list:
+return [m for m in MONTHS_FULL if m in df.columns]
+
+def main() -> int:
+ap = argparse.ArgumentParser(description=“QC for Question 4”)
+ap.add_argument(”–stage”, required=True)
+ap.add_argument(”–out”, required=True)
+ap.add_argument(”–prior-stage”, default=None)
+ap.add_argument(”–year”, type=int, default=None)
+args = ap.parse_args()
+
+```
+stage = Path(args.stage)
+try:
+    df = pd.read_excel(stage, sheet_name="Q4", engine="openpyxl")
+    print(f"[INFO] Loaded {len(df)} rows from Q4")
+except Exception as e:
+    print(f"[WARN] Q4 sheet not found: {e}")
+    return 0
+
+year = int(args.year if args.year is not None else df["year"].mode().iat[0])
+current_q = normalize_quarter_label(df["quarter"])
+df = df[df["year"] == year].copy()
+print(f"[INFO] Processing year {year}, quarter {current_q}")
+
+prior_df = None
+if args.prior_stage:
+    try:
+        prev = pd.read_excel(Path(args.prior_stage), sheet_name="Q4", engine="openpyxl")
+        prior_df = prev[prev["year"] == (year - 1)].copy()
+        print(f"[INFO] Loaded {len(prior_df)} prior year rows")
+    except Exception as e:
+        print(f"[WARN] Prior data not available: {e}")
+
+wb = new_empty_workbook()
+
+# Q4 includes job function breakdown
+write_qc_sheet(
+    wb, "QC_Q4", df,
+    include_job_function=True,
+    months_to_show=months_in_df(df),
+    current_q=current_q, year=year, prior_df=prior_df
+)
+append_about_sheet_last(wb, "RLMS – QC (Q4)", year, current_q)
+
+out_path = Path(args.out)
+out_path.parent.mkdir(parents=True, exist_ok=True)
+if "Sheet" in wb.sheetnames:
+    del wb["Sheet"]
+wb.save(str(out_path))
+print(f"[DONE] {out_path}")
+return 0
+```
+
+if **name** == “**main**”:
+raise SystemExit(main())
+
+# =============================================================================
+
+# qc_q5.py
+
+# =============================================================================
+
+from **future** import annotations
+import argparse
+from pathlib import Path
+import pandas as pd
+from qc_common import (
+new_empty_workbook, append_about_sheet_last, write_qc_sheet,
+normalize_quarter_label, MONTHS_FULL
+)
+
+def months_in_df(df: pd.DataFrame) -> list:
+return [m for m in MONTHS_FULL if m in df.columns]
+
+def main() -> int:
+ap = argparse.ArgumentParser(description=“QC for Question 5”)
+ap.add_argument(”–stage”, required=True)
+ap.add_argument(”–out”, required=True)
+ap.add_argument(”–prior-stage”, default=None)
+ap.add_argument(”–year”, type=int, default=None)
+args = ap.parse_args()
+
+```
+stage = Path(args.stage)
+try:
+    df = pd.read_excel(stage, sheet_name="Q5", engine="openpyxl")
+    print(f"[INFO] Loaded {len(df)} rows from Q5")
+except Exception as e:
+    print(f"[WARN] Q5 sheet not found: {e}")
+    return 0
+
+year = int(args.year if args.year is not None else df["year"].mode().iat[0])
+current_q = normalize_quarter_label(df["quarter"])
+df = df[df["year"] == year].copy()
+print(f"[INFO] Processing year {year}, quarter {current_q}")
+
+prior_df = None
+if args.prior_stage:
+    try:
+        prev = pd.read_excel(Path(args.prior_stage), sheet_name="Q5", engine="openpyxl")
+        prior_df = prev[prev["year"] == (year - 1)].copy()
+        print(f"[INFO] Loaded {len(prior_df)} prior year rows")
+    except Exception as e:
+        print(f"[WARN] Prior data not available: {e}")
+
+wb = new_empty_workbook()
+write_qc_sheet(
+    wb, "QC_Q5", df,
+    include_job_function=False,
+    months_to_show=months_in_df(df),
+    current_q=current_q, year=year, prior_df=prior_df
+)
+append_about_sheet_last(wb, "RLMS – QC (Q5)", year, current_q)
+
+out_path = Path(args.out)
+out_path.parent.mkdir(parents=True, exist_ok=True)
+if "Sheet" in wb.sheetnames:
+    del wb["Sheet"]
+wb.save(str(out_path))
+print(f"[DONE] {out_path}")
+return 0
+```
+
+if **name** == “**main**”:
+raise SystemExit(main())
