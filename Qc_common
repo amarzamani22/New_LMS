@@ -802,254 +802,255 @@ def write_qc_sheet(args: QCArgs) -> None:
 
 
 
-
-
-
-# qc_q1.py
+# qc_common.py
 from __future__ import annotations
-import argparse
+from typing import Dict, List, Optional, Sequence, Tuple
 from pathlib import Path
 import pandas as pd
+import numpy as np
 
-from qc_common import (
-    new_empty_workbook, append_about_sheet_last,
-    normalize_quarter_label, months_up_to, MONTHS_FULL,
-    attach_entity_type, expand_rollups,
-    calc_mom, calc_quarter_sums, calc_yoy_quarters, tidy_to_excel
-)
+# ---------------- Quarter / Month helpers ----------------
+QMAP = {
+    "Quarter 1":"Q1","Quarter 2":"Q2","Quarter 3":"Q3","Quarter 4":"Q4",
+    "Q1":"Q1","Q2":"Q2","Q3":"Q3","Q4":"Q4",
+}
+Q_TO_MONTHS = {
+    "Q1": ["Jan","Feb","Mar"],
+    "Q2": ["Apr","May","Jun"],
+    "Q3": ["Jul","Aug","Sep"],
+    "Q4": ["Oct","Nov","Dec"],
+}
+MONTHS_FULL = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+Q_ORDER = ["Q1","Q2","Q3","Q4"]
+MONTH_ORDER_IDX = {m:i for i,m in enumerate(MONTHS_FULL)}
 
-def _load(stage_path: Path, sheet: str) -> pd.DataFrame:
-    try:
-        return pd.read_excel(stage_path, sheet_name=sheet, engine="openpyxl")
-    except Exception:
-        return pd.DataFrame()
+def normalize_quarter_label(series_or_str) -> str:
+    if isinstance(series_or_str, str):
+        return QMAP.get(series_or_str.strip(), series_or_str.strip())
+    s = pd.Series(series_or_str).dropna().astype(str)
+    if s.empty:
+        return "Q1"
+    # pick the max quarter by order
+    s = s.map(lambda x: QMAP.get(x.strip(), x.strip()))
+    idx = s.map(lambda q: Q_ORDER.index(q) if q in Q_ORDER else -1).max()
+    return Q_ORDER[idx if idx>=0 else 0]
 
-def _choose_year_and_quarter(frames: list[pd.DataFrame], forced_year: int|None):
-    years = pd.concat([f[["year"]] for f in frames if not f.empty], ignore_index=True)
-    year = int(forced_year if forced_year is not None else years["year"].mode().iat[0])
-    qseries = pd.concat([f["quarter"] for f in frames if not f.empty], ignore_index=True)
-    qlabel = normalize_quarter_label(qseries)
-    return year, qlabel
+def months_up_to(q: str) -> List[str]:
+    q = normalize_quarter_label(q)
+    out: List[str] = []
+    for qq in Q_ORDER:
+        out += Q_TO_MONTHS[qq]
+        if qq == q: break
+    return out
 
-def _ensure_month_cols(df: pd.DataFrame, months: list[str]) -> pd.DataFrame:
+# ---------------- FI Type & Rollups ----------------
+# (Paste your full ENTITY_TO_TYPE & ROLLUPS here — shortened for brevity in this snippet)
+ENTITY_TO_TYPE: Dict[str, str] = {
+    # >>> PASTE FULL MAP YOU PROVIDED <<<
+}
+
+ROLLUPS: Dict[str, List[str]] = {
+    # >>> PASTE FULL ROLLUPS YOU PROVIDED <<<
+}
+
+def attach_entity_type(df: pd.DataFrame, col: str = "entity_name") -> pd.DataFrame:
+    if df.empty: return df.copy()
     x = df.copy()
-    for m in months:
-        if m not in x.columns:
-            x[m] = 0
+    x["_ENT_UP"] = x[col].astype(str).str.upper().str.strip()
+    x["entity_type"] = x["_ENT_UP"].map(ENTITY_TO_TYPE).fillna("Unknown")
+    x.drop(columns=["_ENT_UP"], inplace=True)
     return x
 
-def qc_q1a_main(df: pd.DataFrame, prior: pd.DataFrame|None, year: int, upto_q: str):
-    if df.empty: 
-        return None
+def _sum_numeric(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty: return df
+    return df.select_dtypes(include="number").sum(min_count=1)
 
-    months = months_up_to(upto_q)
-    df = df[df["year"]==year].copy()
-    df = _ensure_month_cols(df, months)
-
-    # attach FI type & rollups
-    base_keys = ["entity_name","year","quarter","subquestion","worker_category"]
-    df = attach_entity_type(df, "entity_name")
-    df = expand_rollups(df, group_keys=["year","quarter","subquestion","worker_category","entity_type"])
-
-    # Fill missing months (0)
-    df[months] = df[months].fillna(0)
-
-    # MoM
-    df = calc_mom(df, months)
-
-    # Quarter sums + QoQ
-    df, q_cols = calc_quarter_sums(df, upto_q)
-
-    # YoY on quarter sums (by keys)
-    key_cols = ["entity_name","entity_type","subquestion","worker_category"]
-    prior_q = None
-    if prior is not None and not prior.empty:
-        p = prior[prior["year"]==(year-1)].copy()
-        p = attach_entity_type(p, "entity_name")
-        p = expand_rollups(p, group_keys=["year","quarter","subquestion","worker_category","entity_type"])
-        p = _ensure_month_cols(p, months_up_to(upto_q))
-        p, p_qcols = calc_quarter_sums(p, upto_q)
-        # align q_cols with prior present
-        prior_q = p
-
-    df = calc_yoy_quarters(df, prior_q, key_cols=key_cols, q_cols=q_cols)
-
-    # Order columns to a tidy view
-    order = ["entity_type","entity_name","subquestion","worker_category"] + months
-    order += [c for c in df.columns if c.startswith("Diff ") and any(mm in c for mm in months)]
-    order += [c for c in df.columns if c.startswith("MoM ")]
-    order += [q for q in ["Q1","Q2","Q3","Q4"] if q in df.columns]
-    order += [c for c in df.columns if c.startswith("Diff Q")]
-    order += [c for c in df.columns if c.startswith("%Diff Q")]
-    order += [c for c in df.columns if c.startswith("Prior Q")]
-    order += [c for c in df.columns if c.startswith("YoY Q")]
-    # keep only present
-    order = [c for c in order if c in df.columns]
-    tidy = df[order].copy()
-    # numeric fill
-    tidy = tidy.fillna(0)
-    return tidy
-
-def qc_q1a_jobfunc_q4(df: pd.DataFrame, prior: pd.DataFrame|None, year: int, upto_q: str):
+def expand_rollups(df: pd.DataFrame,
+                   group_keys: Sequence[str],
+                   entity_col: str = "entity_name",
+                   entity_type_col: str = "entity_type") -> pd.DataFrame:
+    """
+    Create rollup rows by summing across the provided group_keys + numeric cols.
+    group_keys should NOT include entity_name or entity_type; those are injected.
+    """
     if df.empty:
-        return None
-    df = df[df["year"]==year].copy()
-    # Q4 only values (no months) — keep value column
-    df = attach_entity_type(df, "entity_name")
-    df = expand_rollups(df, group_keys=["year","quarter","subquestion","worker_category","job_function","entity_type"])
-    # current Q4 values are in 'value'
-    # YoY: compare with prior year 'value' for the same Q4 only
-    cur_q = normalize_quarter_label(df["quarter"].iloc[0])
-    if cur_q != "Q4":
-        # still show tidy view for completeness (just values)
-        pass
+        return df
+    out = [df]
+    for roll, members in ROLLUPS.items():
+        sub = df[df[entity_type_col].isin(members)]
+        if sub.empty: 
+            continue
+        agg = sub.groupby(list(group_keys), dropna=False).apply(_sum_numeric).reset_index()
+        agg[entity_col] = roll
+        agg[entity_type_col] = roll
+        out.append(agg)
+    return pd.concat(out, ignore_index=True)
 
-    # Prepare prior
-    merged = df.copy()
-    if prior is not None and not prior.empty:
-        p = prior[(prior["year"]==(year-1))].copy()
-        p = attach_entity_type(p, "entity_name")
-        p = expand_rollups(p, group_keys=["year","quarter","subquestion","worker_category","job_function","entity_type"])
-        key = ["entity_type","entity_name","subquestion","worker_category","job_function"]
-        prior_slim = p[key + ["value"]].rename(columns={"value":"Prior Q4"})
-        merged = merged.merge(prior_slim, on=key, how="left")
-        merged["YoY Q4"] = (merged["value"] - merged["Prior Q4"].fillna(0)) / merged["Prior Q4"].replace(0,np.nan)
-        merged["YoY Q4"] = merged["YoY Q4"].fillna(0)
+# ---------------- Calculations (pandas) ----------------
+def _safe_div(num: pd.Series, den: pd.Series) -> pd.Series:
+    # same behavior as your Excel guards: 0/0 -> 0; x/0 (x!=0) -> NaN (we’ll show "N/A")
+    out = pd.Series(np.nan, index=num.index, dtype="float64")
+    both_zero = (num==0) & (den==0)
+    out[both_zero] = 0.0
+    nonzero_den = (den!=0)
+    out[nonzero_den] = (num[nonzero_den] - den[nonzero_den]) / den[nonzero_den]
+    return out
 
-    # Order
-    cols = ["entity_type","entity_name","subquestion","worker_category","job_function","value"]
-    if "Prior Q4" in merged.columns: cols += ["Prior Q4","YoY Q4"]
-    merged = merged[cols].fillna(0)
+def calc_mom(block: pd.DataFrame, months: List[str]) -> pd.DataFrame:
+    """
+    Given a block that already has one row per logical “line” (group keys),
+    add Diff_<Mon> and MoM_<Mon> columns for months after the first available month.
+    """
+    if block.empty or len(months) < 2:
+        return block
+    res = block.copy()
+    for i in range(1, len(months)):
+        cur, prev = months[i], months[i-1]
+        res[f"Diff {cur}"] = res[cur] - res[prev]
+        res[f"MoM {cur}"]  = _safe_div(res[cur], res[prev])
+    return res
+
+def calc_quarter_sums(block: pd.DataFrame, upto_q: str) -> Tuple[pd.DataFrame, List[str]]:
+    """Add Q1..Qn columns (sums), plus Diff_Q and PctDiff_Q for Q>first."""
+    if block.empty:
+        return (block, [])
+    upto_q = normalize_quarter_label(upto_q)
+    res = block.copy()
+    q_cols: List[str] = []
+    for q in Q_ORDER:
+        months = Q_TO_MONTHS[q]
+        if set(months).issubset(res.columns):
+            res[q] = res[months].sum(axis=1)
+            q_cols.append(q)
+        if q == upto_q:
+            break
+    # QoQ diff & % for those that exist
+    for i in range(1, len(q_cols)):
+        cur_q, prev_q = q_cols[i], q_cols[i-1]
+        res[f"Diff {cur_q}"]    = res[cur_q] - res[prev_q]
+        res[f"%Diff {cur_q}"]   = _safe_div(res[cur_q], res[prev_q])
+    return (res, q_cols)
+
+def calc_yoy_quarters(cur_qs: pd.DataFrame, prior_qs: Optional[pd.DataFrame],
+                      key_cols: Sequence[str],
+                      q_cols: Sequence[str]) -> pd.DataFrame:
+    """
+    For quarter totals: join prior on keys & same quarter label -> add Prior Qx and YoY Qx.
+    cur_qs: has Qx columns in q_cols
+    prior_qs: same structure numeric totals for year-1
+    """
+    if cur_qs.empty or not q_cols or prior_qs is None or prior_qs.empty:
+        return cur_qs
+    # Prepare slim prior (keys + Qx)
+    prior_keep = list(key_cols) + list(q_cols)
+    prior_slim = prior_qs[prior_keep].copy()
+    # rename prior Qx
+    prior_ren = {q: f"Prior {q}" for q in q_cols}
+    prior_slim.rename(columns=prior_ren, inplace=True)
+
+    merged = cur_qs.merge(prior_slim, on=list(key_cols), how="left")
+    for q in q_cols:
+        pcol = f"Prior {q}"
+        ycol = f"YoY {q}"
+        if pcol not in merged.columns: 
+            continue
+        # YoY% with guards
+        curv = merged[q].fillna(0.0)
+        prv  = merged[pcol].fillna(0.0)
+        merged[ycol] = _safe_div(curv, prv)
     return merged
 
-def qc_q1b(df: pd.DataFrame, prior: pd.DataFrame|None, year: int, upto_q: str):
-    if df.empty:
-        return None
-    df = df[df["year"]==year].copy()
-    df = attach_entity_type(df, "entity_name")
-    df = expand_rollups(df, group_keys=["year","quarter","subquestion","worker_category","entity_type"])
+def tidy_to_excel(wb, sheet_name: str, df: pd.DataFrame,
+                  highlight_cols: List[str],
+                  mom_threshold: float, qoq_threshold: float, yoy_threshold: float,
+                  abs_cutoff: float) -> None:
+    """
+    Write a tidy DataFrame to a new sheet with basic formatting & conditional colors.
+    Colors (hex):
+      - Yellow when |%| >= threshold
+      - Red when |%| >= threshold AND |abs change| >= abs_cutoff
+    We look for columns named:
+      MoM <Mon>, Diff <Mon>, %Diff Q, Diff Q, YoY Q
+    """
+    from openpyxl import Workbook
+    from openpyxl.utils.dataframe import dataframe_to_rows
+    from openpyxl.styles import Font, Alignment, PatternFill, NamedStyle, numbers
+    from openpyxl.formatting.rule import FormulaRule
 
-    # Only Jun and/or Dec possible in staging for Q1B
-    months_present = [m for m in ["Jun","Dec"] if m in df.columns]
-    for m in months_present:
-        df[m] = df[m].fillna(0)
+    ws = wb.create_sheet(title=sheet_name)
+    # write header + rows
+    for r in dataframe_to_rows(df, index=False, header=True):
+        ws.append(r)
 
-    # YoY month-to-month (Jun with Jun, Dec with Dec)
-    if prior is not None and not prior.empty:
-        p = prior[prior["year"]==(year-1)].copy()
-        p = attach_entity_type(p, "entity_name")
-        p = expand_rollups(p, group_keys=["year","quarter","subquestion","worker_category","entity_type"])
-        key = ["entity_type","entity_name","subquestion","worker_category"]
-        keep = key + [m for m in months_present if m in p.columns]
-        p = p[keep].copy() if keep else pd.DataFrame()
-        if not p.empty:
-            ren = {m: f"Prior {m}" for m in months_present if m in p.columns}
-            p.rename(columns=ren, inplace=True)
-            df = df.merge(p, on=key, how="left")
-            for m in months_present:
-                pm = f"Prior {m}"
-                if pm in df.columns:
-                    df[f"YoY {m}"] = (df[m] - df[pm].fillna(0)) / df[pm].replace(0,np.nan)
-                    df[f"YoY {m}"] = df[f"YoY {m}"].fillna(0)
+    # styles
+    bold = Font(bold=True)
+    center = Alignment(vertical="center")
+    for c in range(1, ws.max_column+1):
+        ws.cell(1, c).font = bold
+        ws.cell(1, c).alignment = center
+        ws.column_dimensions[ws.cell(1,c).column_letter].width = 16
 
-    # Order
-    cols = ["entity_type","entity_name","subquestion","worker_category"] + months_present
-    cols += [f"Prior {m}" for m in months_present if f"Prior {m}" in df.columns]
-    cols += [f"YoY {m}" for m in months_present if f"YoY {m}" in df.columns]
-    df = df[cols].fillna(0)
-    return df
+    # formats
+    # value-like columns: months & Diff <Mon> & Qx & Diff Qx
+    num_like = [c for c in df.columns if (c in MONTHS_FULL) or c.startswith("Diff ") or c in ["Q1","Q2","Q3","Q4"]]
+    for row in range(2, ws.max_row+1):
+        for col_name in num_like:
+            if col_name in df.columns:
+                ci = df.columns.get_loc(col_name) + 1
+                ws.cell(row, ci).number_format = "#,##0"
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="QC for Question 1 (pandas-calculated, styled Excel)")
-    ap.add_argument("--stage", required=True, help="staging workbook (.xlsx)")
-    ap.add_argument("--out", required=True, help="output QC workbook (.xlsx)")
-    ap.add_argument("--prior-stage", default=None, help="optional prior-year staging workbook (.xlsx)")
-    ap.add_argument("--year", type=int, default=None)
-    ap.add_argument("--mom-threshold", type=float, default=0.25)
-    ap.add_argument("--qoq-threshold", type=float, default=0.25)
-    ap.add_argument("--yoy-threshold", type=float, default=0.25)
-    ap.add_argument("--abs-cutoff", type=float, default=50)
-    args = ap.parse_args()
+    # percent-like columns: MoM <Mon>, %Diff Qx, YoY Qx
+    pct_like = [c for c in df.columns if c.startswith("MoM ") or c.startswith("%Diff ") or c.startswith("YoY ")]
+    for row in range(2, ws.max_row+1):
+        for col_name in pct_like:
+            if col_name in df.columns:
+                ci = df.columns.get_loc(col_name) + 1
+                ws.cell(row, ci).number_format = "0.0%"
 
-    stage = Path(args.stage)
-    q1a  = _load(stage, "Q1A_Main")
-    q1jf = _load(stage, "Q1A_JobFunc_Q4")
-    q1b  = _load(stage, "Q1B")
+    # conditional highlights (yellow/red) for MoM, QoQ, YoY
+    FILL_YELLOW = PatternFill(start_color="FFF7CC", end_color="FFF7CC", fill_type="solid")
+    FILL_RED    = PatternFill(start_color="FFE5E5", end_color="FFE5E5", fill_type="solid")
 
-    if q1a.empty and q1jf.empty and q1b.empty:
-        print("[WARN] No Q1 sheets in staging.")
-        return 0
+    def _addr(r1, c1, r2, c2) -> str:
+        from openpyxl.utils import get_column_letter
+        return f"{get_column_letter(c1)}{r1}:{get_column_letter(c2)}{r2}"
 
-    year, upto_q = _choose_year_and_quarter([q1a,q1jf,q1b], args.year)
+    def add_rules(col_prefix: str, threshold: float, uses_abs_col: bool) -> None:
+        for cname in df.columns:
+            if not (cname.startswith(col_prefix) and cname in highlight_cols):
+                continue
+            c_idx = df.columns.get_loc(cname) + 1
+            rng = _addr(2, c_idx, ws.max_row, c_idx)
+            # yellow: abs(% ) >= threshold
+            yellow = FormulaRule(formula=[f'=ABS({ws.cell(2,c_idx).column_letter}2)>={threshold}'], fill=FILL_YELLOW)
+            ws.conditional_formatting.add(rng, yellow)
+            if uses_abs_col:
+                # find partner diff col
+                partner = cname.replace("MoM ","Diff ").replace("%Diff ","Diff ").replace("YoY ","Diff ")
+                if partner in df.columns:
+                    p_idx = df.columns.get_loc(partner) + 1
+                    # red: abs(% ) >= threshold AND abs(diff) >= abs_cutoff
+                    red = FormulaRule(formula=[f'=AND(ABS({ws.cell(2,c_idx).column_letter}2)>={threshold},ABS({ws.cell(2,p_idx).column_letter}2)>={abs_cutoff})'], fill=FILL_RED)
+                    ws.conditional_formatting.add(rng, red)
 
-    prior_a = prior_jf = prior_b = None
-    if args.prior_stage:
-        p = Path(args.prior_stage)
-        if p.exists():
-            pa = _load(p, "Q1A_Main")
-            pj = _load(p, "Q1A_JobFunc_Q4")
-            pb = _load(p, "Q1B")
-            prior_a  = pa if not pa.empty else None
-            prior_jf = pj if not pj.empty else None
-            prior_b  = pb if not pb.empty else None
+    add_rules("MoM ", mom_threshold, uses_abs_col=True)
+    add_rules("%Diff ", qoq_threshold, uses_abs_col=True)
+    add_rules("YoY ", yoy_threshold, uses_abs_col=False)
 
-    wb = __import__("qc_common").qc_common.new_empty_workbook() if hasattr(__import__("qc_common"), "qc_common") else new_empty_workbook()
+    # freeze
+    ws.freeze_panes = "A2"
 
-    # Q1A Main
-    if not q1a.empty:
-        df = qc_q1a_main(q1a, prior_a, year, upto_q)
-        if df is not None and not df.empty:
-            highlight_cols = [c for c in df.columns if c.startswith("MoM ") or c.startswith("%Diff ") or c.startswith("YoY ")]
-            tidy_to_excel(
-                wb, "QC_Q1A_Main", df, highlight_cols,
-                mom_threshold=args.mom_threshold,
-                qoq_threshold=args.qoq_threshold,
-                yoy_threshold=args.yoy_threshold,
-                abs_cutoff=args.abs_cutoff
-            )
+def new_empty_workbook():
+    from openpyxl import Workbook
+    wb = Workbook()
+    # openpyxl creates one default sheet; drop it
+    del wb[wb.sheetnames[0]]
+    return wb
 
-    # Q1A Job Function (Q4)
-    if not q1jf.empty:
-        df = qc_q1a_jobfunc_q4(q1jf, prior_jf, year, upto_q)
-        if df is not None and not df.empty:
-            highlight_cols = [c for c in df.columns if c.startswith("YoY ")]
-            tidy_to_excel(
-                wb, "QC_Q1A_JobFunc_Q4", df, highlight_cols,
-                mom_threshold=args.mom_threshold,
-                qoq_threshold=args.qoq_threshold,
-                yoy_threshold=args.yoy_threshold,
-                abs_cutoff=args.abs_cutoff
-            )
-
-    # Q1B (Jun/Dec only)
-    if not q1b.empty:
-        df = qc_q1b(q1b, prior_b, year, upto_q)
-        if df is not None and not df.empty:
-            highlight_cols = [c for c in df.columns if c.startswith("YoY ")]
-            tidy_to_excel(
-                wb, "QC_Q1B", df, highlight_cols,
-                mom_threshold=args.mom_threshold,
-                qoq_threshold=args.qoq_threshold,
-                yoy_threshold=args.yoy_threshold,
-                abs_cutoff=args.abs_cutoff
-            )
-
-    append_about_sheet_last(wb, "RLMS – QC (Q1)", year, upto_q)
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    wb.save(args.out)
-    print(f"[DONE] {args.out}")
-    return 0
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-
-
-
-
-
-
-
-
-
+def append_about_sheet_last(wb, title: str, year: int, qlabel: str):
+    ws = wb.create_sheet("About")
+    ws["A1"] = title
+    ws["A2"] = "Year"; ws["B2"] = year
+    ws["A3"] = "Up to Quarter"; ws["B3"] = normalize_quarter_label(qlabel)
 
 
