@@ -5,133 +5,122 @@ from pathlib import Path
 import pandas as pd
 
 from qc_common import (
-    new_empty_workbook, append_about_sheet_last, write_qc_sheet,
+    new_empty_workbook, append_about_sheet_last, write_qc_sheet_rowwise,
     normalize_quarter_label, MONTHS_FULL, QCArgs
 )
 
-def load(path: Path, sheet: str) -> pd.DataFrame:
-    """Helper: read a sheet from staging Excel; return empty df if missing."""
+def _load(path: Path, sheet: str) -> pd.DataFrame:
     try:
         return pd.read_excel(path, sheet_name=sheet, engine="openpyxl")
     except Exception:
         return pd.DataFrame()
 
-def months_in_df(df: pd.DataFrame) -> list[str]:
-    """Return all month columns that exist in df (Jan..Dec)."""
+def _months_present(df: pd.DataFrame) -> list:
     return [m for m in MONTHS_FULL if m in df.columns]
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="QC for Question 1")
-    ap.add_argument("--stage", required=True, help="Staging Excel file (current year)")
-    ap.add_argument("--out", required=True, help="Output QC Excel file")
-    ap.add_argument("--prior-stage", default=None, help="Staging Excel file (previous year)")
-    ap.add_argument("--year", type=int, default=None, help="Target year; auto-detect if not given")
-    ap.add_argument("--mom-threshold", type=float, default=0.25, help="MoM % threshold")
-    ap.add_argument("--qoq-threshold", type=float, default=0.25, help="QoQ % threshold")
-    ap.add_argument("--yoy-threshold", type=float, default=0.25, help="YoY % threshold")
-    ap.add_argument("--abs-cutoff", type=float, default=50, help="Absolute diff cutoff")
+    ap = argparse.ArgumentParser(description="QC workbook for Question 1")
+    ap.add_argument("--stage", required=True, help="Staging workbook (.xlsx)")
+    ap.add_argument("--out",   required=True, help="Output QC workbook (.xlsx)")
+    ap.add_argument("--prior-stage", default=None, help="Prior-year staging workbook for YoY (.xlsx)")
+    ap.add_argument("--year",  type=int, default=None)
+    ap.add_argument("--mom-threshold", type=float, default=0.25)
+    ap.add_argument("--qoq-threshold", type=float, default=0.25)
+    ap.add_argument("--abs-cutoff",    type=float, default=50)
+    ap.add_argument("--yoy-threshold", type=float, default=0.25)  # (kept for symmetry if you want to surface later)
     args = ap.parse_args()
 
     stage = Path(args.stage)
-    # Load Q1 sheets
-    q1a  = load(stage, "Q1A_Main")
-    q1jf = load(stage, "Q1A_JobFunc_Q4")
-    q1b  = load(stage, "Q1B")
+    q1a  = _load(stage, "Q1A_Main")
+    q1jf = _load(stage, "Q1A_JobFunc_Q4")
+    q1b  = _load(stage, "Q1B")
 
     if q1a.empty and q1jf.empty and q1b.empty:
         print("[WARN] No Q1 sheets found in staging.")
         return 0
 
-    # Detect year
-    years = pd.concat(
-        [d[["year"]] for d in [q1a,q1jf,q1b] if not d.empty],
-        ignore_index=True
-    ) if not (q1a.empty and q1jf.empty and q1b.empty) else pd.DataFrame()
-    year = int(args.year if args.year else years["year"].mode().iat[0])
+    # Pick target year & current quarter from what exists
+    years = pd.concat([d[["year"]] for d in [q1a,q1jf,q1b] if not d.empty], ignore_index=True)
+    tgt_year = int(args.year if args.year is not None else years["year"].mode().iat[0])
+    qser = pd.concat([d["quarter"] for d in [q1a,q1jf,q1b] if not d.empty], ignore_index=True)
+    current_q = normalize_quarter_label(qser)
 
-    # Detect current quarter
-    qseries = pd.concat(
-        [d["quarter"] for d in [q1a,q1jf,q1b] if not d.empty],
-        ignore_index=True
-    )
-    current_q = normalize_quarter_label(qseries)
+    # Filter to target year
+    if not q1a.empty:  q1a  = q1a[q1a["year"] == tgt_year]
+    if not q1jf.empty: q1jf = q1jf[q1jf["year"] == tgt_year]
+    if not q1b.empty:  q1b  = q1b[q1b["year"] == tgt_year]
 
-    # Filter by year
-    if not q1a.empty:  q1a  = q1a[q1a["year"]==year]
-    if not q1jf.empty: q1jf = q1jf[q1jf["year"]==year]
-    if not q1b.empty:  q1b  = q1b[q1b["year"]==year]
-
-    # Prior year data for YoY
+    # Prior
     prior_a = prior_jf = prior_b = None
     if args.prior_stage:
         p = Path(args.prior_stage)
-        pa = load(p, "Q1A_Main")
-        pj = load(p, "Q1A_JobFunc_Q4")
-        pb = load(p, "Q1B")
-        if not pa.empty: prior_a  = pa[pa["year"]==(year-1)]
-        if not pj.empty: prior_jf = pj[pj["year"]==(year-1)]
-        if not pb.empty: prior_b  = pb[pb["year"]==(year-1)]
+        pa = _load(p, "Q1A_Main")
+        pj = _load(p, "Q1A_JobFunc_Q4")
+        pb = _load(p, "Q1B")
+        if not pa.empty: prior_a  = pa[pa["year"]==(tgt_year-1)]
+        if not pj.empty: prior_jf = pj[pj["year"]==(tgt_year-1)]
+        if not pb.empty: prior_b  = pb[pb["year"]==(tgt_year-1)]
 
-    # New workbook
     wb = new_empty_workbook()
 
-    # ---- QC_Q1A_Main ----
+    # ---- Q1A Main (monthly) ----
     if not q1a.empty:
-        args_qc = QCArgs(
+        write_qc_sheet_rowwise(QCArgs(
             sheet_name="QC_Q1A_Main",
             df=q1a,
             wb=wb,
-            year=year,
+            year=tgt_year,
             current_q=current_q,
             prior_df=prior_a,
-            months_to_show=months_in_df(q1a),
+            months_to_show=_months_present(q1a),   # show all months available in staging
             include_job_function=False,
+            yoy_quarters=None,                     # auto: YoY per quarter (since > 2 months)
             mom_pct_threshold=args.mom_threshold,
             qoq_pct_threshold=args.qoq_threshold,
             yoy_pct_threshold=args.yoy_threshold,
-            abs_cutoff=args.abs_cutoff,
-        )
-        write_qc_sheet(args_qc)
+            abs_cutoff=args.abs_cutoff
+        ))
 
-    # ---- QC_Q1A_JobFunc_Q4 ----
+    # ---- Q1A Job Function (Q4 value) ----
     if not q1jf.empty:
-        args_qc = QCArgs(
+        # Ensure subquestion exists (your extractor now includes subquestion for jobfunc)
+        write_qc_sheet_rowwise(QCArgs(
             sheet_name="QC_Q1A_JobFunc_Q4",
             df=q1jf,
             wb=wb,
-            year=year,
+            year=tgt_year,
             current_q=current_q,
             prior_df=prior_jf,
-            months_to_show=[],   # jobfunc uses single 'value'
-            include_job_function=True,
-            yoy_quarters=["Q4"],  # compare only Q4 YoY
+            months_to_show=[],          # value-only (Q4 total)
+            include_job_function=True,  # expects 'value' column; YoY vs prior Q4
+            yoy_quarters=["Q4"],
             mom_pct_threshold=args.mom_threshold,
             qoq_pct_threshold=args.qoq_threshold,
             yoy_pct_threshold=args.yoy_threshold,
-            abs_cutoff=args.abs_cutoff,
-        )
-        write_qc_sheet(args_qc)
+            abs_cutoff=args.abs_cutoff
+        ))
 
-    # ---- QC_Q1B ----
+    # ---- Q1B (Jun/Dec only) ----
     if not q1b.empty:
-        args_qc = QCArgs(
+        # Keep only the month columns that actually exist (likely Jun and/or Dec)
+        present = _months_present(q1b)   # e.g., ['Jun'] or ['Dec'] or ['Jun','Dec']
+        write_qc_sheet_rowwise(QCArgs(
             sheet_name="QC_Q1B",
             df=q1b,
             wb=wb,
-            year=year,
+            year=tgt_year,
             current_q=current_q,
             prior_df=prior_b,
-            months_to_show=months_in_df(q1b),  # typically Jun, Dec
-            include_job_function=False,
+            months_to_show=present,
+            include_job_function=False,  # monthly YoY per month
+            yoy_quarters=None,
             mom_pct_threshold=args.mom_threshold,
             qoq_pct_threshold=args.qoq_threshold,
             yoy_pct_threshold=args.yoy_threshold,
-            abs_cutoff=args.abs_cutoff,
-        )
-        write_qc_sheet(args_qc)
+            abs_cutoff=args.abs_cutoff
+        ))
 
-    # ---- About ----
-    append_about_sheet_last(wb, "RLMS – QC (Q1)", year, current_q)
+    append_about_sheet_last(wb, "RLMS – QC (Q1)", tgt_year, current_q)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     wb.save(args.out)
     print(f"[DONE] {args.out}")
