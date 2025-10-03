@@ -31,6 +31,7 @@ ROLLUPS: Dict[str, List[str]] = {
     "Insurers": ["Insurers"],
     "Takaful Operators": ["Takaful Operators"],
 }
+
 ROLLUP_ORDER = [
     "All Financial Institutions",
     "Banking Institutions",
@@ -194,12 +195,15 @@ Q_TO_MONTHS = {
 MONTHS_FULL = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
 
 def normalize_quarter_label(qseries: pd.Series) -> str:
+    """Return the latest quarter label (Q1..Q4) appearing in the series."""
     if qseries is None or qseries.empty:
         return "Q1"
-    # pick the max quarter appearing (Q1..Q4)
     tmp = qseries.astype(str).map(lambda s: QMAP.get(s.strip(), s.strip()))
-    rank = {"Q1":1,"Q2":2,"Q3":3,"Q4":4}
-    return tmp.map(rank).fillna(0).idxmax().__class__ and tmp.iloc[tmp.map(rank).idxmax()]
+    rank_map = {"Q1":1,"Q2":2,"Q3":3,"Q4":4}
+    rank = tmp.map(rank_map).fillna(0)
+    # pick the value at the position of the max rank
+    pos = int(rank.to_numpy().argmax())
+    return str(tmp.iloc[pos])
 
 def months_up_to(q: str) -> List[str]:
     order = ["Q1","Q2","Q3","Q4"]
@@ -339,7 +343,7 @@ def write_qc_sheet(args: QCArgs) -> None:
       - Quarter sums present in months_to_show (Q1..current)
       - QoQ diffs/% between quarter sums (if >= 2)
       - YoY via hidden prior sheet (INDEX/MATCH), both Prior Qx and YoY % for Qx
-        or for month-only frames (e.g., Q1B) we add Prior <Mon> and YoY <Mon>.
+        or for month-only frames (e.g., Q1B/Q2B) we add Prior <Mon> and YoY <Mon>.
       - Red/Yellow highlighting with thresholds.
     """
     df = args.df.copy()
@@ -347,27 +351,26 @@ def write_qc_sheet(args: QCArgs) -> None:
         return
 
     # ----- 1) Normalize structural columns -----
-    # Ensure optional columns exist
     for col in ["subquestion","worker_category","job_function"]:
         if col not in df.columns:
             df[col] = ""
     # Attach entity_type
     df = attach_entity_type(df, entity_col="entity_name")
 
-    # Pick months to display (user-supplied) and ensure numeric
+    # Pick months to display and ensure numeric
     months = [m for m in args.months_to_show if m in MONTHS_FULL]
     for m in months:
         if m not in df.columns:
             df[m] = 0.0
-    # If jobfunc sheet: create a single Q column from 'value'
+
+    # If jobfunc sheet: single Q4 value column
     jobfunc_mode = bool(args.include_job_function)
     if jobfunc_mode:
         if "value" not in df.columns:
             df["value"] = 0.0
-        # define the quarter list to show for YoY (default Q4)
         yoy_qs = args.yoy_quarters or ["Q4"]
     else:
-        yoy_qs = []  # will fill after computing available Q-sums
+        yoy_qs: List[str] = []
 
     # ----- 2) Expand with rollups -----
     key_cols = ["entity_type","entity_name","subquestion","worker_category"]
@@ -376,7 +379,7 @@ def write_qc_sheet(args: QCArgs) -> None:
     num_cols = (["value"] if jobfunc_mode else months)
     df_full = expand_rollups(df, numeric_cols=num_cols, keys=key_cols)
 
-    # ----- 3) Sort: rollups first, then institutions A→Z -----
+    # ----- 3) Sort -----
     roll_rank = {n:i for i,n in enumerate(ROLLUP_ORDER)}
     df_full["_rank"] = df_full["entity_name"].map(lambda x: roll_rank.get(x, 10_000))
     df_full = df_full.sort_values(
@@ -384,7 +387,7 @@ def write_qc_sheet(args: QCArgs) -> None:
         kind="mergesort"
     ).drop(columns=["_rank"]).reset_index(drop=True)
 
-    # ----- 4) Prepare sheet & header info band -----
+    # ----- 4) Sheet & info band -----
     ws = args.wb.create_sheet(args.sheet_name)
     info_rows = 4
     ws["A1"] = f"{args.sheet_name}"; ws["A1"].font = Font(bold=True, size=13)
@@ -398,15 +401,14 @@ def write_qc_sheet(args: QCArgs) -> None:
                 c.fill = FILL_INFO
                 c.border = BTHIN
 
-    # ----- 5) Columns layout -----
+    # ----- 5) Headers -----
     dims = ["Entity Type","Entity / Group","Subquestion","Worker Category"]
     if jobfunc_mode:
         dims.append("Job Function")
     headers: List[str] = dims[:]
 
-    # data columns
     if jobfunc_mode:
-        headers += ["Q4"]  # jobfunc is quarter-4 total
+        headers += ["Q4"]
     else:
         headers += months
 
@@ -423,26 +425,22 @@ def write_qc_sheet(args: QCArgs) -> None:
     # Quarter sums + QoQ
     q_sums: List[str] = []
     if not jobfunc_mode:
-        # Only add Qx if all 3 months for that quarter are present
         for q in ["Q1","Q2","Q3","Q4"]:
             need = set(Q_TO_MONTHS[q])
             if need.issubset(set(months)):
                 q_sums.append(q)
         if q_sums:
             headers += q_sums
-            # QoQ diffs/%
             for i in range(1, len(q_sums)):
                 headers += [f"Diff {q_sums[i]}", f"%Diff {q_sums[i]}"]
 
-    # YoY (quarters or months)
+    # YoY
     yoy_prior_headers: List[str] = []
     yoy_pct_headers: List[str]   = []
     if jobfunc_mode:
-        # YoY Q4
         yoy_prior_headers = [f"Prior {q}" for q in yoy_qs]
         yoy_pct_headers   = [f"YoY {q}" for q in yoy_qs]
     else:
-        # If monthly (e.g., Q1B Jun/Dec only): do YoY per month if just 1–2 months
         if len(months) <= 2:
             yoy_prior_headers = [f"Prior {m}" for m in months]
             yoy_pct_headers   = [f"YoY {m}" for m in months]
@@ -452,9 +450,9 @@ def write_qc_sheet(args: QCArgs) -> None:
             yoy_pct_headers   = [f"YoY {q}" for q in yoy_qs]
     headers += yoy_prior_headers + yoy_pct_headers
 
-    # ----- 6) Write header row -----
+    # Header row (+ spacer)
     header_row = info_rows + 2
-    ws.append([""] * len(headers))  # spacer row at info_rows+1
+    ws.append([""] * len(headers))
     for j, h in enumerate(headers, start=1):
         c = ws.cell(header_row, j, h)
         c.font = Font(bold=True)
@@ -464,7 +462,7 @@ def write_qc_sheet(args: QCArgs) -> None:
 
     col_index = {h: i+1 for i, h in enumerate(headers)}
 
-    # ----- 7) Write data rows -----
+    # ----- 6) Data rows -----
     first_data_row = header_row + 1
     for _, r in df_full.iterrows():
         row_vals: List = [
@@ -475,13 +473,11 @@ def write_qc_sheet(args: QCArgs) -> None:
         ]
         if jobfunc_mode:
             row_vals.append(r.get("job_function",""))
-        # data
         if jobfunc_mode:
             row_vals.append(r.get("value", 0))
         else:
             for m in months:
                 row_vals.append(r.get(m, 0))
-        # placeholders for calcs (formulas added later)
         need = len(headers) - len(row_vals)
         row_vals += [""] * max(0, need)
         ws.append(row_vals)
@@ -490,7 +486,7 @@ def write_qc_sheet(args: QCArgs) -> None:
     if last_data_row < first_data_row:
         return
 
-    # Freeze panes & simple table
+    # Freeze & table
     freeze_col = 5 if jobfunc_mode else 4
     ws.freeze_panes = ws.cell(first_data_row, freeze_col)
     table_ref = f"A{header_row}:{ws.cell(last_data_row, len(headers)).coordinate}"
@@ -498,8 +494,7 @@ def write_qc_sheet(args: QCArgs) -> None:
     tbl.tableStyleInfo = TableStyleInfo(name="TableStyleLight9", showRowStripes=True)
     ws.add_table(tbl)
 
-    # Number formats
-    # Raw values / quarters: number; percentages later
+    # Number formats (values/diffs)
     value_like = []
     if jobfunc_mode:
         value_like += ["Q4"]
@@ -511,12 +506,11 @@ def write_qc_sheet(args: QCArgs) -> None:
             for r in range(first_data_row, last_data_row + 1):
                 ws.cell(r, cidx).number_format = "#,##0"
 
-    # ----- 8) Formulas (MoM, QoQ, YoY) -----
+    # ----- 7) Formulas -----
     # MoM
     if not jobfunc_mode and len(months) >= 2:
         for i in range(1, len(months)):
             m = months[i]; prev = months[i-1]
-            # Diff m
             if f"Diff {m}" in col_index:
                 diff_col = col_index[f"Diff {m}"]
                 for r in range(first_data_row, last_data_row + 1):
@@ -524,7 +518,6 @@ def write_qc_sheet(args: QCArgs) -> None:
                     b = ws.cell(r, col_index[prev]).coordinate
                     ws.cell(r, diff_col).value = f"={a}-{b}"
                     ws.cell(r, diff_col).number_format = "#,##0"
-            # MoM %
             if f"MoM {m}" in col_index:
                 pct_col = col_index[f"MoM {m}"]
                 for r in range(first_data_row, last_data_row + 1):
@@ -549,7 +542,6 @@ def write_qc_sheet(args: QCArgs) -> None:
         if "Q4" in q_sums:
             for r in range(first_data_row, last_data_row + 1):
                 ws.cell(r, col_index["Q4"]).value = f"=SUM({ws.cell(r,col_index['Oct']).coordinate}:{ws.cell(r,col_index['Dec']).coordinate})"
-        # QoQ diffs/%
         for i in range(1, len(q_sums)):
             q = q_sums[i]; prevq = q_sums[i-1]
             if f"Diff {q}" in col_index:
@@ -568,91 +560,53 @@ def write_qc_sheet(args: QCArgs) -> None:
                     ws.cell(r, cp).number_format = "0.0%"
 
     # YoY
-    # Prepare prior sheet & key columns for joining
     key_cols_for_yoy = ["Entity / Group","Subquestion","Worker Category"]
     if jobfunc_mode:
         key_cols_for_yoy.append("Job Function")
-    # Map from our display headers to actual headers used
-    display_to_header = {
-        "Entity / Group":"Entity / Group",
-        "Subquestion":"Subquestion",
-        "Worker Category":"Worker Category",
-        "Job Function":"Job Function",
-    }
-    # ensure columns exist in col_index for keys:
-    for k in key_cols_for_yoy:
-        if k not in col_index:
-            # if the sheet doesn't carry that key, drop it from key list
-            pass
-    # Build helper: find available Qs for YoY, or months for YoY (Q1B)
-    yoy_quarters = []
-    yoy_months = []
-    if jobfunc_mode:
-        yoy_quarters = args.yoy_quarters or ["Q4"]
-    else:
-        if len(months) <= 2:
-            yoy_months = months[:]
-        else:
-            yoy_quarters = q_sums[:]
 
     # Build prior frame compatible with our keys
     prior = args.prior_df.copy() if args.prior_df is not None and not args.prior_df.empty else None
-
-    # For jobfunc: we need a column Q4 synthesized from 'value'
     if prior is not None:
         prior = attach_entity_type(prior, "entity_name")
-        # Rollups for prior as well
         p_key_cols = ["entity_type","entity_name","subquestion","worker_category"]
         if jobfunc_mode:
             p_key_cols.append("job_function")
         p_num = ["value"] if jobfunc_mode else months
         prior_full = expand_rollups(prior, numeric_cols=p_num, keys=p_key_cols)
 
-        # Reduce to keys + Q columns we need
         if jobfunc_mode:
-            # make a prior Q4 column named 'Q4'
             prior_full = prior_full.rename(columns={"job_function":"Job Function"})
             prior_full["Entity / Group"] = prior_full["entity_name"]
             prior_full["Subquestion"]    = prior_full["subquestion"]
             prior_full["Worker Category"]= prior_full["worker_category"]
             prior_full["Q4"] = prior_full["value"]
-            need_cols = ["Entity / Group","Subquestion","Worker Category","Job Function","Q4"]
-            prior_qc_df = prior_full[need_cols].copy()
+            prior_qc_df = prior_full[["Entity / Group","Subquestion","Worker Category","Job Function","Q4"]].copy()
         else:
             prior_full["Entity / Group"] = prior_full["entity_name"]
             prior_full["Subquestion"]    = prior_full["subquestion"]
             prior_full["Worker Category"]= prior_full["worker_category"]
-            # build quarter sums if needed for YoY Q
             for q in ["Q1","Q2","Q3","Q4"]:
                 need = set(Q_TO_MONTHS[q])
                 if need.issubset(set(prior_full.columns)):
                     prior_full[q] = prior_full[list(need)].sum(axis=1)
-            prior_qc_df = prior_full[["Entity / Group","Subquestion","Worker Category"] +
-                                     [c for c in ["Q1","Q2","Q3","Q4"] if c in prior_full.columns]].copy()
+            cols = ["Entity / Group","Subquestion","Worker Category"] + [c for c in ["Q1","Q2","Q3","Q4"] if c in prior_full.columns]
+            prior_qc_df = prior_full[cols].copy()
     else:
         prior_qc_df = None
 
-    # Depict key columns on the QC sheet using our display headers
-    # (We already wrote those headers in `headers`)
-    # Hidden KEY + hidden prior sheet + wiring
     def _add_prior_and_fill_qoy(yoy_quarters: List[str]):
-        if not yoy_quarters:
+        if not yoy_quarters or prior_qc_df is None or prior_qc_df.empty:
             return
-        # 1) Create prior sheet
         prior_sheet_name = f"_{args.sheet_name}_PRIOR"
         (ps, qmap) = _add_prior_sheet(args.wb, prior_qc_df, ["Entity / Group","Subquestion","Worker Category","Job Function"], yoy_quarters, prior_sheet_name)
         if not qmap:
             return
-        # 2) Hidden KEY column
         key_idx = _ensure_hidden_key_col(ws, header_row, first_data_row, last_data_row, col_index,
                                          ["Entity / Group","Subquestion","Worker Category","Job Function"], "_KEY")
-        # 3) Wire PRIOR and YoY
         for q in yoy_quarters:
             prior_hdr = f"Prior {q}"
             yoy_hdr   = f"YoY {q}"
-            if prior_hdr not in col_index and yoy_hdr not in col_index:
-                continue
-            if q not in qmap:
+            if (prior_hdr not in col_index and yoy_hdr not in col_index) or (q not in qmap):
                 continue
             prior_letter = qmap[q]
             prior_range = f"{ps}!${prior_letter}:${prior_letter}"
@@ -669,29 +623,25 @@ def write_qc_sheet(args: QCArgs) -> None:
                 if yoy_col and curr_col:
                     curr_addr = ws.cell(r, curr_col).coordinate
                     ws.cell(r, yoy_col).value = (
-                        f'=IFERROR(IF({prior_expr}="","N/A",'
-                        f'IF(AND({prior_expr}=0,{curr_addr}=0),0,'
-                        f'IF(AND({prior_expr}=0,{curr_addr}>0),"N/A",'
-                        f'({curr_addr}-{prior_expr})/{prior_expr}))),"N/A")'
+                        f"=IFERROR(IF({prior_expr}=\"\",\"N/A\","
+                        f"IF(AND({prior_expr}=0,{curr_addr}=0),0,"
+                        f"IF(AND({prior_expr}=0,{curr_addr}>0),\"N/A\","
+                        f"({curr_addr}-{prior_expr})/{prior_expr}))),\"N/A\")"
                     )
                     ws.cell(r, yoy_col).number_format = "0.0%"
 
     def _add_prior_and_fill_months(yoy_months: List[str]):
         if not yoy_months or prior_qc_df is None or prior_qc_df.empty:
             return
-        # Build a prior sheet with monthly columns too
         ps = f"_{args.sheet_name}_PRIOR_M"
         if ps in args.wb.sheetnames:
             del args.wb[ps]
         wsp = args.wb.create_sheet(ps)
         wsp["A1"] = "KEY"
-        # Write month columns
         m_map: Dict[str,str] = {}
         for j, m in enumerate(yoy_months, start=2):
             wsp.cell(1, j, m)
             m_map[m] = wsp.cell(1, j).column_letter
-        # Fill rows (compute prior monthly from prior_df directly)
-        # Build a compact prior keyed frame with those months
         p = args.prior_df.copy()
         p = attach_entity_type(p, "entity_name")
         p = expand_rollups(p, numeric_cols=yoy_months, keys=["entity_type","entity_name","subquestion","worker_category"])
@@ -705,15 +655,13 @@ def write_qc_sheet(args: QCArgs) -> None:
                 wsp.cell(i+2, j, row.get(m, 0) or 0)
         wsp.sheet_state = "hidden"
 
-        # Hidden KEY column
         key_idx = _ensure_hidden_key_col(ws, header_row, first_data_row, last_data_row, col_index,
                                          ["Entity / Group","Subquestion","Worker Category","Job Function"], "_KEY_M")
 
-        # Wire Prior <Mon> and YoY <Mon>
         for m in yoy_months:
             prior_hdr = f"Prior {m}"
             yoy_hdr   = f"YoY {m}"
-            if prior_hdr not in col_index and yoy_hdr not in col_index:
+            if (prior_hdr not in col_index and yoy_hdr not in col_index):
                 continue
             prior_letter = m_map[m]
             prior_range = f"{ps}!${prior_letter}:${prior_letter}"
@@ -730,28 +678,31 @@ def write_qc_sheet(args: QCArgs) -> None:
                 if yoy_col and curr_col:
                     curr_addr = ws.cell(r, curr_col).coordinate
                     ws.cell(r, yoy_col).value = (
-                        f'=IFERROR(IF({prior_expr}="","N/A",'
-                        f'IF(AND({prior_expr}=0,{curr_addr}=0),0,'
-                        f'IF(AND({prior_expr}=0,{curr_addr}>0),"N/A",'
-                        f'({curr_addr}-{prior_expr})/{prior_expr}))),"N/A")'
+                        f"=IFERROR(IF({prior_expr}=\"\",\"N/A\","
+                        f"IF(AND({prior_expr}=0,{curr_addr}=0),0,"
+                        f"IF(AND({prior_expr}=0,{curr_addr}>0),\"N/A\","
+                        f"({curr_addr}-{prior_expr})/{prior_expr}))),\"N/A\")"
                     )
                     ws.cell(r, yoy_col).number_format = "0.0%"
 
-    if yoy_quarters:
-        _add_prior_and_fill_qoy(yoy_quarters)
-    if yoy_months:
-        _add_prior_and_fill_months(yoy_months)
+    # Decide YoY mode
+    yoy_months: List[str] = []
+    if jobfunc_mode:
+        _add_prior_and_fill_qoy(yoy_qs)
+    else:
+        if len(months) <= 2:
+            yoy_months = months[:]
+            _add_prior_and_fill_months(yoy_months)
+        else:
+            _add_prior_and_fill_qoy(yoy_qs)
 
-    # ----- 9) Conditional formatting (RED/YELLOW) -----
-    # Helper to add CF for a % column using sibling Diff column where applicable
+    # ----- 8) Conditional formatting (RED/YELLOW) -----
     def _cf_for_percent(col_title: str, diff_title: Optional[str]):
         if col_title not in col_index:
             return
         pct_col = col_index[col_title]
         letter  = ws.cell(header_row, pct_col).column_letter
         rng = f"{letter}{first_data_row}:{letter}{last_data_row}"
-
-        # Build formula using relative reference for the top-left of the range
         top = f"{letter}{first_data_row}"
         if diff_title and diff_title in col_index:
             dletter = ws.cell(header_row, col_index[diff_title]).column_letter
@@ -759,28 +710,21 @@ def write_qc_sheet(args: QCArgs) -> None:
             red_formula = f"=AND(ISNUMBER({top}),ABS({top})>={args.mom_pct_threshold},ABS({dtop})>={args.abs_cutoff})"
             yel_formula = f"=AND(ISNUMBER({top}),ABS({top})>={args.mom_pct_threshold},ABS({dtop})<{args.abs_cutoff})"
         else:
-            # If no diff column (e.g., YoY month without an explicit diff), only use pct threshold
             red_formula = f"=AND(ISNUMBER({top}),ABS({top})>={args.mom_pct_threshold},ABS({top})>={args.mom_pct_threshold})"
             yel_formula = f"=AND(ISNUMBER({top}),ABS({top})>={args.mom_pct_threshold},ABS({top})<{args.mom_pct_threshold})"
-
         ws.conditional_formatting.add(rng, FormulaRule(formula=[red_formula], fill=FILL_RED))
         ws.conditional_formatting.add(rng, FormulaRule(formula=[yel_formula], fill=FILL_YEL))
 
-    # MoM%
     if not jobfunc_mode and len(months) >= 2:
         for i in range(1, len(months)):
             m = months[i]
             _cf_for_percent(f"MoM {m}", f"Diff {m}")
-
-    # QoQ %Diff
     if not jobfunc_mode and q_sums:
         for i in range(1, len(q_sums)):
             q = q_sums[i]
             _cf_for_percent(f"%Diff {q}", f"Diff {q}")
-
-    # YoY %
     if jobfunc_mode:
-        for q in yoy_quarters:
+        for q in yoy_qs:
             _cf_for_percent(f"YoY {q}", None)
     else:
         if len(months) <= 2:
@@ -790,7 +734,7 @@ def write_qc_sheet(args: QCArgs) -> None:
             for q in yoy_qs:
                 _cf_for_percent(f"YoY {q}", None)
 
-    # ----- 10) Auto width (lightweight) -----
+    # ----- 9) Column widths -----
     for col in range(1, len(headers) + 1):
         maxw = max(len(str(ws.cell(header_row, col).value or "")), 10)
         for r in range(first_data_row, min(first_data_row + 50, last_data_row + 1)):
@@ -798,6 +742,3 @@ def write_qc_sheet(args: QCArgs) -> None:
             if v is not None:
                 maxw = max(maxw, len(str(v)))
         ws.column_dimensions[ws.cell(1, col).column_letter].width = min(maxw + 2, 28)
-
-
-
