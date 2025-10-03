@@ -5,29 +5,33 @@ from pathlib import Path
 import pandas as pd
 
 from qc_common import (
-    new_empty_workbook, append_about_sheet_last, write_qc_sheet_rowwise,
-    normalize_quarter_label, MONTHS_FULL, QCArgs
+    QCArgs,
+    write_qc_sheet,
+    new_empty_workbook,
+    append_about_sheet_last,
+    MONTHS_FULL,
+    normalize_quarter_label,  # if you expose/need it; otherwise not used
 )
 
-def _load(path: Path, sheet: str) -> pd.DataFrame:
+def _load(sheet_path: Path, sheet_name: str) -> pd.DataFrame:
     try:
-        return pd.read_excel(path, sheet_name=sheet, engine="openpyxl")
+        return pd.read_excel(sheet_path, sheet_name=sheet_name, engine="openpyxl")
     except Exception:
         return pd.DataFrame()
 
-def _months_present(df: pd.DataFrame) -> list:
+def _months_in_df(df: pd.DataFrame) -> list[str]:
     return [m for m in MONTHS_FULL if m in df.columns]
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="QC workbook for Question 1")
-    ap.add_argument("--stage", required=True, help="Staging workbook (.xlsx)")
-    ap.add_argument("--out",   required=True, help="Output QC workbook (.xlsx)")
-    ap.add_argument("--prior-stage", default=None, help="Prior-year staging workbook for YoY (.xlsx)")
-    ap.add_argument("--year",  type=int, default=None)
+    ap = argparse.ArgumentParser(description="QC template builder – Question 1")
+    ap.add_argument("--stage", required=True, help="staging_all.xlsx (current)")
+    ap.add_argument("--out",   required=True, help="output QC workbook")
+    ap.add_argument("--prior-stage", default=None, help="prior year's staging_all.xlsx for YoY")
+    ap.add_argument("--year", type=int, default=None, help="filter to this year (default = mode in staging)")
     ap.add_argument("--mom-threshold", type=float, default=0.25)
-    ap.add_argument("--qoq-threshold", type=float, default=0.25)
-    ap.add_argument("--abs-cutoff",    type=float, default=50)
-    ap.add_argument("--yoy-threshold", type=float, default=0.25)  # (kept for symmetry if you want to surface later)
+    ap.add_argument("--qoq-threshold", type=float, default=0.25)  # kept for consistency; CF uses mom-threshold
+    ap.add_argument("--yoy-threshold", type=float, default=0.25)  # kept for consistency; CF uses mom-threshold
+    ap.add_argument("--abs-cutoff", type=float, default=50.0)
     args = ap.parse_args()
 
     stage = Path(args.stage)
@@ -36,91 +40,90 @@ def main() -> int:
     q1b  = _load(stage, "Q1B")
 
     if q1a.empty and q1jf.empty and q1b.empty:
-        print("[WARN] No Q1 sheets found in staging.")
+        print("[WARN] No Q1 sheets in staging.")
         return 0
 
-    # Pick target year & current quarter from what exists
-    years = pd.concat([d[["year"]] for d in [q1a,q1jf,q1b] if not d.empty], ignore_index=True)
-    tgt_year = int(args.year if args.year is not None else years["year"].mode().iat[0])
-    qser = pd.concat([d["quarter"] for d in [q1a,q1jf,q1b] if not d.empty], ignore_index=True)
-    current_q = normalize_quarter_label(qser)
+    # Pick year & quarter label from whatever is present
+    years = pd.concat([d[["year"]] for d in [q1a, q1jf, q1b] if not d.empty], ignore_index=True)
+    year = int(args.year if args.year is not None else years["year"].mode().iat[0])
 
-    # Filter to target year
-    if not q1a.empty:  q1a  = q1a[q1a["year"] == tgt_year]
-    if not q1jf.empty: q1jf = q1jf[q1jf["year"] == tgt_year]
-    if not q1b.empty:  q1b  = q1b[q1b["year"] == tgt_year]
+    qseries = pd.concat([d["quarter"] for d in [q1a, q1jf, q1b] if not d.empty], ignore_index=True)
+    # We’ll show months up to the *max* quarter found; qc_common handles banding/labels
+    # If you don’t export normalize_quarter_label, this line can be removed – qc_common only needs months list.
+    # current_q = normalize_quarter_label(qseries)
 
-    # Prior
+    if not q1a.empty:  q1a  = q1a[q1a["year"] == year]
+    if not q1jf.empty: q1jf = q1jf[q1jf["year"] == year]
+    if not q1b.empty:  q1b  = q1b[q1b["year"] == year]
+
     prior_a = prior_jf = prior_b = None
     if args.prior_stage:
         p = Path(args.prior_stage)
         pa = _load(p, "Q1A_Main")
         pj = _load(p, "Q1A_JobFunc_Q4")
         pb = _load(p, "Q1B")
-        if not pa.empty: prior_a  = pa[pa["year"]==(tgt_year-1)]
-        if not pj.empty: prior_jf = pj[pj["year"]==(tgt_year-1)]
-        if not pb.empty: prior_b  = pb[pb["year"]==(tgt_year-1)]
+        if not pa.empty: prior_a  = pa[pa["year"] == (year - 1)]
+        if not pj.empty: prior_jf = pj[pj["year"] == (year - 1)]
+        if not pb.empty: prior_b  = pb[pb["year"] == (year - 1)]
 
     wb = new_empty_workbook()
 
-    # ---- Q1A Main (monthly) ----
+    # ---- Q1A Main (monthly table with MoM/QoQ/YoY) ----
     if not q1a.empty:
-        write_qc_sheet_rowwise(QCArgs(
+        args_qc = QCArgs(
             sheet_name="QC_Q1A_Main",
             df=q1a,
             wb=wb,
-            year=tgt_year,
-            current_q=current_q,
+            year=year,
+            current_q=str(q1a["quarter"].iloc[0]),
             prior_df=prior_a,
-            months_to_show=_months_present(q1a),   # show all months available in staging
+            months_to_show=_months_in_df(q1a),
             include_job_function=False,
-            yoy_quarters=None,                     # auto: YoY per quarter (since > 2 months)
             mom_pct_threshold=args.mom_threshold,
             qoq_pct_threshold=args.qoq_threshold,
             yoy_pct_threshold=args.yoy_threshold,
-            abs_cutoff=args.abs_cutoff
-        ))
+            abs_cutoff=args.abs_cutoff,
+        )
+        write_qc_sheet(args_qc)
 
-    # ---- Q1A Job Function (Q4 value) ----
+    # ---- Q1A Job Function (Q4 value-only + YoY Q4) ----
     if not q1jf.empty:
-        # Ensure subquestion exists (your extractor now includes subquestion for jobfunc)
-        write_qc_sheet_rowwise(QCArgs(
+        args_qc = QCArgs(
             sheet_name="QC_Q1A_JobFunc_Q4",
             df=q1jf,
             wb=wb,
-            year=tgt_year,
-            current_q=current_q,
+            year=year,
+            current_q="Q4",
             prior_df=prior_jf,
-            months_to_show=[],          # value-only (Q4 total)
-            include_job_function=True,  # expects 'value' column; YoY vs prior Q4
-            yoy_quarters=["Q4"],
+            months_to_show=[],          # value-only view
+            include_job_function=True,  # expects 'value' column
+            yoy_quarters=["Q4"],        # compare Q4 vs prior-year Q4
             mom_pct_threshold=args.mom_threshold,
             qoq_pct_threshold=args.qoq_threshold,
             yoy_pct_threshold=args.yoy_threshold,
-            abs_cutoff=args.abs_cutoff
-        ))
+            abs_cutoff=args.abs_cutoff,
+        )
+        write_qc_sheet(args_qc)
 
-    # ---- Q1B (Jun/Dec only) ----
+    # ---- Q1B (Jun/Dec single-month view + YoY per month present) ----
     if not q1b.empty:
-        # Keep only the month columns that actually exist (likely Jun and/or Dec)
-        present = _months_present(q1b)   # e.g., ['Jun'] or ['Dec'] or ['Jun','Dec']
-        write_qc_sheet_rowwise(QCArgs(
+        args_qc = QCArgs(
             sheet_name="QC_Q1B",
             df=q1b,
             wb=wb,
-            year=tgt_year,
-            current_q=current_q,
+            year=year,
+            current_q=str(q1b["quarter"].iloc[0]),
             prior_df=prior_b,
-            months_to_show=present,
-            include_job_function=False,  # monthly YoY per month
-            yoy_quarters=None,
+            months_to_show=_months_in_df(q1b),  # will be ['Jun'] or ['Dec'] or both
+            include_job_function=False,
             mom_pct_threshold=args.mom_threshold,
             qoq_pct_threshold=args.qoq_threshold,
             yoy_pct_threshold=args.yoy_threshold,
-            abs_cutoff=args.abs_cutoff
-        ))
+            abs_cutoff=args.abs_cutoff,
+        )
+        write_qc_sheet(args_qc)
 
-    append_about_sheet_last(wb, "RLMS – QC (Q1)", tgt_year, current_q)
+    append_about_sheet_last(wb, "RLMS – QC (Q1)", year, "—")
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     wb.save(args.out)
     print(f"[DONE] {args.out}")
