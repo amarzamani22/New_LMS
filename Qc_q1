@@ -5,127 +5,133 @@ from pathlib import Path
 import pandas as pd
 
 from qc_common import (
-    QCArgs, new_empty_workbook, append_about_sheet_last,
-    write_qc_sheet, normalize_quarter_label, MONTHS_FULL
+    new_empty_workbook, append_about_sheet_last, write_qc_sheet,
+    normalize_quarter_label, MONTHS_FULL, QCArgs
 )
 
-def _load_excel(path: Path, sheet: str) -> pd.DataFrame:
+def load(path: Path, sheet: str) -> pd.DataFrame:
+    """Helper: read a sheet from staging Excel; return empty df if missing."""
     try:
         return pd.read_excel(path, sheet_name=sheet, engine="openpyxl")
     except Exception:
         return pd.DataFrame()
 
-def _months_in_df(df: pd.DataFrame) -> list:
+def months_in_df(df: pd.DataFrame) -> list[str]:
+    """Return all month columns that exist in df (Jan..Dec)."""
     return [m for m in MONTHS_FULL if m in df.columns]
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Build QC workbook for Question 1")
-    ap.add_argument("--stage", required=True, help="Current staging workbook (.xlsx)")
-    ap.add_argument("--out",   required=True, help="Output QC workbook (.xlsx)")
-    ap.add_argument("--prior-stage", default=None, help="Prior-year staging workbook (.xlsx)")
-    ap.add_argument("--year", type=int, default=None)
-    ap.add_argument("--mom-threshold", type=float, default=0.25)
-    ap.add_argument("--qoq-threshold", type=float, default=0.25)
-    ap.add_argument("--yoy-threshold", type=float, default=0.25)
-    ap.add_argument("--abs-cutoff", type=float, default=50)
+    ap = argparse.ArgumentParser(description="QC for Question 1")
+    ap.add_argument("--stage", required=True, help="Staging Excel file (current year)")
+    ap.add_argument("--out", required=True, help="Output QC Excel file")
+    ap.add_argument("--prior-stage", default=None, help="Staging Excel file (previous year)")
+    ap.add_argument("--year", type=int, default=None, help="Target year; auto-detect if not given")
+    ap.add_argument("--mom-threshold", type=float, default=0.25, help="MoM % threshold")
+    ap.add_argument("--qoq-threshold", type=float, default=0.25, help="QoQ % threshold")
+    ap.add_argument("--yoy-threshold", type=float, default=0.25, help="YoY % threshold")
+    ap.add_argument("--abs-cutoff", type=float, default=50, help="Absolute diff cutoff")
     args = ap.parse_args()
 
     stage = Path(args.stage)
-    if not stage.exists():
-        print(f"[ERROR] Staging not found: {stage}")
-        return 2
-
-    q1a  = _load_excel(stage, "Q1A_Main")
-    q1jf = _load_excel(stage, "Q1A_JobFunc_Q4")
-    q1b  = _load_excel(stage, "Q1B")
+    # Load Q1 sheets
+    q1a  = load(stage, "Q1A_Main")
+    q1jf = load(stage, "Q1A_JobFunc_Q4")
+    q1b  = load(stage, "Q1B")
 
     if q1a.empty and q1jf.empty and q1b.empty:
         print("[WARN] No Q1 sheets found in staging.")
         return 0
 
-    # Determine target year and current quarter from the staging
-    years = pd.concat([d[["year"]] for d in [q1a,q1jf,q1b] if not d.empty], ignore_index=True)
-    tgt_year = int(args.year if args.year is not None else years["year"].mode().iat[0])
+    # Detect year
+    years = pd.concat(
+        [d[["year"]] for d in [q1a,q1jf,q1b] if not d.empty],
+        ignore_index=True
+    ) if not (q1a.empty and q1jf.empty and q1b.empty) else pd.DataFrame()
+    year = int(args.year if args.year else years["year"].mode().iat[0])
 
-    qseries = pd.concat([d["quarter"] for d in [q1a,q1jf,q1b] if not d.empty], ignore_index=True)
+    # Detect current quarter
+    qseries = pd.concat(
+        [d["quarter"] for d in [q1a,q1jf,q1b] if not d.empty],
+        ignore_index=True
+    )
     current_q = normalize_quarter_label(qseries)
 
-    # Filter current year
-    if not q1a.empty:  q1a  = q1a[q1a["year"]==tgt_year]
-    if not q1jf.empty: q1jf = q1jf[q1jf["year"]==tgt_year]
-    if not q1b.empty:  q1b  = q1b[q1b["year"]==tgt_year]
+    # Filter by year
+    if not q1a.empty:  q1a  = q1a[q1a["year"]==year]
+    if not q1jf.empty: q1jf = q1jf[q1jf["year"]==year]
+    if not q1b.empty:  q1b  = q1b[q1b["year"]==year]
 
-    # Prior year frames for YoY
+    # Prior year data for YoY
     prior_a = prior_jf = prior_b = None
     if args.prior_stage:
-        prior = Path(args.prior_stage)
-        if prior.exists():
-            pa = _load_excel(prior, "Q1A_Main")
-            pj = _load_excel(prior, "Q1A_JobFunc_Q4")
-            pb = _load_excel(prior, "Q1B")
-            if not pa.empty: prior_a  = pa[pa["year"]==(tgt_year-1)]
-            if not pj.empty: prior_jf = pj[pj["year"]==(tgt_year-1)]
-            if not pb.empty: prior_b  = pb[pb["year"]==(tgt_year-1)]
+        p = Path(args.prior_stage)
+        pa = load(p, "Q1A_Main")
+        pj = load(p, "Q1A_JobFunc_Q4")
+        pb = load(p, "Q1B")
+        if not pa.empty: prior_a  = pa[pa["year"]==(year-1)]
+        if not pj.empty: prior_jf = pj[pj["year"]==(year-1)]
+        if not pb.empty: prior_b  = pb[pb["year"]==(year-1)]
 
+    # New workbook
     wb = new_empty_workbook()
 
-    # ---------- QC_Q1A_Main ----------
+    # ---- QC_Q1A_Main ----
     if not q1a.empty:
-        months = _months_in_df(q1a)   # up to current quarter (whatever exists)
-        write_qc_sheet(QCArgs(
+        args_qc = QCArgs(
             sheet_name="QC_Q1A_Main",
             df=q1a,
             wb=wb,
-            year=tgt_year,
+            year=year,
             current_q=current_q,
             prior_df=prior_a,
-            months_to_show=months,
+            months_to_show=months_in_df(q1a),
             include_job_function=False,
             mom_pct_threshold=args.mom_threshold,
             qoq_pct_threshold=args.qoq_threshold,
             yoy_pct_threshold=args.yoy_threshold,
             abs_cutoff=args.abs_cutoff,
-        ))
+        )
+        write_qc_sheet(args_qc)
 
-    # ---------- QC_Q1A_JobFunc_Q4 ----------
+    # ---- QC_Q1A_JobFunc_Q4 ----
     if not q1jf.empty:
-        # Job function: show one Q column (Q4) from df['value'] and YoY with prior Q4
-        write_qc_sheet(QCArgs(
+        args_qc = QCArgs(
             sheet_name="QC_Q1A_JobFunc_Q4",
             df=q1jf,
             wb=wb,
-            year=tgt_year,
+            year=year,
             current_q=current_q,
             prior_df=prior_jf,
-            months_to_show=[],            # value-only
-            include_job_function=True,    # tells writer to use df['value'] as Q4
-            yoy_quarters=["Q4"],
+            months_to_show=[],   # jobfunc uses single 'value'
+            include_job_function=True,
+            yoy_quarters=["Q4"],  # compare only Q4 YoY
             mom_pct_threshold=args.mom_threshold,
             qoq_pct_threshold=args.qoq_threshold,
             yoy_pct_threshold=args.yoy_threshold,
             abs_cutoff=args.abs_cutoff,
-        ))
+        )
+        write_qc_sheet(args_qc)
 
-    # ---------- QC_Q1B ----------
+    # ---- QC_Q1B ----
     if not q1b.empty:
-        # Q1B is end-of-quarter month (Jun or Dec, or both). Show only present months.
-        months = [m for m in ["Jun","Dec"] if m in q1b.columns]
-        write_qc_sheet(QCArgs(
+        args_qc = QCArgs(
             sheet_name="QC_Q1B",
             df=q1b,
             wb=wb,
-            year=tgt_year,
+            year=year,
             current_q=current_q,
             prior_df=prior_b,
-            months_to_show=months,        # one or two months
-            include_job_function=False,   # no jobfunc
+            months_to_show=months_in_df(q1b),  # typically Jun, Dec
+            include_job_function=False,
             mom_pct_threshold=args.mom_threshold,
             qoq_pct_threshold=args.qoq_threshold,
             yoy_pct_threshold=args.yoy_threshold,
             abs_cutoff=args.abs_cutoff,
-        ))
+        )
+        write_qc_sheet(args_qc)
 
-    append_about_sheet_last(wb, "RLMS – QC (Q1)", tgt_year, current_q)
+    # ---- About ----
+    append_about_sheet_last(wb, "RLMS – QC (Q1)", year, current_q)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     wb.save(args.out)
     print(f"[DONE] {args.out}")
