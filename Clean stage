@@ -1,281 +1,281 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import os, sys, tempfile, shutil, subprocess
+import sys
 from pathlib import Path
-from typing import Dict, List, Optional
-from openpyxl import load_workbook, Workbook
-from openpyxl.worksheet.table import Table, TableStyleInfo
+import pandas as pd
 
-# ---------------------------
-# Simple prompts
-# ---------------------------
-def ask_path(prompt: str, must_exist: bool = False, allow_blank: bool = False) -> Optional[Path]:
+from qc_common import (
+    new_empty_workbook, append_about_sheet_last, write_qc_sheet, QCArgs,
+    normalize_quarter_label, months_up_to, MONTHS_FULL
+)
+
+def _load_sheet(xlsx: Path, name: str) -> pd.DataFrame:
+    try:
+        return pd.read_excel(xlsx, sheet_name=name, engine="openpyxl")
+    except Exception:
+        return pd.DataFrame()
+
+def _pick_year(*dfs: pd.DataFrame, explicit: int | None) -> int | None:
+    if explicit is not None:
+        return int(explicit)
+    years = []
+    for d in dfs:
+        if d is not None and not d.empty and "year" in d.columns:
+            years.append(d["year"])
+    if not years:
+        return None
+    s = pd.concat(years, ignore_index=True)
+    return int(s.mode().iat[0]) if not s.empty else None
+
+def _months_present(df: pd.DataFrame, up_to_quarter: str) -> list[str]:
+    # show only months that exist in df & not beyond current quarter
+    allowed = set(months_up_to(up_to_quarter))
+    return [m for m in MONTHS_FULL if m in df.columns and m in allowed]
+
+def _ask_path(prompt: str, required: bool = False) -> Path | None:
     while True:
-        p = input(prompt).strip()
-        if allow_blank and p == "":
+        s = input(prompt).strip()
+        if not s and not required:
             return None
-        path = Path(p)
-        if not must_exist or path.exists():
-            return path
-        print("  -> Not found. Try again.")
+        p = Path(s)
+        if p.exists():
+            return p
+        print("  → Path not found. Try again.")
 
-def ask_float(prompt: str, default: float) -> float:
-    s = input(f"{prompt} [default {default}]: ").strip()
-    if s == "":
+def _ask_float(prompt: str, default: float) -> float:
+    s = input(f"{prompt} [{default}]: ").strip()
+    if not s:
         return default
     try:
         return float(s)
     except Exception:
-        print("  -> Invalid number. Using default.")
+        print("  → Not a number. Using default.")
         return default
 
-def ask_yesno(prompt: str, default_yes: bool = True) -> bool:
-    d = "Y/n" if default_yes else "y/N"
-    s = input(f"{prompt} ({d}): ").strip().lower()
-    if s == "":
-        return default_yes
-    return s in ("y","yes")
-
-def run_subprocess(pyfile: str, args: List[str]) -> bool:
-    exe = sys.executable or "python"
-    cmd = [exe, pyfile] + args
-    print("  ->", " ".join([str(c) for c in cmd]))
+def _ask_int(prompt: str, default: int | None) -> int | None:
+    s = input(f"{prompt}{' ['+str(default)+']' if default is not None else ''}: ").strip()
+    if not s:
+        return default
     try:
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        print(res.stdout)
-        return res.returncode == 0
-    except Exception as e:
-        print(f"  -> Failed to run {pyfile}: {e}")
-        return False
-
-# ---------------------------
-# Styled sheet copy (values + styles + rules + tables)
-# ---------------------------
-def _unique_sheet_name(dest_wb: Workbook, desired: str) -> str:
-    base = desired[:31]
-    name = base
-    k = 1
-    while name in dest_wb.sheetnames:
-        suff = f"_{k}"
-        name = (base[:31-len(suff)] + suff)
-        k += 1
-    return name
-
-def _unique_table_name(existing: set, base: str) -> str:
-    norm = "".join(ch if ch.isalnum() else "_" for ch in (base or "Table"))
-    name = norm
-    k = 1
-    while name in existing:
-        name = f"{norm}_{k}"
-        k += 1
-    existing.add(name)
-    return name
-
-def copy_sheet_with_styles(ws_src, dest_wb: Workbook, name_hint: Optional[str] = None) -> str:
-    """
-    Deep copy of a sheet:
-      - values, formulas, number formats
-      - fonts, fills, alignment, borders
-      - column widths, row heights, hidden flags
-      - freeze panes
-      - conditional formatting rules (including colors)
-      - Excel tables (unique names)
-    """
-    name = _unique_sheet_name(dest_wb, name_hint or ws_src.title)
-    ws_new = dest_wb.create_sheet(name)
-
-    max_row, max_col = ws_src.max_row, ws_src.max_column
-
-    # 1) Cells (values + formats/styles)
-    for row in ws_src.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col):
-        for cell in row:
-            c = ws_new.cell(cell.row, cell.col_idx, cell.value)
-            c.number_format = cell.number_format
-            if cell.font:      c.font = cell.font.copy()
-            if cell.fill:      c.fill = cell.fill.copy()
-            if cell.alignment: c.alignment = cell.alignment.copy()
-            if cell.border:    c.border = cell.border.copy()
-
-    # 2) Col widths / hidden
-    for col_letter, dim in ws_src.column_dimensions.items():
-        tgt = ws_new.column_dimensions[col_letter]
-        if dim.width is not None:
-            tgt.width = dim.width
-        tgt.hidden = bool(dim.hidden)
-
-    # 3) Row heights / hidden
-    for idx, dim in ws_src.row_dimensions.items():
-        tgt = ws_new.row_dimensions[idx]
-        if dim.height is not None:
-            tgt.height = dim.height
-        tgt.hidden = bool(dim.hidden)
-
-    # 4) Freeze panes
-    try:
-        ws_new.freeze_panes = ws_src.freeze_panes
+        return int(s)
     except Exception:
-        pass
+        print("  → Not an integer. Leaving empty.")
+        return None
 
-    # 5) Conditional formatting
-    try:
-        for key, rules in ws_src.conditional_formatting._cf_rules.items():  # type: ignore[attr-defined]
-            for rule in rules:
-                # Copy to same sqref
-                ws_new.conditional_formatting.add(rule.sqref, rule)
-    except Exception:
-        pass
+def qc_make_all(
+    stage: Path,
+    out: Path,
+    prior_q1: Path | None,
+    prior_q2: Path | None,
+    prior_q3: Path | None,
+    prior_q4: Path | None,
+    prior_q5: Path | None,
+    th_q1: tuple[float,float,float,float],
+    th_q2: tuple[float,float,float,float],
+    th_q3: tuple[float,float,float,float],
+    th_q4: tuple[float,float,float,float],
+    th_q5: tuple[float,float,float,float],
+    year: int | None,
+):
+    # ---- Load available staging sheets ----
+    q1a   = _load_sheet(stage, "Q1A_Main")
+    q1jf  = _load_sheet(stage, "Q1A_JobFunc_Q4")
+    q1b   = _load_sheet(stage, "Q1B")
 
-    # 6) Tables (with unique names)
-    try:
-        existing = {t.displayName for s in dest_wb.worksheets for t in getattr(s, "_tables", [])}
-        for t in getattr(ws_src, "_tables", []):
-            new_t = Table(displayName=_unique_table_name(existing, t.displayName), ref=t.ref)
-            if isinstance(t.tableStyleInfo, TableStyleInfo):
-                s = t.tableStyleInfo
-                new_t.tableStyleInfo = TableStyleInfo(
-                    name=s.name,
-                    showFirstColumn=s.showFirstColumn,
-                    showLastColumn=s.showLastColumn,
-                    showRowStripes=s.showRowStripes,
-                    showColumnStripes=s.showColumnStripes,
-                )
-            ws_new.add_table(new_t)
-    except Exception:
-        pass
+    q2a   = _load_sheet(stage, "Q2A_Main")
+    q2jf  = _load_sheet(stage, "Q2A_JobFunc_Q4")
+    q2b   = _load_sheet(stage, "Q2B")
 
-    return name
+    q3    = _load_sheet(stage, "Q3")
+    q4    = _load_sheet(stage, "Q4")
+    q5    = _load_sheet(stage, "Q5")
 
-def copy_workbook_sheets(src_xlsx: Path, dest_wb: Workbook) -> int:
-    """Copy all sheets from src_xlsx to dest_wb preserving styles."""
-    try:
-        wb = load_workbook(src_xlsx, data_only=False)  # keep formulas
-    except Exception as e:
-        print(f"  -> Could not open {src_xlsx.name}: {e}")
-        return 0
-    count = 0
-    for nm in wb.sheetnames:
-        copy_sheet_with_styles(wb[nm], dest_wb, nm)
-        count += 1
-    try: wb.close()
-    except Exception: pass
-    return count
+    if all(d.empty for d in [q1a,q1jf,q1b,q2a,q2jf,q2b,q3,q4,q5]):
+        print("[WARN] No QC-able sheets in the staging workbook.")
+        return
 
-def remove_about_sheet(xlsx: Path) -> None:
-    """Delete any sheet named exactly '_About' inside a workbook."""
-    try:
-        wb = load_workbook(xlsx)
-        if "_About" in wb.sheetnames:
-            del wb["_About"]
-            wb.save(xlsx)
-        wb.close()
-    except Exception:
-        pass
+    # current quarter from whatever is present
+    qseries = pd.concat([d["quarter"] for d in [q1a,q1jf,q1b,q2a,q2jf,q2b,q3,q4,q5] if not d.empty], ignore_index=True)
+    current_q = normalize_quarter_label(qseries)
 
-# ---------------------------
-# Main interactive runner
-# ---------------------------
+    # decide year (default = modal year across available sheets)
+    year = _pick_year(q1a,q1jf,q1b,q2a,q2jf,q2b,q3,q4,q5, explicit=year)
+    if year is None:
+        print("[ERROR] Could not determine the target year.")
+        return
+
+    # filter current year
+    def _fy(d):
+        return d[d["year"]==year] if (d is not None and not d.empty and "year" in d.columns) else d
+
+    q1a  = _fy(q1a);  q1jf = _fy(q1jf); q1b  = _fy(q1b)
+    q2a  = _fy(q2a);  q2jf = _fy(q2jf); q2b  = _fy(q2b)
+    q3   = _fy(q3);   q4   = _fy(q4);   q5   = _fy(q5)
+
+    # prior data (prior year only, per question)
+    def _prior_df(p: Path | None, sheet: str) -> pd.DataFrame | None:
+        if not p: return None
+        df = _load_sheet(p, sheet)
+        if df.empty: return None
+        if "year" in df.columns:
+            return df[df["year"]==(year-1)]
+        return df
+
+    # thresholds (mom, qoq, yoy, abs)
+    mom1,qoq1,yoy1,abs1 = th_q1
+    mom2,qoq2,yoy2,abs2 = th_q2
+    mom3,qoq3,yoy3,abs3 = th_q3
+    mom4,qoq4,yoy4,abs4 = th_q4
+    mom5,qoq5,yoy5,abs5 = th_q5
+
+    # create single workbook, write all QC sheets using qc_common so style is identical
+    wb = new_empty_workbook()
+
+    # ===== Q1 =====
+    if not q1a.empty:
+        mshow = [m for m in _months_present(q1a, current_q)]
+        write_qc_sheet(QCArgs(
+            sheet_name="QC_Q1A_Main",
+            df=q1a, wb=wb, year=year, current_q=current_q,
+            prior_df=_prior_df(prior_q1, "Q1A_Main"),
+            months_to_show=mshow,
+            include_job_function=False,
+            mom_pct_threshold=mom1, qoq_pct_threshold=qoq1, yoy_pct_threshold=yoy1, abs_cutoff=abs1
+        ))
+    if not q1jf.empty:
+        write_qc_sheet(QCArgs(
+            sheet_name="QC_Q1A_JobFunc_Q4",
+            df=q1jf, wb=wb, year=year, current_q=current_q,
+            prior_df=_prior_df(prior_q1, "Q1A_JobFunc_Q4"),
+            months_to_show=[],  # value-based (Q4) in df['value']
+            include_job_function=True, yoy_quarters=["Q4"],
+            mom_pct_threshold=mom1, qoq_pct_threshold=qoq1, yoy_pct_threshold=yoy1, abs_cutoff=abs1
+        ))
+    if not q1b.empty:
+        poss = [m for m in ["Jun","Dec"] if m in q1b.columns]
+        mshow = [m for m in poss if m in months_up_to(current_q)]
+        write_qc_sheet(QCArgs(
+            sheet_name="QC_Q1B",
+            df=q1b, wb=wb, year=year, current_q=current_q,
+            prior_df=_prior_df(prior_q1, "Q1B"),
+            months_to_show=mshow,
+            include_job_function=False,
+            mom_pct_threshold=mom1, qoq_pct_threshold=qoq1, yoy_pct_threshold=yoy1, abs_cutoff=abs1
+        ))
+
+    # ===== Q2 =====
+    if not q2a.empty:
+        mshow = [m for m in _months_present(q2a, current_q)]
+        write_qc_sheet(QCArgs(
+            sheet_name="QC_Q2A_Main",
+            df=q2a, wb=wb, year=year, current_q=current_q,
+            prior_df=_prior_df(prior_q2, "Q2A_Main"),
+            months_to_show=mshow,
+            include_job_function=False,
+            mom_pct_threshold=mom2, qoq_pct_threshold=qoq2, yoy_pct_threshold=yoy2, abs_cutoff=abs2
+        ))
+    if not q2jf.empty:
+        write_qc_sheet(QCArgs(
+            sheet_name="QC_Q2A_JobFunc_Q4",
+            df=q2jf, wb=wb, year=year, current_q=current_q,
+            prior_df=_prior_df(prior_q2, "Q2A_JobFunc_Q4"),
+            months_to_show=[], include_job_function=True, yoy_quarters=["Q4"],
+            mom_pct_threshold=mom2, qoq_pct_threshold=qoq2, yoy_pct_threshold=yoy2, abs_cutoff=abs2
+        ))
+    if not q2b.empty:
+        poss = [m for m in ["Jun","Dec"] if m in q2b.columns]
+        mshow = [m for m in poss if m in months_up_to(current_q)]
+        write_qc_sheet(QCArgs(
+            sheet_name="QC_Q2B",
+            df=q2b, wb=wb, year=year, current_q=current_q,
+            prior_df=_prior_df(prior_q2, "Q2B"),
+            months_to_show=mshow,
+            include_job_function=False,
+            mom_pct_threshold=mom2, qoq_pct_threshold=qoq2, yoy_pct_threshold=yoy2, abs_cutoff=abs2
+        ))
+
+    # ===== Q3 (no subquestion, no job function) =====
+    if not q3.empty:
+        mshow = [m for m in _months_present(q3, current_q)]
+        if "subquestion" not in q3.columns:
+            q3 = q3.copy(); q3["subquestion"] = ""
+        write_qc_sheet(QCArgs(
+            sheet_name="QC_Q3",
+            df=q3, wb=wb, year=year, current_q=current_q,
+            prior_df=_prior_df(prior_q3, "Q3"),
+            months_to_show=mshow, include_job_function=False,
+            mom_pct_threshold=mom3, qoq_pct_threshold=qoq3, yoy_pct_threshold=yoy3, abs_cutoff=abs3
+        ))
+
+    # ===== Q4 =====
+    if not q4.empty:
+        mshow = [m for m in _months_present(q4, current_q)]
+        write_qc_sheet(QCArgs(
+            sheet_name="QC_Q4",
+            df=q4, wb=wb, year=year, current_q=current_q,
+            prior_df=_prior_df(prior_q4, "Q4"),
+            months_to_show=mshow, include_job_function=False,
+            mom_pct_threshold=mom4, qoq_pct_threshold=qoq4, yoy_pct_threshold=yoy4, abs_cutoff=abs4
+        ))
+
+    # ===== Q5 =====
+    if not q5.empty:
+        mshow = [m for m in _months_present(q5, current_q)]
+        write_qc_sheet(QCArgs(
+            sheet_name="QC_Q5",
+            df=q5, wb=wb, year=year, current_q=current_q,
+            prior_df=_prior_df(prior_q5, "Q5"),
+            months_to_show=mshow, include_job_function=False,
+            mom_pct_threshold=mom5, qoq_pct_threshold=qoq5, yoy_pct_threshold=yoy5, abs_cutoff=abs5
+        ))
+
+    # Single About sheet at the end
+    append_about_sheet_last(wb, "RLMS – QC (All Questions)", year, current_q)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(out)
+    print(f"\n[DONE] {out}\n")
+
 def main() -> int:
-    print("\n=== RLMS QC – Interactive Runner (Styled, Single About) ===\n")
+    print("=== RLMS QC – Build ALL Questions (Interactive) ===")
 
-    stage_path = ask_path("Path to CURRENT staging workbook (.xlsx): ", must_exist=True)
-    out_path   = ask_path("Path to OUTPUT merged QC workbook (.xlsx): ", must_exist=False)
-    if out_path.suffix.lower() != ".xlsx":
-        out_path = out_path.with_suffix(".xlsx")
+    stage = _ask_path("Path to CURRENT staging workbook (.xlsx): ", required=True)
+    out   = Path(input("Path to OUTPUT QC workbook (.xlsx): ").strip() or "QC_All_Output.xlsx")
 
-    run_q1 = ask_yesno("Run QC for Question 1?", True)
-    run_q2 = ask_yesno("Run QC for Question 2?", True)
-    run_q3 = ask_yesno("Run QC for Question 3?", True)
-    run_q4 = ask_yesno("Run QC for Question 4?", True)
-    run_q5 = ask_yesno("Run QC for Question 5?", True)
+    # prior staging (optional, press Enter to skip)
+    print("\n--- Optional: prior staging workbooks (used for YoY) ---")
+    prior_q1 = _ask_path("  Prior staging for Q1 (.xlsx) [Enter to skip]: ", required=False)
+    prior_q2 = _ask_path("  Prior staging for Q2 (.xlsx) [Enter to skip]: ", required=False)
+    prior_q3 = _ask_path("  Prior staging for Q3 (.xlsx) [Enter to skip]: ", required=False)
+    prior_q4 = _ask_path("  Prior staging for Q4 (.xlsx) [Enter to skip]: ", required=False)
+    prior_q5 = _ask_path("  Prior staging for Q5 (.xlsx) [Enter to skip]: ", required=False)
 
-    print("\n(Optional) Prior stagings for YoY (blank = skip):")
-    prior_q1 = ask_path("  Prior staging for Q1: ", must_exist=True, allow_blank=True)
-    prior_q2 = ask_path("  Prior staging for Q2: ", must_exist=True, allow_blank=True)
-    prior_q3 = ask_path("  Prior staging for Q3: ", must_exist=True, allow_blank=True)
-    prior_q4 = ask_path("  Prior staging for Q4: ", must_exist=True, allow_blank=True)
-    prior_q5 = ask_path("  Prior staging for Q5: ", must_exist=True, allow_blank=True)
+    # thresholds (defaults shown; you can customize per question)
+    print("\n--- Thresholds (press Enter to accept defaults) ---")
+    def ask_block(tag: str, d_mom=0.25, d_qoq=0.25, d_yoy=0.25, d_abs=50.0):
+        print(f"  {tag}:")
+        mom = _ask_float("    MoM % threshold", d_mom)
+        qoq = _ask_float("    QoQ % threshold", d_qoq)
+        yoy = _ask_float("    YoY % threshold", d_yoy)
+        abv = _ask_float("    Absolute cutoff", d_abs)
+        return (mom, qoq, yoy, abv)
 
-    print("\nThresholds per question (Enter to keep defaults):")
-    def ask_th(tag: str, mom=0.25, qoq=0.25, yoy=0.25, absc=50.0):
-        print(f"  • {tag}")
-        return {
-            "mom": ask_float("    MoM % threshold", mom),
-            "qoq": ask_float("    QoQ % threshold", qoq),
-            "yoy": ask_float("    YoY % threshold", yoy),
-            "abs": ask_float("    Absolute diff cutoff", absc),
-        }
+    th_q1 = ask_block("Q1", 0.25, 0.25, 0.25, 50.0)
+    th_q2 = ask_block("Q2", 0.25, 0.25, 0.25, 50.0)
+    th_q3 = ask_block("Q3", 0.25, 0.25, 0.25, 50.0)
+    th_q4 = ask_block("Q4", 0.25, 0.25, 0.25, 50.0)
+    th_q5 = ask_block("Q5", 0.25, 0.25, 0.25, 50.0)
 
-    TH: Dict[str, Dict[str,float]] = {}
-    if run_q1: TH["Q1"] = ask_th("Q1")
-    if run_q2: TH["Q2"] = ask_th("Q2")
-    if run_q3: TH["Q3"] = ask_th("Q3")
-    if run_q4: TH["Q4"] = ask_th("Q4")
-    if run_q5: TH["Q5"] = ask_th("Q5")
+    # optional: lock to a specific year (else auto from staging)
+    y = _ask_int("\nTarget YEAR (leave blank to auto-detect from staging)", None)
 
-    tmpdir = Path(tempfile.mkdtemp(prefix="qc_all_"))
-    print(f"\n[INFO] Working directory: {tmpdir}")
-
-    jobs: List[tuple] = []
-    def add_job(script: str, tag: str, prior: Optional[Path]):
-        out = tmpdir / f"{tag}.xlsx"
-        args = [
-            "--stage", str(stage_path), "--out", str(out),
-            "--mom-threshold", str(TH[tag]["mom"]),
-            "--qoq-threshold", str(TH[tag]["qoq"]),
-            "--yoy-threshold", str(TH[tag]["yoy"]),
-            "--abs-cutoff",    str(TH[tag]["abs"]),
-        ]
-        if prior: args += ["--prior-stage", str(prior)]
-        jobs.append((script, out, args, tag))
-
-    if run_q1: add_job("qc_q1.py", "Q1", prior_q1)
-    if run_q2: add_job("qc_q2.py", "Q2", prior_q2)
-    if run_q3: add_job("qc_q3.py", "Q3", prior_q3)
-    if run_q4: add_job("qc_q4.py", "Q4", prior_q4)
-    if run_q5: add_job("qc_q5.py", "Q5", prior_q5)
-
-    produced: List[Path] = []
-    for script, out_xlsx, args, tag in jobs:
-        print(f"\n[RUN] {tag} → {script}")
-        if not Path(script).exists():
-            print(f"  -> {script} not found. Skipping {tag}.")
-            continue
-        ok = run_subprocess(script, args)
-        if ok and out_xlsx.exists():
-            # remove per-question _About before merging
-            remove_about_sheet(out_xlsx)
-            produced.append(out_xlsx)
-        else:
-            print(f"  -> {tag} produced no workbook.")
-
-    if not produced:
-        print("\n[WARN] Nothing to merge.")
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        return 0
-
-    # Merge with full styling
-    merged = Workbook()
-    merged.remove(merged.active)
-
-    print(f"\n[MERGE] Copying styled sheets into: {out_path.name}")
-    for p in produced:
-        copied = copy_workbook_sheets(p, merged)
-        print(f"  -> {copied} sheet(s) from {p.name}")
-
-    # Single About at end
-    about = merged.create_sheet("_About")
-    about["A1"] = "RLMS – QC (All Questions)"; about["A1"].style = "Title"
-    about["A3"] = "Current staging"; about["B3"] = str(stage_path)
-    about["A4"] = "This file";       about["B4"] = str(out_path)
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    merged.save(out_path)
-    print(f"\n[DONE] Wrote merged QC workbook → {out_path}")
-
-    if ask_yesno("Delete temporary per-question QC files?", True):
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        print("  -> Temp cleaned.")
+    # run
+    qc_make_all(
+        stage=stage, out=out,
+        prior_q1=prior_q1, prior_q2=prior_q2, prior_q3=prior_q3, prior_q4=prior_q4, prior_q5=prior_q5,
+        th_q1=th_q1, th_q2=th_q2, th_q3=th_q3, th_q4=th_q4, th_q5=th_q5,
+        year=y
+    )
     return 0
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
