@@ -1,0 +1,139 @@
+# make_bi_source.py
+from __future__ import annotations
+import argparse
+from pathlib import Path
+import pandas as pd
+
+MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+
+# Optional: paste your ENTITY_TO_TYPE dict here if you want "entity_type" in the export
+ENTITY_TO_TYPE = {}  # keep empty if you don't need it in Power BI
+
+def _read_sheet(path: Path, sheet: str) -> pd.DataFrame:
+    try:
+        return pd.read_excel(path, sheet_name=sheet, engine="openpyxl")
+    except Exception:
+        return pd.DataFrame()
+
+def _long_from_months(df: pd.DataFrame, months_present: list[str]) -> pd.DataFrame:
+    # melt months to Month/Amount
+    if not months_present:
+        return pd.DataFrame()
+    keep = [c for c in ["entity_name","year","quarter","question","subquestion","worker_category","job_function"] if c in df.columns]
+    mdf = df[keep + months_present].copy()
+    long = mdf.melt(id_vars=keep, value_vars=months_present, var_name="month", value_name="Amount")
+    return long
+
+def _coalesce_entity_type(df: pd.DataFrame) -> pd.DataFrame:
+    if not ENTITY_TO_TYPE:
+        return df
+    df = df.copy()
+    df["_E"] = df["entity_name"].astype(str).str.upper().str.strip()
+    df["entity_type"] = df["_E"].map(ENTITY_TO_TYPE).fillna("Unknown")
+    df.drop(columns=["_E"], inplace=True)
+    return df
+
+def normalize_question(path: Path, sheet: str) -> pd.DataFrame:
+    """
+    Convert a staging sheet to long fact rows with standard columns:
+    entity_name, entity_type(opt), year, quarter, question, subquestion, worker_category, job_function,
+    month, Amount, source_sheet
+    """
+    raw = _read_sheet(path, sheet)
+    if raw.empty: 
+        return pd.DataFrame()
+
+    # Figure which months exist in the sheet (Q1B/Q2B may have only Jun/Dec)
+    months_present = [m for m in MONTHS if m in raw.columns]
+
+    # Job function Q4 sheets have a single 'value' column (no months)
+    is_jobfunc = ("JobFunc" in sheet) or ("JobFunc" in "".join(raw.columns))
+
+    if is_jobfunc:
+        # Expect columns: entity_name, year, quarter, subquestion, worker_category, job_function, value
+        need = ["entity_name","year","quarter","subquestion","worker_category","job_function","value"]
+        for c in need:
+            if c not in raw.columns:
+                raw[c] = "" if c in ("subquestion","worker_category","job_function") else 0
+        out = raw.rename(columns={"value":"Amount"}).copy()
+        # Put Q4 as a pseudo-month (so the timeline can still place it; PB will mostly use quarter/page filters)
+        out["month"] = "Q4"
+        out["question"] = out.get("question", sheet)
+        out["source_sheet"] = sheet
+        out = out[["entity_name","year","quarter","question","subquestion","worker_category","job_function","month","Amount","source_sheet"]]
+        return _coalesce_entity_type(out)
+
+    # Normal (monthly) sheets
+    long = _long_from_months(raw, months_present)
+    if long.empty:
+        return pd.DataFrame()
+
+    # Ensure presence of optional columns
+    for c in ["question","subquestion","worker_category","job_function"]:
+        if c not in long.columns:
+            long[c] = ""
+
+    long["question"] = long.get("question", sheet)
+    long["source_sheet"] = sheet
+    long = long[["entity_name","year","quarter","question","subquestion","worker_category","job_function","month","Amount","source_sheet"]]
+    return _coalesce_entity_type(long)
+
+def main():
+    ap = argparse.ArgumentParser(description="Build a single BI-ready fact CSV from staging_all.xlsx")
+    ap.add_argument("--stage", required=True, help="Path to staging_all.xlsx")
+    ap.add_argument("--out", required=True, help="Output CSV path, e.g., RLMS_Fact.csv")
+    args = ap.parse_args()
+
+    stage_path = Path(args.stage)
+    if not stage_path.exists():
+        raise SystemExit(f"[ERROR] Staging not found: {stage_path}")
+
+    # List the sheets we expect; we’ll read whatever exists
+    expected = [
+        "Q1A_Main","Q1A_JobFunc_Q4","Q1B",
+        "Q2A_Main","Q2A_JobFunc_Q4","Q2B",
+        "Q3","Q4","Q5"
+    ]
+
+    frames: list[pd.DataFrame] = []
+    # Try to discover actual sheet names too (avoid errors if some missing)
+    try:
+        xls = pd.ExcelFile(stage_path, engine="openpyxl")
+        available = set(xls.sheet_names)
+    except Exception:
+        available = set(expected)
+
+    for sh in expected:
+        if sh in available:
+            df = normalize_question(stage_path, sh)
+            if not df.empty:
+                frames.append(df)
+
+    if not frames:
+        raise SystemExit("[WARN] No usable sheets found; nothing to write.")
+
+    fact = pd.concat(frames, ignore_index=True)
+    # Standardize dtypes
+    fact["year"] = pd.to_numeric(fact["year"], errors="coerce").astype("Int64")
+    # Amount numeric
+    fact["Amount"] = pd.to_numeric(fact["Amount"], errors="coerce").fillna(0)
+
+    # Optional time helpers for Power BI
+    # MonthNum and YearMonth only when month is an actual month (Jan..Dec)
+    month_to_num = {m:i+1 for i,m in enumerate(MONTHS)}
+    fact["MonthNum"] = fact["month"].map(month_to_num)
+    fact["YearMonth"] = fact.apply(
+        lambda r: f"{int(r['year'])}-{int(r['MonthNum']):02d}" if pd.notna(r["year"]) and pd.notna(r["MonthNum"]) else None,
+        axis=1
+    )
+
+    # Sort for sanity
+    fact = fact.sort_values(["entity_name","question","subquestion","worker_category","job_function","year","MonthNum","month"], kind="mergesort")
+
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fact.to_csv(out, index=False, encoding="utf-8-sig")
+    print(f"[DONE] Wrote {out} with {len(fact):,} rows.")
+
+if __name__ == "__main__":
+    main()
