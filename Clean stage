@@ -1,69 +1,257 @@
-import os
-import pandas as pd
+#!/usr/bin/env python3
+from __future__ import annotations
+import os, sys, tempfile, shutil
 from pathlib import Path
-from qc_common import new_empty_workbook, append_about_sheet_last
-from qc_q1 import run_qc_q1
-from qc_q2 import run_qc_q2
-from qc_q3 import run_qc_q3
-from qc_q4 import run_qc_q4
-from qc_q5 import run_qc_q5
+import subprocess
+from typing import Dict, Optional, List
+from openpyxl import load_workbook, Workbook
 
-# ================
-# CONFIGURATION
-# ================
-STAGE_DIR = r"C:\Users\YourName\OneDrive - Bank Negara Malaysia\RLMS\staging_2026"
-PRIOR_STAGE_DIR = r"C:\Users\YourName\OneDrive - Bank Negara Malaysia\RLMS\staging_2025"
-OUT_FILE = r"C:\Users\YourName\OneDrive - Bank Negara Malaysia\RLMS\Submission\QC Template\QC_LMS_2026.xlsx"
-YEAR = 2026
-CURRENT_Q = "Q2"  # Adjust based on your staging (Q1..Q4)
+# ---------------------------
+# Helpers (prompt + defaults)
+# ---------------------------
+def ask_path(prompt: str, must_exist: bool = False, allow_blank: bool = False) -> Optional[Path]:
+    while True:
+        p = input(prompt).strip()
+        if allow_blank and p == "":
+            return None
+        path = Path(p)
+        if not must_exist:
+            return path
+        if path.exists():
+            return path
+        print("  -> Not found. Try again.")
 
-# ================
-# INITIALIZE WORKBOOK
-# ================
-wb = new_empty_workbook()
+def ask_float(prompt: str, default: float) -> float:
+    s = input(f"{prompt} [default {default}]: ").strip()
+    if s == "":
+        return default
+    try:
+        return float(s)
+    except Exception:
+        print("  -> Invalid number. Using default.")
+        return default
 
-# ================
-# GENERATE EACH QC SHEET
-# ================
-print("🚀 Generating QC sheets into one workbook...")
+def ask_yesno(prompt: str, default_yes: bool = True) -> bool:
+    d = "Y/n" if default_yes else "y/N"
+    s = input(f"{prompt} ({d}): ").strip().lower()
+    if s == "":
+        return default_yes
+    return s in ("y", "yes")
 
-try:
-    run_qc_q1(stage_dir=STAGE_DIR, prior_stage=PRIOR_STAGE_DIR, wb=wb, year=YEAR, current_q=CURRENT_Q)
-    print("✅ Q1 done.")
-except Exception as e:
-    print(f"⚠️ Skipped Q1: {e}")
+def run_subprocess(pyfile: str, args: List[str]) -> bool:
+    """Run `python pyfile args...`. Return True on success."""
+    exe = sys.executable or "python"
+    cmd = [exe, pyfile] + args
+    try:
+        print("  ->", " ".join([str(c) for c in cmd]))
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        print(res.stdout)
+        return res.returncode == 0
+    except Exception as e:
+        print(f"  -> Failed to run {pyfile}: {e}")
+        return False
 
-try:
-    run_qc_q2(stage_dir=STAGE_DIR, prior_stage=PRIOR_STAGE_DIR, wb=wb, year=YEAR, current_q=CURRENT_Q)
-    print("✅ Q2 done.")
-except Exception as e:
-    print(f"⚠️ Skipped Q2: {e}")
+def copy_sheets(src_xlsx: Path, dest_wb: Workbook, prefix: Optional[str] = None) -> int:
+    """Copy all sheets from src into dest (no overwrite). Returns #sheets copied."""
+    try:
+        wb = load_workbook(src_xlsx, data_only=True)
+    except Exception as e:
+        print(f"  -> Could not open {src_xlsx.name}: {e}")
+        return 0
+    copied = 0
+    for name in wb.sheetnames:
+        ws_src = wb[name]
+        # create new sheet name (optionally prefixed)
+        new_name = f"{prefix}_{name}" if prefix else name
+        # ensure unique
+        base = new_name
+        k = 1
+        while new_name in dest_wb.sheetnames:
+            new_name = f"{base}_{k}"
+            k += 1
+        ws_new = dest_wb.create_sheet(new_name)
+        for r in ws_src.iter_rows():
+            for cell in r:
+                ws_new.cell(row=cell.row, column=cell.col_idx, value=cell.value)
+        # copy a few simple styles for headers (lightweight)
+        # (full style copy is heavy and tends to trigger Excel repairs)
+        copied += 1
+    try:
+        wb.close()
+    except Exception:
+        pass
+    return copied
 
-try:
-    run_qc_q3(stage_dir=STAGE_DIR, prior_stage=PRIOR_STAGE_DIR, wb=wb, year=YEAR, current_q=CURRENT_Q)
-    print("✅ Q3 done.")
-except Exception as e:
-    print(f"⚠️ Skipped Q3: {e}")
+# ---------------------------
+# Main interactive runner
+# ---------------------------
+def main() -> int:
+    print("\n=== RLMS QC – Interactive Runner (Q1–Q5) ===\n")
 
-try:
-    run_qc_q4(stage_dir=STAGE_DIR, prior_stage=PRIOR_STAGE_DIR, wb=wb, year=YEAR, current_q=CURRENT_Q)
-    print("✅ Q4 done.")
-except Exception as e:
-    print(f"⚠️ Skipped Q4: {e}")
+    # 1) Core inputs
+    stage_path = ask_path("Path to CURRENT staging workbook (.xlsx): ", must_exist=True)
+    out_path   = ask_path("Path to OUTPUT QC workbook (.xlsx): ", must_exist=False)
+    if out_path.suffix.lower() != ".xlsx":
+        out_path = out_path.with_suffix(".xlsx")
 
-try:
-    run_qc_q5(stage_dir=STAGE_DIR, prior_stage=PRIOR_STAGE_DIR, wb=wb, year=YEAR, current_q=CURRENT_Q)
-    print("✅ Q5 done.")
-except Exception as e:
-    print(f"⚠️ Skipped Q5: {e}")
+    # 2) Which questions to run?
+    run_q1 = ask_yesno("Run QC for Question 1?", True)
+    run_q2 = ask_yesno("Run QC for Question 2?", True)
+    run_q3 = ask_yesno("Run QC for Question 3?", True)
+    run_q4 = ask_yesno("Run QC for Question 4?", True)
+    run_q5 = ask_yesno("Run QC for Question 5?", True)
 
-# ================
-# ADD ABOUT SHEET
-# ================
-append_about_sheet_last(wb, title="Labour Market Statistics QC Template", year=YEAR, qlabel=CURRENT_Q)
+    # 3) Prior staging per question (optional)
+    print("\n(Optional) Provide PRIOR staging workbook to enable YoY. Leave blank to skip.")
+    prior_q1 = ask_path("  Prior staging for Q1 (.xlsx) [blank=skip]: ", must_exist=True, allow_blank=True)
+    prior_q2 = ask_path("  Prior staging for Q2 (.xlsx) [blank=skip]: ", must_exist=True, allow_blank=True)
+    prior_q3 = ask_path("  Prior staging for Q3 (.xlsx) [blank=skip]: ", must_exist=True, allow_blank=True)
+    prior_q4 = ask_path("  Prior staging for Q4 (.xlsx) [blank=skip]: ", must_exist=True, allow_blank=True)
+    prior_q5 = ask_path("  Prior staging for Q5 (.xlsx) [blank=skip]: ", must_exist=True, allow_blank=True)
 
-# ================
-# SAVE FILE
-# ================
-wb.save(OUT_FILE)
-print(f"\n🎉 All QC sheets saved to {OUT_FILE}")
+    # 4) Thresholds per question (tuneable)
+    print("\nEnter thresholds (press Enter to accept defaults).")
+    def ask_th(name: str, mom=0.25, qoq=0.25, yoy=0.25, absc=50.0) -> Dict[str,float]:
+        print(f"  • {name}")
+        return {
+            "mom": ask_float("    MoM % threshold", mom),
+            "qoq": ask_float("    QoQ % threshold", qoq),
+            "yoy": ask_float("    YoY % threshold", yoy),
+            "abs": ask_float("    Absolute diff cutoff", absc),
+        }
+
+    TH: Dict[str, Dict[str,float]] = {}
+    if run_q1: TH["Q1"] = ask_th("Q1", mom=0.25, qoq=0.25, yoy=0.25, absc=50)
+    if run_q2: TH["Q2"] = ask_th("Q2", mom=0.25, qoq=0.25, yoy=0.25, absc=50)
+    if run_q3: TH["Q3"] = ask_th("Q3", mom=0.25, qoq=0.25, yoy=0.25, absc=50)
+    if run_q4: TH["Q4"] = ask_th("Q4", mom=0.25, qoq=0.25, yoy=0.25, absc=50)
+    if run_q5: TH["Q5"] = ask_th("Q5", mom=0.25, qoq=0.25, yoy=0.25, absc=50)
+
+    # 5) Temp folder for per-question outputs
+    tmpdir = Path(tempfile.mkdtemp(prefix="qc_all_"))
+    print(f"\n[INFO] Working in: {tmpdir}")
+
+    # 6) Fire each QC script → temp workbook
+    jobs = []
+    if run_q1:
+        out_q1 = tmpdir / "QC_Q1.xlsx"
+        args = [
+            "--stage", str(stage_path),
+            "--out",   str(out_q1),
+            "--mom-threshold", str(TH["Q1"]["mom"]),
+            "--qoq-threshold", str(TH["Q1"]["qoq"]),
+            "--yoy-threshold", str(TH["Q1"]["yoy"]),
+            "--abs-cutoff",    str(TH["Q1"]["abs"]),
+        ]
+        if prior_q1: args += ["--prior-stage", str(prior_q1)]
+        jobs.append(("qc_q1.py", args, out_q1, "Q1"))
+
+    if run_q2:
+        out_q2 = tmpdir / "QC_Q2.xlsx"
+        args = [
+            "--stage", str(stage_path),
+            "--out",   str(out_q2),
+            "--mom-threshold", str(TH["Q2"]["mom"]),
+            "--qoq-threshold", str(TH["Q2"]["qoq"]),
+            "--yoy-threshold", str(TH["Q2"]["yoy"]),
+            "--abs-cutoff",    str(TH["Q2"]["abs"]),
+        ]
+        if prior_q2: args += ["--prior-stage", str(prior_q2)]
+        jobs.append(("qc_q2.py", args, out_q2, "Q2"))
+
+    if run_q3:
+        out_q3 = tmpdir / "QC_Q3.xlsx"
+        args = [
+            "--stage", str(stage_path),
+            "--out",   str(out_q3),
+            "--mom-threshold", str(TH["Q3"]["mom"]),
+            "--qoq-threshold", str(TH["Q3"]["qoq"]),
+            "--yoy-threshold", str(TH["Q3"]["yoy"]),
+            "--abs-cutoff",    str(TH["Q3"]["abs"]),
+        ]
+        if prior_q3: args += ["--prior-stage", str(prior_q3)]
+        jobs.append(("qc_q3.py", args, out_q3, "Q3"))
+
+    if run_q4:
+        out_q4 = tmpdir / "QC_Q4.xlsx"
+        args = [
+            "--stage", str(stage_path),
+            "--out",   str(out_q4),
+            "--mom-threshold", str(TH["Q4"]["mom"]),
+            "--qoq-threshold", str(TH["Q4"]["qoq"]),
+            "--yoy-threshold", str(TH["Q4"]["yoy"]),
+            "--abs-cutoff",    str(TH["Q4"]["abs"]),
+        ]
+        if prior_q4: args += ["--prior-stage", str(prior_q4)]
+        jobs.append(("qc_q4.py", args, out_q4, "Q4"))
+
+    if run_q5:
+        out_q5 = tmpdir / "QC_Q5.xlsx"
+        args = [
+            "--stage", str(stage_path),
+            "--out",   str(out_q5),
+            "--mom-threshold", str(TH["Q5"]["mom"]),
+            "--qoq-threshold", str(TH["Q5"]["qoq"]),
+            "--yoy-threshold", str(TH["Q5"]["yoy"]),
+            "--abs-cutoff",    str(TH["Q5"]["abs"]),
+        ]
+        if prior_q5: args += ["--prior-stage", str(prior_q5)]
+        jobs.append(("qc_q5.py", args, out_q5, "Q5"))
+
+    # 7) Execute
+    produced: List[Path] = []
+    for script, args, out_file, tag in jobs:
+        print(f"\n[RUN] {tag} → {script}")
+        if not Path(script).exists():
+            print(f"  -> {script} not found. Skipping {tag}.")
+            continue
+        ok = run_subprocess(script, args)
+        if ok and out_file.exists():
+            produced.append(out_file)
+        else:
+            print(f"  -> {tag} produced no workbook.")
+
+    if not produced:
+        print("\n[WARN] No QC files were produced. Nothing to merge.")
+        try: shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception: pass
+        return 0
+
+    # 8) Merge all QC sheets into one workbook
+    print(f"\n[MERGE] Combining {len(produced)} QC workbooks → {out_path.name}")
+    dest = Workbook()
+    # remove default sheet
+    dest.remove(dest.active)
+
+    for p in produced:
+        # Copy every sheet (keeps each question’s tab names)
+        copied = copy_sheets(p, dest)
+        print(f"  -> Copied {copied} sheets from {p.name}")
+
+    # Add a simple About sheet at end
+    about = dest.create_sheet("_About")
+    about["A1"] = "RLMS – QC (All)"
+    about["A1"].style = "Title"
+    about["A3"] = "Staging"
+    about["B3"] = str(stage_path)
+    about["A4"] = "Generated by"
+    about["B4"] = "qc_all_interactive.py"
+    about["A6"] = "Notes"
+    about["B6"] = "Thresholds were chosen interactively per question at runtime."
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    dest.save(out_path)
+    print(f"\n[DONE] Wrote merged QC workbook → {out_path}")
+
+    # 9) Cleanup temp
+    if ask_yesno("\nDelete temporary per-question QC files?", True):
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            print("  -> Temp cleaned.")
+        except Exception as e:
+            print(f"  -> Could not delete temp: {e}")
+
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
