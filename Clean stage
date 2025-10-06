@@ -5,9 +5,10 @@ from pathlib import Path
 import subprocess
 from typing import Dict, Optional, List
 from openpyxl import load_workbook, Workbook
+from openpyxl.worksheet.table import Table, TableStyleInfo
 
 # ---------------------------
-# Helpers (prompt + defaults)
+# Simple prompts
 # ---------------------------
 def ask_path(prompt: str, must_exist: bool = False, allow_blank: bool = False) -> Optional[Path]:
     while True:
@@ -15,9 +16,7 @@ def ask_path(prompt: str, must_exist: bool = False, allow_blank: bool = False) -
         if allow_blank and p == "":
             return None
         path = Path(p)
-        if not must_exist:
-            return path
-        if path.exists():
+        if not must_exist or path.exists():
             return path
         print("  -> Not found. Try again.")
 
@@ -39,7 +38,6 @@ def ask_yesno(prompt: str, default_yes: bool = True) -> bool:
     return s in ("y", "yes")
 
 def run_subprocess(pyfile: str, args: List[str]) -> bool:
-    """Run `python pyfile args...`. Return True on success."""
     exe = sys.executable or "python"
     cmd = [exe, pyfile] + args
     try:
@@ -51,31 +49,127 @@ def run_subprocess(pyfile: str, args: List[str]) -> bool:
         print(f"  -> Failed to run {pyfile}: {e}")
         return False
 
-def copy_sheets(src_xlsx: Path, dest_wb: Workbook, prefix: Optional[str] = None) -> int:
-    """Copy all sheets from src into dest (no overwrite). Returns #sheets copied."""
+# ---------------------------
+# Deep sheet copy (keeps styling & tables)
+# ---------------------------
+def _unique_sheet_name(dest_wb: Workbook, desired: str) -> str:
+    base = desired[:31]  # Excel name limit
+    name = base
+    k = 1
+    while name in dest_wb.sheetnames:
+        suffix = f"_{k}"
+        name = (base[:31-len(suffix)] + suffix)
+        k += 1
+    return name
+
+def _unique_table_name(existing_names: set, base: str) -> str:
+    base = "".join(ch if ch.isalnum() else "_" for ch in base)
+    if len(base) == 0:
+        base = "Table"
+    name = base
+    k = 1
+    while name in existing_names:
+        name = f"{base}_{k}"
+        k += 1
+    existing_names.add(name)
+    return name
+
+def copy_sheet_with_styles(ws_src, dest_wb: Workbook, name_hint: Optional[str] = None) -> str:
+    """
+    Create a new sheet in dest_wb that is a styled copy of ws_src:
+      - values, number formats, fonts, fills, alignment, borders
+      - column widths, row heights
+      - freeze panes
+      - conditional formatting
+      - Excel tables (with unique names)
+    Returns new sheet name.
+    """
+    new_name = _unique_sheet_name(dest_wb, name_hint or ws_src.title)
+    ws_new = dest_wb.create_sheet(new_name)
+
+    # 1) Basic grid (values + core styles)
+    max_row = ws_src.max_row
+    max_col = ws_src.max_column
+
+    for row in ws_src.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col):
+        for cell in row:
+            c = ws_new.cell(row=cell.row, column=cell.col_idx, value=cell.value)
+            # number format first
+            c.number_format = cell.number_format
+            # styles (copy lightweight properties explicitly to avoid XML bloat)
+            if cell.font:       c.font = cell.font.copy()
+            if cell.fill:       c.fill = cell.fill.copy()
+            if cell.alignment:  c.alignment = cell.alignment.copy()
+            if cell.border:     c.border = cell.border.copy()
+
+    # 2) Column widths & row heights
+    for col_letter, dim in ws_src.column_dimensions.items():
+        # if width is None, Excel auto; keep default
+        if dim.width is not None:
+            ws_new.column_dimensions[col_letter].width = dim.width
+        if dim.hidden:
+            ws_new.column_dimensions[col_letter].hidden = True
+
+    for idx, dim in ws_src.row_dimensions.items():
+        if dim.height is not None:
+            ws_new.row_dimensions[idx].height = dim.height
+        if dim.hidden:
+            ws_new.row_dimensions[idx].hidden = True
+
+    # 3) Freeze panes
     try:
-        wb = load_workbook(src_xlsx, data_only=True)
+        ws_new.freeze_panes = ws_src.freeze_panes
+    except Exception:
+        pass
+
+    # 4) Conditional formatting
+    try:
+        # copy each rule & its ranges
+        for cf in ws_src.conditional_formatting._cf_rules.values():
+            for rule in cf:
+                # add back to the same ranges
+                for rng in rule.sqref:
+                    ws_new.conditional_formatting.add(rng, rule)
+    except Exception:
+        # be forgiving; if anything fails here, sheet still usable
+        pass
+
+    # 5) Tables (rename to keep them unique)
+    try:
+        existing_table_names = {t.displayName for s in dest_wb.worksheets for t in getattr(s, "_tables", [])}
+        for t in getattr(ws_src, "_tables", []):
+            ref = t.ref
+            style = t.tableStyleInfo
+            new_t = Table(displayName=_unique_table_name(existing_table_names, t.displayName), ref=ref)
+            if isinstance(style, TableStyleInfo):
+                new_t.tableStyleInfo = TableStyleInfo(
+                    name=style.name,
+                    showFirstColumn=style.showFirstColumn,
+                    showLastColumn=style.showLastColumn,
+                    showRowStripes=style.showRowStripes,
+                    showColumnStripes=style.showColumnStripes,
+                )
+            ws_new.add_table(new_t)
+    except Exception:
+        pass
+
+    return new_name
+
+def copy_workbook_sheets(src_xlsx: Path, dest_wb: Workbook, prefix: Optional[str] = None) -> int:
+    """Copy all sheets from src_xlsx into dest_wb preserving styling/tables."""
+    try:
+        wb = load_workbook(src_xlsx, data_only=False)  # keep formulas
     except Exception as e:
         print(f"  -> Could not open {src_xlsx.name}: {e}")
         return 0
+
     copied = 0
     for name in wb.sheetnames:
         ws_src = wb[name]
-        # create new sheet name (optionally prefixed)
-        new_name = f"{prefix}_{name}" if prefix else name
-        # ensure unique
-        base = new_name
-        k = 1
-        while new_name in dest_wb.sheetnames:
-            new_name = f"{base}_{k}"
-            k += 1
-        ws_new = dest_wb.create_sheet(new_name)
-        for r in ws_src.iter_rows():
-            for cell in r:
-                ws_new.cell(row=cell.row, column=cell.col_idx, value=cell.value)
-        # copy a few simple styles for headers (lightweight)
-        # (full style copy is heavy and tends to trigger Excel repairs)
+        target_name = f"{prefix}_{name}" if prefix else name
+        copy_sheet_with_styles(ws_src, dest_wb, target_name)
         copied += 1
+
     try:
         wb.close()
     except Exception:
@@ -86,22 +180,19 @@ def copy_sheets(src_xlsx: Path, dest_wb: Workbook, prefix: Optional[str] = None)
 # Main interactive runner
 # ---------------------------
 def main() -> int:
-    print("\n=== RLMS QC – Interactive Runner (Q1–Q5) ===\n")
+    print("\n=== RLMS QC – Interactive Runner (Q1–Q5, Styled Merge) ===\n")
 
-    # 1) Core inputs
     stage_path = ask_path("Path to CURRENT staging workbook (.xlsx): ", must_exist=True)
     out_path   = ask_path("Path to OUTPUT QC workbook (.xlsx): ", must_exist=False)
     if out_path.suffix.lower() != ".xlsx":
         out_path = out_path.with_suffix(".xlsx")
 
-    # 2) Which questions to run?
     run_q1 = ask_yesno("Run QC for Question 1?", True)
     run_q2 = ask_yesno("Run QC for Question 2?", True)
     run_q3 = ask_yesno("Run QC for Question 3?", True)
     run_q4 = ask_yesno("Run QC for Question 4?", True)
     run_q5 = ask_yesno("Run QC for Question 5?", True)
 
-    # 3) Prior staging per question (optional)
     print("\n(Optional) Provide PRIOR staging workbook to enable YoY. Leave blank to skip.")
     prior_q1 = ask_path("  Prior staging for Q1 (.xlsx) [blank=skip]: ", must_exist=True, allow_blank=True)
     prior_q2 = ask_path("  Prior staging for Q2 (.xlsx) [blank=skip]: ", must_exist=True, allow_blank=True)
@@ -109,7 +200,6 @@ def main() -> int:
     prior_q4 = ask_path("  Prior staging for Q4 (.xlsx) [blank=skip]: ", must_exist=True, allow_blank=True)
     prior_q5 = ask_path("  Prior staging for Q5 (.xlsx) [blank=skip]: ", must_exist=True, allow_blank=True)
 
-    # 4) Thresholds per question (tuneable)
     print("\nEnter thresholds (press Enter to accept defaults).")
     def ask_th(name: str, mom=0.25, qoq=0.25, yoy=0.25, absc=50.0) -> Dict[str,float]:
         print(f"  • {name}")
@@ -121,23 +211,20 @@ def main() -> int:
         }
 
     TH: Dict[str, Dict[str,float]] = {}
-    if run_q1: TH["Q1"] = ask_th("Q1", mom=0.25, qoq=0.25, yoy=0.25, absc=50)
-    if run_q2: TH["Q2"] = ask_th("Q2", mom=0.25, qoq=0.25, yoy=0.25, absc=50)
-    if run_q3: TH["Q3"] = ask_th("Q3", mom=0.25, qoq=0.25, yoy=0.25, absc=50)
-    if run_q4: TH["Q4"] = ask_th("Q4", mom=0.25, qoq=0.25, yoy=0.25, absc=50)
-    if run_q5: TH["Q5"] = ask_th("Q5", mom=0.25, qoq=0.25, yoy=0.25, absc=50)
+    if run_q1: TH["Q1"] = ask_th("Q1")
+    if run_q2: TH["Q2"] = ask_th("Q2")
+    if run_q3: TH["Q3"] = ask_th("Q3")
+    if run_q4: TH["Q4"] = ask_th("Q4")
+    if run_q5: TH["Q5"] = ask_th("Q5")
 
-    # 5) Temp folder for per-question outputs
     tmpdir = Path(tempfile.mkdtemp(prefix="qc_all_"))
     print(f"\n[INFO] Working in: {tmpdir}")
 
-    # 6) Fire each QC script → temp workbook
     jobs = []
     if run_q1:
         out_q1 = tmpdir / "QC_Q1.xlsx"
         args = [
-            "--stage", str(stage_path),
-            "--out",   str(out_q1),
+            "--stage", str(stage_path), "--out", str(out_q1),
             "--mom-threshold", str(TH["Q1"]["mom"]),
             "--qoq-threshold", str(TH["Q1"]["qoq"]),
             "--yoy-threshold", str(TH["Q1"]["yoy"]),
@@ -149,8 +236,7 @@ def main() -> int:
     if run_q2:
         out_q2 = tmpdir / "QC_Q2.xlsx"
         args = [
-            "--stage", str(stage_path),
-            "--out",   str(out_q2),
+            "--stage", str(stage_path), "--out", str(out_q2),
             "--mom-threshold", str(TH["Q2"]["mom"]),
             "--qoq-threshold", str(TH["Q2"]["qoq"]),
             "--yoy-threshold", str(TH["Q2"]["yoy"]),
@@ -162,8 +248,7 @@ def main() -> int:
     if run_q3:
         out_q3 = tmpdir / "QC_Q3.xlsx"
         args = [
-            "--stage", str(stage_path),
-            "--out",   str(out_q3),
+            "--stage", str(stage_path), "--out", str(out_q3),
             "--mom-threshold", str(TH["Q3"]["mom"]),
             "--qoq-threshold", str(TH["Q3"]["qoq"]),
             "--yoy-threshold", str(TH["Q3"]["yoy"]),
@@ -175,8 +260,7 @@ def main() -> int:
     if run_q4:
         out_q4 = tmpdir / "QC_Q4.xlsx"
         args = [
-            "--stage", str(stage_path),
-            "--out",   str(out_q4),
+            "--stage", str(stage_path), "--out", str(out_q4),
             "--mom-threshold", str(TH["Q4"]["mom"]),
             "--qoq-threshold", str(TH["Q4"]["qoq"]),
             "--yoy-threshold", str(TH["Q4"]["yoy"]),
@@ -188,8 +272,7 @@ def main() -> int:
     if run_q5:
         out_q5 = tmpdir / "QC_Q5.xlsx"
         args = [
-            "--stage", str(stage_path),
-            "--out",   str(out_q5),
+            "--stage", str(stage_path), "--out", str(out_q5),
             "--mom-threshold", str(TH["Q5"]["mom"]),
             "--qoq-threshold", str(TH["Q5"]["qoq"]),
             "--yoy-threshold", str(TH["Q5"]["yoy"]),
@@ -198,7 +281,6 @@ def main() -> int:
         if prior_q5: args += ["--prior-stage", str(prior_q5)]
         jobs.append(("qc_q5.py", args, out_q5, "Q5"))
 
-    # 7) Execute
     produced: List[Path] = []
     for script, args, out_file, tag in jobs:
         print(f"\n[RUN] {tag} → {script}")
@@ -217,33 +299,24 @@ def main() -> int:
         except Exception: pass
         return 0
 
-    # 8) Merge all QC sheets into one workbook
-    print(f"\n[MERGE] Combining {len(produced)} QC workbooks → {out_path.name}")
-    dest = Workbook()
-    # remove default sheet
-    dest.remove(dest.active)
+    # 8) Merge with styling preserved
+    out_wb = Workbook()
+    out_wb.remove(out_wb.active)
 
+    print(f"\n[MERGE] Combining {len(produced)} QC workbooks (preserving styles) → {out_path.name}")
     for p in produced:
-        # Copy every sheet (keeps each question’s tab names)
-        copied = copy_sheets(p, dest)
+        copied = copy_workbook_sheets(p, out_wb)
         print(f"  -> Copied {copied} sheets from {p.name}")
 
-    # Add a simple About sheet at end
-    about = dest.create_sheet("_About")
-    about["A1"] = "RLMS – QC (All)"
-    about["A1"].style = "Title"
-    about["A3"] = "Staging"
-    about["B3"] = str(stage_path)
-    about["A4"] = "Generated by"
-    about["B4"] = "qc_all_interactive.py"
-    about["A6"] = "Notes"
-    about["B6"] = "Thresholds were chosen interactively per question at runtime."
-
+    # Add a small About sheet at end
+    about = out_wb.create_sheet("_About")
+    about["A1"] = "RLMS – QC (All)"; about["A1"].style = "Title"
+    about["A3"] = "Current Staging"; about["B3"] = str(stage_path)
+    about["A4"] = "Generated By";    about["B4"] = "qc_all_interactive.py (styled merge)"
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    dest.save(out_path)
+    out_wb.save(out_path)
     print(f"\n[DONE] Wrote merged QC workbook → {out_path}")
 
-    # 9) Cleanup temp
     if ask_yesno("\nDelete temporary per-question QC files?", True):
         try:
             shutil.rmtree(tmpdir, ignore_errors=True)
