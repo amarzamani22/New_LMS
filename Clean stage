@@ -1,47 +1,69 @@
-    # --- Build prior qc frame with the same keys/columns (robust for Q3: no subquestion) ---
-    prior_qc_df = None
-    if args.prior_df is not None and not args.prior_df.empty:
-        p = args.prior_df.copy()
+import os
+import pandas as pd
+from pathlib import Path
+from qc_common import new_empty_workbook, append_about_sheet_last
+from qc_q1 import run_qc_q1
+from qc_q2 import run_qc_q2
+from qc_q3 import run_qc_q3
+from qc_q4 import run_qc_q4
+from qc_q5 import run_qc_q5
 
-        # Ensure optional key columns exist in PRIOR too (Q3 has no subquestion)
-        for c in ["subquestion", "worker_category", "job_function"]:
-            if c not in p.columns:
-                p[c] = ""
+# ================
+# CONFIGURATION
+# ================
+STAGE_DIR = r"C:\Users\YourName\OneDrive - Bank Negara Malaysia\RLMS\staging_2026"
+PRIOR_STAGE_DIR = r"C:\Users\YourName\OneDrive - Bank Negara Malaysia\RLMS\staging_2025"
+OUT_FILE = r"C:\Users\YourName\OneDrive - Bank Negara Malaysia\RLMS\Submission\QC Template\QC_LMS_2026.xlsx"
+YEAR = 2026
+CURRENT_Q = "Q2"  # Adjust based on your staging (Q1..Q4)
 
-        # Ensure numeric columns expected for join exist in PRIOR as well
-        if jobfunc_mode:
-            if "value" not in p.columns:
-                p["value"] = 0.0
-        else:
-            for m in months:
-                if m not in p.columns:
-                    p[m] = 0.0
+# ================
+# INITIALIZE WORKBOOK
+# ================
+wb = new_empty_workbook()
 
-        # Attach entity type and build rollups on PRIOR just like current
-        p = attach_entity_type(p, "entity_name")
-        p_keys = ["subquestion", "worker_category"]
-        if jobfunc_mode:
-            p_keys.append("job_function")
-        p_nums = (["value"] if jobfunc_mode else months)
-        p_roll = expand_rollups(p, keys=p_keys, numeric_cols=p_nums)
+# ================
+# GENERATE EACH QC SHEET
+# ================
+print("🚀 Generating QC sheets into one workbook...")
 
-        # Map to display keys for prior sheet(s)
-        p_roll["Entity / Group"] = p_roll["Entity / Group"]  # already created by expand_rollups
-        p_roll["Subquestion"]     = p_roll["subquestion"]
-        p_roll["Worker Category"] = p_roll["worker_category"]
+try:
+    run_qc_q1(stage_dir=STAGE_DIR, prior_stage=PRIOR_STAGE_DIR, wb=wb, year=YEAR, current_q=CURRENT_Q)
+    print("✅ Q1 done.")
+except Exception as e:
+    print(f"⚠️ Skipped Q1: {e}")
 
-        if jobfunc_mode:
-            p_roll["Job Function"] = p_roll["job_function"]
-            p_roll["Q4"] = p_roll["value"]
-            prior_qc_df = p_roll[["Entity / Group","Subquestion","Worker Category","Job Function","Q4"]].copy()
-        else:
-            # Provide quarterly totals in prior if we’ll do YoY on quarters
-            for q in ["Q1","Q2","Q3","Q4"]:
-                need = set(Q_TO_MONTHS[q])
-                if need.issubset(set(p_roll.columns)):
-                    p_roll[q] = p_roll[list(need)].sum(axis=1)
+try:
+    run_qc_q2(stage_dir=STAGE_DIR, prior_stage=PRIOR_STAGE_DIR, wb=wb, year=YEAR, current_q=CURRENT_Q)
+    print("✅ Q2 done.")
+except Exception as e:
+    print(f"⚠️ Skipped Q2: {e}")
 
-            base_cols = ["Entity / Group","Subquestion","Worker Category"]
-            keep_cols = base_cols + [c for c in ["Q1","Q2","Q3","Q4"] if c in p_roll.columns] \
-                                   + [m for m in months if m in p_roll.columns]
-            prior_qc_df = p_roll[keep_cols].copy()
+try:
+    run_qc_q3(stage_dir=STAGE_DIR, prior_stage=PRIOR_STAGE_DIR, wb=wb, year=YEAR, current_q=CURRENT_Q)
+    print("✅ Q3 done.")
+except Exception as e:
+    print(f"⚠️ Skipped Q3: {e}")
+
+try:
+    run_qc_q4(stage_dir=STAGE_DIR, prior_stage=PRIOR_STAGE_DIR, wb=wb, year=YEAR, current_q=CURRENT_Q)
+    print("✅ Q4 done.")
+except Exception as e:
+    print(f"⚠️ Skipped Q4: {e}")
+
+try:
+    run_qc_q5(stage_dir=STAGE_DIR, prior_stage=PRIOR_STAGE_DIR, wb=wb, year=YEAR, current_q=CURRENT_Q)
+    print("✅ Q5 done.")
+except Exception as e:
+    print(f"⚠️ Skipped Q5: {e}")
+
+# ================
+# ADD ABOUT SHEET
+# ================
+append_about_sheet_last(wb, title="Labour Market Statistics QC Template", year=YEAR, qlabel=CURRENT_Q)
+
+# ================
+# SAVE FILE
+# ================
+wb.save(OUT_FILE)
+print(f"\n🎉 All QC sheets saved to {OUT_FILE}")
