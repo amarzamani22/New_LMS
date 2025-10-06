@@ -1,71 +1,47 @@
-from pathlib import Path
-import pandas as pd
-from openpyxl import Workbook
-from datetime import datetime
+    # --- Build prior qc frame with the same keys/columns (robust for Q3: no subquestion) ---
+    prior_qc_df = None
+    if args.prior_df is not None and not args.prior_df.empty:
+        p = args.prior_df.copy()
 
-from extractors import extract_from_file   # reuse your existing extractor
-from aggregations import months_up_to_quarter, pivot_for_qc, build_rollups
+        # Ensure optional key columns exist in PRIOR too (Q3 has no subquestion)
+        for c in ["subquestion", "worker_category", "job_function"]:
+            if c not in p.columns:
+                p[c] = ""
 
-def main(inputs: str, out: str = None):
-    in_root = Path(inputs)
-    files = list(in_root.rglob("*.xlsx"))
-    all_rows = []
+        # Ensure numeric columns expected for join exist in PRIOR as well
+        if jobfunc_mode:
+            if "value" not in p.columns:
+                p["value"] = 0.0
+        else:
+            for m in months:
+                if m not in p.columns:
+                    p[m] = 0.0
 
-    # 1) Extract raw rows
-    for p in files:
-        rows = extract_from_file(p, verbose=False)
-        if rows:
-            all_rows.extend(r.__dict__ for r in rows)
+        # Attach entity type and build rollups on PRIOR just like current
+        p = attach_entity_type(p, "entity_name")
+        p_keys = ["subquestion", "worker_category"]
+        if jobfunc_mode:
+            p_keys.append("job_function")
+        p_nums = (["value"] if jobfunc_mode else months)
+        p_roll = expand_rollups(p, keys=p_keys, numeric_cols=p_nums)
 
-    if not all_rows:
-        print("No rows extracted.")
-        return
+        # Map to display keys for prior sheet(s)
+        p_roll["Entity / Group"] = p_roll["Entity / Group"]  # already created by expand_rollups
+        p_roll["Subquestion"]     = p_roll["subquestion"]
+        p_roll["Worker Category"] = p_roll["worker_category"]
 
-    df = pd.DataFrame(all_rows)
+        if jobfunc_mode:
+            p_roll["Job Function"] = p_roll["job_function"]
+            p_roll["Q4"] = p_roll["value"]
+            prior_qc_df = p_roll[["Entity / Group","Subquestion","Worker Category","Job Function","Q4"]].copy()
+        else:
+            # Provide quarterly totals in prior if we’ll do YoY on quarters
+            for q in ["Q1","Q2","Q3","Q4"]:
+                need = set(Q_TO_MONTHS[q])
+                if need.issubset(set(p_roll.columns)):
+                    p_roll[q] = p_roll[list(need)].sum(axis=1)
 
-    # 2) Determine current year/quarter
-    year = int(df["year"].mode().iat[0])
-    q_order = ["Quarter 1", "Quarter 2", "Quarter 3", "Quarter 4"]
-    df["q_index"] = df["quarter"].map({q: i for i, q in enumerate(q_order)})
-    current_q = df.loc[df["q_index"].idxmax(), "quarter"]
-
-    # 3) Pivot into QC shape (like your current QC but no styling)
-    big = build_rollups(df)
-    qc_df = pivot_for_qc(big, current_q=current_q, year=year)
-
-    # 4) Save to Excel (very plain, just values)
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "QC_Data"
-
-    # Write headers
-    ws.append(qc_df.columns.tolist())
-
-    # Write rows
-    for row in qc_df.itertuples(index=False, name=None):
-        ws.append(row)
-
-    # About sheet
-    about = wb.create_sheet("About")
-    about["A1"] = "RLMS Q5 – Labour Turnover STAGING"
-    about["A2"] = "Year"; about["B2"] = year
-    about["A3"] = "Up to Quarter"; about["B3"] = current_q
-    about["A5"] = f"Extracted at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-
-    # Output path
-    if out:
-        out_path = Path(out)
-    else:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = in_root / f"QC_Stage_{year}_up_to_{current_q.replace(' ','')}_{ts}.xlsx"
-
-    wb.save(out_path)
-    print(f"[DONE] Staging workbook written: {out_path}")
-
-if __name__ == "__main__":
-    import argparse
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--inputs", required=True, help="Folder of raw submissions")
-    ap.add_argument("--out", default=None, help="Optional path for output workbook")
-    args = ap.parse_args()
-    main(args.inputs, args.out)
+            base_cols = ["Entity / Group","Subquestion","Worker Category"]
+            keep_cols = base_cols + [c for c in ["Q1","Q2","Q3","Q4"] if c in p_roll.columns] \
+                                   + [m for m in months if m in p_roll.columns]
+            prior_qc_df = p_roll[keep_cols].copy()
