@@ -3,56 +3,69 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import pandas as pd
+
 from qc_common import (
-    QCArgs, write_qc_sheet, new_empty_workbook, append_about_sheet_last,
-    MONTHS_FULL, normalize_quarter_label
+    QCArgs, new_empty_workbook, append_about_sheet_last, write_qc_sheet,
+    normalize_quarter_label, months_up_to, MONTHS_FULL,
 )
 
-def _load(path: Path, sheet: str) -> pd.DataFrame:
+def load(stage_path: Path, sheet: str) -> pd.DataFrame:
     try:
-        return pd.read_excel(path, sheet_name=sheet, engine="openpyxl")
-    except Exception:
+        xls = pd.ExcelFile(stage_path, engine="openpyxl")
+        if sheet in xls.sheet_names:
+            return pd.read_excel(xls, sheet_name=sheet, engine="openpyxl")
+        print(f"[INFO] Sheet '{sheet}' not found in {stage_path.name}, skipping.")
+        return pd.DataFrame()
+    except Exception as e:
+        print(f"[WARN] Failed to open {stage_path} or sheet '{sheet}': {e}")
         return pd.DataFrame()
 
-def _months_in_df(df: pd.DataFrame) -> list:
-    return [m for m in MONTHS_FULL if m in df.columns]
-
 def main() -> int:
-    ap = argparse.ArgumentParser(description="QC Template – Question 5 (Main only)")
-    ap.add_argument("--stage", required=True, help="Q5 staging workbook")
-    ap.add_argument("--out", required=True, help="Output QC workbook (.xlsx)")
-    ap.add_argument("--prior-stage", default=None, help="Prior-year Q5 staging workbook (for YoY)")
+    ap = argparse.ArgumentParser(description="QC Template – Question 5")
+    ap.add_argument("--stage", required=True)
+    ap.add_argument("--out",   required=True)
+    ap.add_argument("--prior-stage", default=None)
     ap.add_argument("--year", type=int, default=None)
-
-    # thresholds
     ap.add_argument("--mom-threshold", type=float, default=0.25)
     ap.add_argument("--qoq-threshold", type=float, default=0.25)
     ap.add_argument("--yoy-threshold", type=float, default=0.25)
     ap.add_argument("--abs-cutoff", type=float, default=50.0)
     args = ap.parse_args()
 
-    stage = Path(args.stage)
-    q5 = _load(stage, "Q5")
+    stage_p = Path(args.stage)
+    q5 = load(stage_p, "Q5")
+
     if q5.empty:
-        print("[WARN] No Q5 sheet found in staging.")
+        print("[WARN] No Q5 sheet found in staging. Producing About-only workbook.")
+        wb = new_empty_workbook()
+        append_about_sheet_last(wb, "RLMS – QC (Q5)", year=0, qlabel="N/A")
+        wb.save(args.out)
+        print(f"[DONE] {args.out}")
         return 0
 
-    year = int(args.year if args.year is not None else q5["year"].mode().iat[0])
-    current_q = normalize_quarter_label(q5["quarter"])
+    years = q5["year"] if "year" in q5.columns else pd.Series([], dtype=int)
+    year = int(args.year if args.year is not None else (years.mode().iat[0] if not years.empty else 0))
+    q_series = q5["quarter"] if "quarter" in q5.columns else pd.Series([], dtype=object)
+    current_q = normalize_quarter_label(q_series)
+
     q5 = q5[q5["year"]==year]
 
-    prior = None
+    prior_df = None
     if args.prior_stage:
-        p = _load(Path(args.prior_stage), "Q5")
-        if not p.empty:
-            prior = p[p["year"]==(year-1)]
+        prior_p = Path(args.prior_stage)
+        p5 = load(prior_p, "Q5")
+        if not p5.empty:
+            prior_df = p5[p5["year"]==(year-1)]
 
-    months = _months_in_df(q5)
     wb = new_empty_workbook()
 
+    months = months_up_to(current_q)
+    months = [m for m in months if m in q5.columns]
+
+    # Q5: main only (question + subquestion, no jobfunc/B)
     write_qc_sheet(QCArgs(
         sheet_name="QC_Q5",
-        df=q5, wb=wb, year=year, current_q=current_q, prior_df=prior,
+        df=q5, wb=wb, year=year, current_q=current_q, prior_df=prior_df,
         months_to_show=months, include_job_function=False,
         mom_pct_threshold=args.mom_threshold, qoq_pct_threshold=args.qoq_threshold,
         yoy_pct_threshold=args.yoy_threshold, abs_cutoff=args.abs_cutoff
