@@ -1,353 +1,195 @@
-#!/usr/bin/env python3
+# build_analysis_csv.py
 from __future__ import annotations
-import argparse
+import argparse, sys
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
-
+from typing import Dict, List, Optional
 import pandas as pd
 
-# --------------------------
-# Quarter & months helpers
-# --------------------------
-QMAP = {
-    "Quarter 1": "Q1", "Quarter 2": "Q2", "Quarter 3": "Q3", "Quarter 4": "Q4",
-    "Q1": "Q1", "Q2": "Q2", "Q3": "Q3", "Q4": "Q4",
-}
-Q_TO_MONTHS = {
-    "Q1": ["Jan","Feb","Mar"],
-    "Q2": ["Apr","May","Jun"],
-    "Q3": ["Jul","Aug","Sep"],
-    "Q4": ["Oct","Nov","Dec"],
-}
-MONTHS_FULL = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
-MONTH_NUM = {m:i for i,m in enumerate(["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"], start=1)}
-
-def months_present(df: pd.DataFrame) -> List[str]:
-    return [m for m in MONTHS_FULL if m in df.columns]
-
-def normalize_quarter(q: str) -> str:
-    return QMAP.get(str(q).strip(), str(q).strip())
-
-def make_period(year: int, month_name: str) -> str:
-    mm = MONTH_NUM.get(month_name, 1)
-    return f"{int(year):04d}-{mm:02d}"
-
-# --------------------------
-# Entity mapping & rollups
-# --------------------------
-# Paste your FULL mapping here
-ENTITY_TO_TYPE: Dict[str, str] = {
-    # "AFFIN BANK BERHAD": "Commercial Banks",
-    # "ALLIANZ LIFE INSURANCE MALAYSIA BERHAD": "Insurers",
-    # ...
-}
-
-# Paste your FULL rollups here
-ROLLUPS: Dict[str, List[str]] = {
-    # "All Financial Institutions": [
-    #     "Commercial Banks", "Investment Banks", "Islamic Banks", "DFI",
-    #     "Insurers", "Takaful Operators", "Foreign Banks",
-    #     "International Islamic Banks", "Digital Banks"
-    # ],
-    # "Banking Institutions": [
-    #     "Commercial Banks", "Investment Banks", "Islamic Banks",
-    #     "Digital Banks", "International Islamic Banks", "Foreign Banks"
-    # ],
-    # "DFI": ["DFI"],
-    # "Insurers": ["Insurers"],
-    # "Takaful Operators": ["Takaful Operators"],
-    # "Commercial Banks": ["Commercial Banks","Foreign Banks"],
-    # "Islamic Banks": ["Islamic Banks"],
-    # "Investment Banks": ["Investment Banks"],
-    # "Digital Banks": ["Digital Banks"],
-    # "International Islamic Banks": ["International Islamic Banks"],
-    # "Foreign Banks": ["Foreign Banks"],
-}
-
-ROLLUP_ORDER = [
-    "All Financial Institutions",
-    "Banking Institutions",
-    "Commercial Banks",
-    "Investment Banks",
-    "Islamic Banks",
-    "Foreign Banks",
-    "Digital Banks",
-    "International Islamic Banks",
-    "DFI",
-    "Insurers",
-    "Takaful Operators",
+EXPECTED_SHEETS = [
+    "Q1A_Main", "Q1A_JobFunc_Q4", "Q1B",
+    "Q2A_Main", "Q2A_JobFunc_Q4", "Q2B",
+    "Q3", "Q4", "Q5",
 ]
 
-def attach_entity_type(df: pd.DataFrame, entity_col: str = "entity_name") -> pd.DataFrame:
-    out = df.copy()
-    out["_ENT_UP"] = out[entity_col].astype(str).str.upper().str.strip()
-    out["entity_type"] = out["_ENT_UP"].map(ENTITY_TO_TYPE).fillna("Unknown")
-    out.drop(columns=["_ENT_UP"], inplace=True)
-    return out
+MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+QMAP = {"Quarter 1":"Q1","Quarter 2":"Q2","Quarter 3":"Q3","Quarter 4":"Q4",
+        "Q1":"Q1","Q2":"Q2","Q3":"Q3","Q4":"Q4"}
 
-def add_rollups(
-    df: pd.DataFrame,
-    group_keys: Sequence[str],
-) -> pd.DataFrame:
-    """
-    Append rollup rows with entity_group set to the rollup label.
-    Keeps original FI rows with entity_group = entity_name.
-    """
-    if df.empty:
-        return df
+def _norm_q(q):
+    if q is None: return ""
+    s = str(q).strip()
+    return QMAP.get(s, s)
 
-    base_cols = df.columns.tolist()
-    num_cols = ["value"]
-    # Base rows (individual FIs)
-    base = df.copy()
-
-    frames = [base]
-
-    # Add rollups
-    for label, members in ROLLUPS.items():
-        sub = base[base["entity_type"].isin(members)]
-        if sub.empty:
-            continue
-        agg = (
-            sub.groupby(list(group_keys), dropna=False)[num_cols]
-               .sum(min_count=1)
-               .reset_index()
-        )
-        agg["entity_group"] = label
-        frames.append(agg)
-
-    out = pd.concat(frames, ignore_index=True)
-
-    # Ensure one row per combo (guard against duplicates)
-    gcols = list(group_keys) + ["entity_group"]
-    out = (
-        out.groupby(gcols, dropna=False)[num_cols]
-           .sum(min_count=1)
-           .reset_index()
-    )
-
-    # Order: rollups first, then FIs A→Z
-    rank = {n:i for i,n in enumerate(ROLLUP_ORDER)}
-    out["_r"] = out["entity_group"].map(lambda x: rank.get(x, 10_000))
-    out = out.sort_values(["_r","entity_group"] + list(group_keys), kind="mergesort").drop(columns=["_r"]).reset_index(drop=True)
-    return out
-
-# --------------------------
-# Sheet loaders
-# --------------------------
-def _safe_read(stage_path: Path, sheet: str) -> pd.DataFrame:
+def read_stage_xlsx(path: Path) -> Dict[str, pd.DataFrame]:
+    out: Dict[str, pd.DataFrame] = {}
     try:
-        return pd.read_excel(stage_path, sheet_name=sheet, engine="openpyxl")
-    except Exception:
-        return pd.DataFrame()
+        xf = pd.ExcelFile(path, engine="openpyxl")
+    except Exception as e:
+        print(f"[ERROR] Cannot open staging xlsx: {e}")
+        return out
+    print(f"[INFO] Found sheets in {path.name}: {xf.sheet_names}")
+    for s in EXPECTED_SHEETS:
+        if s in xf.sheet_names:
+            try:
+                df = pd.read_excel(path, sheet_name=s, engine="openpyxl")
+                if not df.empty:
+                    out[s] = df
+                    print(f"[LOAD] {s}: {len(df):,} rows")
+            except Exception as e:
+                print(f"[WARN] Failed reading {s}: {e}")
+    return out
 
-def _coerce_numeric(df: pd.DataFrame, cols: Sequence[str]) -> pd.DataFrame:
-    out = df.copy()
+def read_stage_csvdir(folder: Path) -> Dict[str, pd.DataFrame]:
+    out: Dict[str, pd.DataFrame] = {}
+    for s in EXPECTED_SHEETS:
+        p = folder / f"{s}.csv"
+        if p.exists():
+            try:
+                df = pd.read_csv(p)
+                if not df.empty:
+                    out[s] = df
+                    print(f"[LOAD] {s} (csv): {len(df):,} rows")
+            except Exception as e:
+                print(f"[WARN] Failed reading {p.name}: {e}")
+    return out
+
+def ensure_cols(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    d = df.copy()
     for c in cols:
-        if c in out.columns:
-            out[c] = pd.to_numeric(out[c], errors="coerce")
-    return out
+        if c not in d.columns:
+            d[c] = "" if c in ("subquestion","worker_category","job_function") else 0
+    return d
 
-def reshape_monthly(
-    df: pd.DataFrame,
-    question_label: str,
-    subq_col: str = "subquestion",
-    needs_subq: bool = True,
-) -> pd.DataFrame:
-    """Melt monthly columns -> tidy rows with month & value."""
-    if df.empty:
-        return pd.DataFrame()
+def melt_months(df: pd.DataFrame, id_cols: List[str]) -> pd.DataFrame:
+    months_present = [m for m in MONTHS if m in df.columns]
+    if not months_present:
+        # job-function (value only) — synthesize Q4 as “Dec period” for PB charts
+        if "value" in df.columns:
+            d = df.copy()
+            d["month"] = "Dec"
+            d["value"] = pd.to_numeric(d["value"], errors="coerce").fillna(0.0)
+            return d[id_cols + ["month","value"]]
+        return pd.DataFrame(columns=id_cols + ["month","value"])
+    d = df.copy()
+    for m in months_present:
+        d[m] = pd.to_numeric(d[m], errors="coerce").fillna(0.0)
+    m = d.melt(id_vars=id_cols, value_vars=months_present,
+               var_name="month", value_name="value")
+    return m
 
-    # Ensure columns exist
-    for c in ["entity_name","year","quarter","worker_category"]:
-        if c not in df.columns:
-            df[c] = ""
+def add_entity_group(df: pd.DataFrame) -> pd.DataFrame:
+    # Keep the literal entity_name as the “group” column for PB drill/filter
+    d = df.copy()
+    if "entity_name" in d.columns:
+        d["entity_group"] = d["entity_name"]
+    else:
+        d["entity_group"] = "Unknown"
+    return d
 
-    if needs_subq and "subquestion" not in df.columns:
-        df["subquestion"] = ""
-    if (not needs_subq) and "subquestion" not in df.columns:
-        # create empty subquestion for Q3
-        df["subquestion"] = ""
+def build_analysis_rows(sheet: str, df: pd.DataFrame) -> pd.DataFrame:
+    base = df.copy()
+    # Normalize structure
+    for c in ["entity_name","year","quarter"]:
+        if c not in base.columns: base[c] = None
+    base["quarter"] = base["quarter"].map(_norm_q)
+    # Figure question label
+    if sheet.startswith("Q1A"):
+        question = "Q1A"
+    elif sheet == "Q1B":
+        question = "Q1B"
+    elif sheet.startswith("Q2A"):
+        question = "Q2A"
+    elif sheet == "Q2B":
+        question = "Q2B"
+    else:
+        question = sheet  # Q3 / Q4 / Q5
 
-    # Which month columns are present?
-    mcols = months_present(df)
-    if not mcols:
-        return pd.DataFrame()
+    # Ensure optional columns
+    if "subquestion" not in base.columns: base["subquestion"] = ""
+    if "worker_category" not in base.columns: base["worker_category"] = ""
+    if "job_function" not in base.columns: base["job_function"] = ""
+    # Identify ID columns per sheet
+    id_cols = ["entity_name","entity_group","year","quarter","question",
+               "subquestion","worker_category","job_function"]
 
-    df = _coerce_numeric(df, mcols)
+    # Add question label & entity_group
+    base["question"] = question
+    base = add_entity_group(base)
 
-    keep = ["entity_name","year","quarter","worker_category","subquestion"]
-    melt = df.melt(
-        id_vars=keep,
-        value_vars=mcols,
-        var_name="month",
-        value_name="value"
-    )
+    # Q1B/Q2B are single-month (Jun/Dec). Keep as months too so visuals work.
+    if sheet in ("Q1B","Q2B"):
+        # Could be Jun or Dec depending on quarter; already columns named “Jun/Dec” in staging
+        # Let melt_months handle whichever month exists.
+        pass
 
-    melt["question"] = question_label
-    melt["quarter"] = melt["quarter"].map(normalize_quarter)
-    melt["period"] = melt.apply(lambda r: make_period(r["year"], r["month"]), axis=1)
-    return melt
+    # Make long (month,value)
+    long = melt_months(base, id_cols=id_cols)
 
-def reshape_b_sheet(df: pd.DataFrame, question_label: str) -> pd.DataFrame:
-    """
-    Q1B/Q2B: single (or two) month columns (Jun and/or Dec).
-    """
-    if df.empty:
-        return pd.DataFrame()
-    # Ensure structure
-    for c in ["entity_name","year","quarter","worker_category","subquestion"]:
-        if c not in df.columns:
-            df[c] = ""
-    # Months present (expect Jun/Dec)
-    mcols = [c for c in ["Jun","Dec"] if c in df.columns]
-    if not mcols:
-        # if staging used single 'M' earlier, handle here safely:
-        if "M" in df.columns:
-            df = df.rename(columns={"M":"Jun"})  # safest default
-            mcols = ["Jun"]
-        else:
-            return pd.DataFrame()
+    # Build period (YYYY-MM) for DateTable join in PBI
+    month_to_num = {m:i for i,m in enumerate(MONTHS, start=1)}
+    long["month_num"] = long["month"].map(month_to_num).fillna(1).astype(int)
+    long["period"] = long.apply(lambda r: f"{int(r['year'])}-{r['month_num']:02d}" if pd.notnull(r["year"]) else "", axis=1)
+    # Clean types
+    long["year"] = pd.to_numeric(long["year"], errors="coerce").astype("Int64")
+    long["value"] = pd.to_numeric(long["value"], errors="coerce").fillna(0.0)
+    # Order columns
+    cols = ["entity_group","entity_name","year","quarter","period","month","question",
+            "subquestion","worker_category","job_function","value"]
+    long = long[cols]
+    return long
 
-    df = _coerce_numeric(df, mcols)
-    keep = ["entity_name","year","quarter","worker_category","subquestion"]
-    melt = df.melt(id_vars=keep, value_vars=mcols, var_name="month", value_name="value")
-    melt["question"] = question_label
-    melt["quarter"] = melt["quarter"].map(normalize_quarter)
-    melt["period"] = melt.apply(lambda r: make_period(r["year"], r["month"]), axis=1)
-    return melt
-
-def reshape_jobfunc_q4(df: pd.DataFrame, question_label: str) -> pd.DataFrame:
-    """
-    Job function (Q4 only): has 'value' per job_function row.
-    Represent as month='Dec' so period is YYYY-12.
-    """
-    if df.empty:
-        return pd.DataFrame()
-    for c in ["entity_name","year","quarter","worker_category","subquestion","job_function"]:
-        if c not in df.columns:
-            df[c] = ""
-    if "value" not in df.columns:
-        df["value"] = 0
-
-    out = df[["entity_name","year","quarter","worker_category","subquestion","job_function","value"]].copy()
-    out["question"] = question_label
-    out["quarter"] = out["quarter"].map(normalize_quarter)
-    # Place Q4 totals at Dec period
-    out["month"] = "Dec"
-    out["period"] = out["year"].astype(int).astype(str) + "-12"
-    return out
-
-# --------------------------
-# Main builder
-# --------------------------
-def build_analysis(stage_path: Path, out_csv: Path) -> None:
-    # Load all sheets
-    q1a  = _safe_read(stage_path, "Q1A_Main")
-    q1jf = _safe_read(stage_path, "Q1A_JobFunc_Q4")
-    q1b  = _safe_read(stage_path, "Q1B")
-
-    q2a  = _safe_read(stage_path, "Q2A_Main")
-    q2jf = _safe_read(stage_path, "Q2A_JobFunc_Q4")
-    q2b  = _safe_read(stage_path, "Q2B")
-
-    q3   = _safe_read(stage_path, "Q3")
-    q4   = _safe_read(stage_path, "Q4")
-    q5   = _safe_read(stage_path, "Q5")
-
-    frames: List[pd.DataFrame] = []
-
-    # Q1
-    if not q1a.empty:
-        frames.append(reshape_monthly(q1a, "Q1A_Main", needs_subq=True))
-    if not q1jf.empty:
-        frames.append(reshape_jobfunc_q4(q1jf, "Q1A_JobFunc_Q4"))
-    if not q1b.empty:
-        frames.append(reshape_b_sheet(q1b, "Q1B"))
-
-    # Q2
-    if not q2a.empty:
-        frames.append(reshape_monthly(q2a, "Q2A_Main", needs_subq=True))
-    if not q2jf.empty:
-        frames.append(reshape_jobfunc_q4(q2jf, "Q2A_JobFunc_Q4"))
-    if not q2b.empty:
-        frames.append(reshape_b_sheet(q2b, "Q2B"))
-
-    # Q3 (no subquestion, no jobfunc)
-    if not q3.empty:
-        frames.append(reshape_monthly(q3, "Q3", needs_subq=False))
-
-    # Q4 (has subquestion)
-    if not q4.empty:
-        frames.append(reshape_monthly(q4, "Q4", needs_subq=True))
-
-    # Q5 (has subquestion)
-    if not q5.empty:
-        frames.append(reshape_monthly(q5, "Q5", needs_subq=True))
-
-    if not frames:
-        print("[WARN] No sheets found in staging. Nothing to write.")
-        return
-
-    df = pd.concat(frames, ignore_index=True)
-
-    # Attach entity_type
-    df = attach_entity_type(df, "entity_name")
-
-    # Entity/Group (original FI rows first)
-    df["entity_group"] = df["entity_name"]
-
-    # Add rollup rows
-    group_keys = ["question","subquestion","worker_category","job_function","year","quarter","month","period"]
-    df_roll = add_rollups(df, group_keys)
-
-    # Columns order for output
-    keep_cols = [
-        "year","quarter","month","period",
-        "question","subquestion","worker_category","job_function",
-        "entity_group","entity_name","entity_type",
-        "value","source_sheet"
-    ]
-
-    # Add source_sheet for traceability
-    def _src(q):
-        return q  # use question label as source
-    df_roll["source_sheet"] = df_roll["question"]
-
-    # Ensure value numeric
-    df_roll["value"] = pd.to_numeric(df_roll["value"], errors="coerce").fillna(0)
-
-    # Fill any missing expected columns
-    for c in keep_cols:
-        if c not in df_roll.columns:
-            df_roll[c] = "" if c not in ("value","year") else (0 if c=="value" else df_roll.get(c, ""))
-
-    df_roll = df_roll[keep_cols].sort_values(
-        ["question","entity_group","subquestion","worker_category","job_function","year","period"],
-        kind="mergesort"
-    ).reset_index(drop=True)
-
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-    df_roll.to_csv(out_csv, index=False, encoding="utf-8-sig")
-    print(f"[DONE] Wrote {out_csv}  (rows={len(df_roll):,})")
-
-# --------------------------
-# CLI
-# --------------------------
-def main() -> int:
-    ap = argparse.ArgumentParser(description="Build Power BI-ready analysis_base.csv from staging_all.xlsx")
-    ap.add_argument("--stage", required=True, help="Path to staging_all.xlsx")
-    ap.add_argument("--out",   default=None, help="Output CSV (default: analysis_base.csv in same folder)")
+def main():
+    ap = argparse.ArgumentParser(description="Build analysis_base.csv from staging (xlsx or csv folder).")
+    ap.add_argument("--stage-xlsx", type=str, default=None, help="Path to staging workbook (.xlsx)")
+    ap.add_argument("--csv-dir", type=str, default=None, help="Folder containing per-sheet CSVs (Q1A_Main.csv, ...)")
+    ap.add_argument("--out", type=str, required=True, help="Output CSV path (analysis_base.csv)")
     args = ap.parse_args()
 
-    stage_path = Path(args.stage)
-    if not stage_path.exists():
-        print(f"[ERROR] Staging file not found: {stage_path}")
-        return 2
+    loaded: Dict[str, pd.DataFrame] = {}
+    if args.stage_xlsx:
+        p = Path(args.stage_xlsx)
+        if not p.exists():
+            print(f"[ERROR] Staging .xlsx not found: {p}")
+            sys.exit(2)
+        loaded = read_stage_xlsx(p)
+    elif args.csv_dir:
+        d = Path(args.csv_dir)
+        if not d.exists():
+            print(f"[ERROR] CSV dir not found: {d}")
+            sys.exit(2)
+        loaded = read_stage_csvdir(d)
+    else:
+        print("[ERROR] Provide either --stage-xlsx or --csv-dir")
+        sys.exit(2)
 
-    out_csv = Path(args.out) if args.out else stage_path.with_name("analysis_base.csv")
-    build_analysis(stage_path, out_csv)
-    return 0
+    if not loaded:
+        print("[ERROR] No sheets found. I looked for:", ", ".join(EXPECTED_SHEETS))
+        sys.exit(3)
+
+    rows: List[pd.DataFrame] = []
+    for name, df in loaded.items():
+        try:
+            part = build_analysis_rows(name, df)
+            if not part.empty:
+                rows.append(part)
+                print(f"[OK] {name} → {len(part):,} rows")
+            else:
+                print(f"[SKIP] {name} produced 0 rows")
+        except Exception as e:
+            print(f"[WARN] Failed to process {name}: {e}")
+
+    if not rows:
+        print("[ERROR] Everything was empty after processing.")
+        sys.exit(4)
+
+    final = pd.concat(rows, ignore_index=True)
+    final.sort_values(["question","entity_group","entity_name","year","period",
+                       "subquestion","worker_category","job_function"],
+                      kind="mergesort", inplace=True)
+    outp = Path(args.out)
+    outp.parent.mkdir(parents=True, exist_ok=True)
+    final.to_csv(outp, index=False)
+    print(f"[DONE] Wrote {len(final):,} rows → {outp}")
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
