@@ -1,195 +1,85 @@
-# build_analysis_csv.py
+# build_powerbi_from_qc.py
 from __future__ import annotations
-import argparse, sys
+import argparse
 from pathlib import Path
-from typing import Dict, List, Optional
 import pandas as pd
 
-EXPECTED_SHEETS = [
-    "Q1A_Main", "Q1A_JobFunc_Q4", "Q1B",
-    "Q2A_Main", "Q2A_JobFunc_Q4", "Q2B",
-    "Q3", "Q4", "Q5",
-]
+def read_qc_sheets(qc_path: Path, verbose=False) -> pd.DataFrame:
+    """
+    Read every QC_* sheet from the QC workbook and combine into one clean CSV dataset.
+    - Keeps all numeric/calculated columns (Jan–Dec, Diff, MoM, QoQ, YoY, etc.)
+    - Converts 'N/A' → blank (None)
+    - Adds a 'question' column based on sheet name
+    """
+    if verbose: print(f"[INFO] Reading QC workbook: {qc_path.name}")
+    xls = pd.ExcelFile(qc_path, engine="openpyxl")
 
-MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
-QMAP = {"Quarter 1":"Q1","Quarter 2":"Q2","Quarter 3":"Q3","Quarter 4":"Q4",
-        "Q1":"Q1","Q2":"Q2","Q3":"Q3","Q4":"Q4"}
+    all_parts = []
+    for sheet in xls.sheet_names:
+        if sheet.startswith("QC_"):
+            if verbose: print(f"  [+] Reading sheet: {sheet}")
+            df = pd.read_excel(xls, sheet_name=sheet, engine="openpyxl")
+            if df.empty:
+                if verbose: print(f"    [!] Sheet empty, skipped: {sheet}")
+                continue
 
-def _norm_q(q):
-    if q is None: return ""
-    s = str(q).strip()
-    return QMAP.get(s, s)
+            # Replace various NA forms with actual NaN (blank)
+            df = df.replace(["N/A", "n/a", "#N/A", "NA", "na"], pd.NA)
 
-def read_stage_xlsx(path: Path) -> Dict[str, pd.DataFrame]:
-    out: Dict[str, pd.DataFrame] = {}
-    try:
-        xf = pd.ExcelFile(path, engine="openpyxl")
-    except Exception as e:
-        print(f"[ERROR] Cannot open staging xlsx: {e}")
-        return out
-    print(f"[INFO] Found sheets in {path.name}: {xf.sheet_names}")
-    for s in EXPECTED_SHEETS:
-        if s in xf.sheet_names:
-            try:
-                df = pd.read_excel(path, sheet_name=s, engine="openpyxl")
-                if not df.empty:
-                    out[s] = df
-                    print(f"[LOAD] {s}: {len(df):,} rows")
-            except Exception as e:
-                print(f"[WARN] Failed reading {s}: {e}")
-    return out
+            # Add a question identifier
+            df.insert(0, "question", sheet)
 
-def read_stage_csvdir(folder: Path) -> Dict[str, pd.DataFrame]:
-    out: Dict[str, pd.DataFrame] = {}
-    for s in EXPECTED_SHEETS:
-        p = folder / f"{s}.csv"
-        if p.exists():
-            try:
-                df = pd.read_csv(p)
-                if not df.empty:
-                    out[s] = df
-                    print(f"[LOAD] {s} (csv): {len(df):,} rows")
-            except Exception as e:
-                print(f"[WARN] Failed reading {p.name}: {e}")
-    return out
+            all_parts.append(df)
 
-def ensure_cols(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    d = df.copy()
-    for c in cols:
-        if c not in d.columns:
-            d[c] = "" if c in ("subquestion","worker_category","job_function") else 0
-    return d
+        elif sheet.lower().startswith("_about"):
+            if verbose: print(f"  [!] Skipping metadata sheet: {sheet}")
+            continue
 
-def melt_months(df: pd.DataFrame, id_cols: List[str]) -> pd.DataFrame:
-    months_present = [m for m in MONTHS if m in df.columns]
-    if not months_present:
-        # job-function (value only) — synthesize Q4 as “Dec period” for PB charts
-        if "value" in df.columns:
-            d = df.copy()
-            d["month"] = "Dec"
-            d["value"] = pd.to_numeric(d["value"], errors="coerce").fillna(0.0)
-            return d[id_cols + ["month","value"]]
-        return pd.DataFrame(columns=id_cols + ["month","value"])
-    d = df.copy()
-    for m in months_present:
-        d[m] = pd.to_numeric(d[m], errors="coerce").fillna(0.0)
-    m = d.melt(id_vars=id_cols, value_vars=months_present,
-               var_name="month", value_name="value")
-    return m
+    if not all_parts:
+        print("[WARN] No QC_* sheets found.")
+        return pd.DataFrame()
 
-def add_entity_group(df: pd.DataFrame) -> pd.DataFrame:
-    # Keep the literal entity_name as the “group” column for PB drill/filter
-    d = df.copy()
-    if "entity_name" in d.columns:
-        d["entity_group"] = d["entity_name"]
-    else:
-        d["entity_group"] = "Unknown"
-    return d
+    combined = pd.concat(all_parts, ignore_index=True)
+    if verbose:
+        print(f"[=] Combined {len(all_parts)} sheets → {len(combined):,} rows, {len(combined.columns)} columns")
 
-def build_analysis_rows(sheet: str, df: pd.DataFrame) -> pd.DataFrame:
-    base = df.copy()
-    # Normalize structure
-    for c in ["entity_name","year","quarter"]:
-        if c not in base.columns: base[c] = None
-    base["quarter"] = base["quarter"].map(_norm_q)
-    # Figure question label
-    if sheet.startswith("Q1A"):
-        question = "Q1A"
-    elif sheet == "Q1B":
-        question = "Q1B"
-    elif sheet.startswith("Q2A"):
-        question = "Q2A"
-    elif sheet == "Q2B":
-        question = "Q2B"
-    else:
-        question = sheet  # Q3 / Q4 / Q5
+    # Clean column names: strip spaces, unify case slightly
+    combined.columns = [str(c).strip() for c in combined.columns]
 
-    # Ensure optional columns
-    if "subquestion" not in base.columns: base["subquestion"] = ""
-    if "worker_category" not in base.columns: base["worker_category"] = ""
-    if "job_function" not in base.columns: base["job_function"] = ""
-    # Identify ID columns per sheet
-    id_cols = ["entity_name","entity_group","year","quarter","question",
-               "subquestion","worker_category","job_function"]
+    # Convert numeric-like columns where possible
+    for c in combined.columns:
+        # skip obvious text columns
+        if c.lower() in ["question", "entity / group", "subquestion", "worker category", "job function"]:
+            continue
+        # try numeric
+        combined[c] = pd.to_numeric(combined[c], errors="ignore")
 
-    # Add question label & entity_group
-    base["question"] = question
-    base = add_entity_group(base)
+    return combined
 
-    # Q1B/Q2B are single-month (Jun/Dec). Keep as months too so visuals work.
-    if sheet in ("Q1B","Q2B"):
-        # Could be Jun or Dec depending on quarter; already columns named “Jun/Dec” in staging
-        # Let melt_months handle whichever month exists.
-        pass
 
-    # Make long (month,value)
-    long = melt_months(base, id_cols=id_cols)
-
-    # Build period (YYYY-MM) for DateTable join in PBI
-    month_to_num = {m:i for i,m in enumerate(MONTHS, start=1)}
-    long["month_num"] = long["month"].map(month_to_num).fillna(1).astype(int)
-    long["period"] = long.apply(lambda r: f"{int(r['year'])}-{r['month_num']:02d}" if pd.notnull(r["year"]) else "", axis=1)
-    # Clean types
-    long["year"] = pd.to_numeric(long["year"], errors="coerce").astype("Int64")
-    long["value"] = pd.to_numeric(long["value"], errors="coerce").fillna(0.0)
-    # Order columns
-    cols = ["entity_group","entity_name","year","quarter","period","month","question",
-            "subquestion","worker_category","job_function","value"]
-    long = long[cols]
-    return long
-
-def main():
-    ap = argparse.ArgumentParser(description="Build analysis_base.csv from staging (xlsx or csv folder).")
-    ap.add_argument("--stage-xlsx", type=str, default=None, help="Path to staging workbook (.xlsx)")
-    ap.add_argument("--csv-dir", type=str, default=None, help="Folder containing per-sheet CSVs (Q1A_Main.csv, ...)")
-    ap.add_argument("--out", type=str, required=True, help="Output CSV path (analysis_base.csv)")
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Build Power BI-ready CSV directly from QC workbook.")
+    ap.add_argument("--qc", required=True, help="Path to QC workbook, e.g. qc_workbook_2025Q2.xlsx")
+    ap.add_argument("--out", required=True, help="Output CSV path for Power BI (e.g. analysis_base.csv)")
+    ap.add_argument("--verbose", action="store_true", help="Print progress information")
     args = ap.parse_args()
 
-    loaded: Dict[str, pd.DataFrame] = {}
-    if args.stage_xlsx:
-        p = Path(args.stage_xlsx)
-        if not p.exists():
-            print(f"[ERROR] Staging .xlsx not found: {p}")
-            sys.exit(2)
-        loaded = read_stage_xlsx(p)
-    elif args.csv_dir:
-        d = Path(args.csv_dir)
-        if not d.exists():
-            print(f"[ERROR] CSV dir not found: {d}")
-            sys.exit(2)
-        loaded = read_stage_csvdir(d)
-    else:
-        print("[ERROR] Provide either --stage-xlsx or --csv-dir")
-        sys.exit(2)
+    qc_path = Path(args.qc)
+    if not qc_path.exists():
+        print(f"[ERROR] File not found: {qc_path}")
+        return 2
 
-    if not loaded:
-        print("[ERROR] No sheets found. I looked for:", ", ".join(EXPECTED_SHEETS))
-        sys.exit(3)
+    df = read_qc_sheets(qc_path, verbose=args.verbose)
+    if df.empty:
+        print("[WARN] No data written — workbook appears empty or no QC_* sheets found.")
+        return 0
 
-    rows: List[pd.DataFrame] = []
-    for name, df in loaded.items():
-        try:
-            part = build_analysis_rows(name, df)
-            if not part.empty:
-                rows.append(part)
-                print(f"[OK] {name} → {len(part):,} rows")
-            else:
-                print(f"[SKIP] {name} produced 0 rows")
-        except Exception as e:
-            print(f"[WARN] Failed to process {name}: {e}")
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(args.out, index=False)
+    if args.verbose:
+        print(f"[DONE] Wrote {len(df):,} rows × {len(df.columns)} cols → {args.out}")
+    return 0
 
-    if not rows:
-        print("[ERROR] Everything was empty after processing.")
-        sys.exit(4)
-
-    final = pd.concat(rows, ignore_index=True)
-    final.sort_values(["question","entity_group","entity_name","year","period",
-                       "subquestion","worker_category","job_function"],
-                      kind="mergesort", inplace=True)
-    outp = Path(args.out)
-    outp.parent.mkdir(parents=True, exist_ok=True)
-    final.to_csv(outp, index=False)
-    print(f"[DONE] Wrote {len(final):,} rows → {outp}")
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
