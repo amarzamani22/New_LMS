@@ -1,104 +1,185 @@
-# generate_powerbi_source.py
-import pandas as pd
-from pathlib import Path
+#!/usr/bin/env python3
+from __future__ import annotations
 import re
+from pathlib import Path
+import pandas as pd
+from openpyxl import load_workbook
 
-INPUT_PATH = "qc_workbook_2025Q2.xlsx"   # your QC workbook
-OUTPUT_PATH = "powerbi_source_2025Q2.xlsx"
+# ======= CONFIG =======
+# Input = your QC workbook from qc_workbook.py
+INPUT_QC = "QC_All_Output.xlsx"
+# Output = long/unpivoted table for Power BI (xlsx or csv)
+OUTPUT = "powerbi_source.xlsx"   # or "powerbi_source.csv"
 
-# Detect patterns
-MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+# Header layout from qc_common: info rows + band row + header row
+# info_rows = 4  -> band_row = 5, header_row = 6 (1-based)
+HEADER_ROW_1BASED = 6  # Excel row number where TRUE column headers are written
+HEADER_ROW_0BASED = HEADER_ROW_1BASED - 1
+
+# Column name constants expected on QC sheets
+ID_COLS_ALL = ["Entity / Group", "Subquestion", "Worker Category", "Job Function"]
+ID_COLS_MIN = ["Entity / Group", "Subquestion", "Worker Category"]  # Job Function optional
+
+# Regex classifiers for metric columns
 PATTERNS = {
     "Value": re.compile(r"^(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|Q[1-4])$"),
-    "Diff": re.compile(r"^Diff "),
-    "MoM %": re.compile(r"^MoM "),
-    "QoQ %": re.compile(r"^%Diff "),
-    "YoY %": re.compile(r"^YoY "),
+    "Diff":  re.compile(r"^Diff (.+)$"),        # Diff Feb, Diff Q2
+    "MoM %": re.compile(r"^MoM (.+)$"),         # MoM Feb
+    "QoQ %": re.compile(r"^%Diff (Q[1-4])$"),   # %Diff Q2
+    "YoY %": re.compile(r"^YoY (.+)$"),         # YoY Feb, YoY Q2, YoY Q4
+    "Prior": re.compile(r"^Prior (.+)$"),       # Prior Feb, Prior Q2
 }
 
-def safe_read_excel(path):
-    try:
-        return pd.read_excel(path, sheet_name=None, engine="openpyxl")
-    except Exception as e:
-        print(f"[!] Failed to read {path}: {e}")
-        return {}
+MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+QUARTERS = ["Q1","Q2","Q3","Q4"]
 
-def classify_column(col):
-    """Classify column type and period based on name."""
-    for k, pattern in PATTERNS.items():
-        if pattern.match(str(col)):
-            # extract period (e.g., Feb from "Diff Feb", Q2 from "%Diff Q2")
-            parts = str(col).replace("Diff ","").replace("MoM ","").replace("%Diff ","").replace("YoY ","").strip()
-            return k, parts
+def read_about(qc_path: Path) -> tuple[str|None, int|None]:
+    """Read Year & Quarter from the _About sheet if present."""
+    year = None
+    quarter = None
+    try:
+        wb = load_workbook(qc_path, read_only=True, data_only=True)
+        if "_About" in wb.sheetnames:
+            ws = wb["_About"]
+            # A3=Year, B3=<int> ; A4=Quarter, B4=Qx
+            yv = ws["B3"].value
+            qv = ws["B4"].value
+            try:
+                year = int(str(yv).strip())
+            except Exception:
+                year = None
+            quarter = str(qv).strip() if qv else None
+        try:
+            wb.close()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return (quarter, year)
+
+def classify_col(colname: str) -> tuple[str|None, str|None]:
+    """
+    Return (MetricType, MetricPeriod)
+      MetricType ∈ {"Value","Diff","MoM %","QoQ %","YoY %","Prior"} or None
+      MetricPeriod ∈ month or quarter inside the title (e.g., "Feb", "Q2")
+    """
+    s = str(colname)
+    # exact months/quarters → "Value"
+    if PATTERNS["Value"].match(s):
+        return "Value", s
+    # others with a token following the label
+    for label, rx in (("Diff", PATTERNS["Diff"]),
+                      ("MoM %", PATTERNS["MoM %"]),
+                      ("QoQ %", PATTERNS["QoQ %"]),
+                      ("YoY %", PATTERNS["YoY %"]),
+                      ("Prior", PATTERNS["Prior"])):
+        m = rx.match(s)
+        if m:
+            return label, m.group(1)
     return None, None
 
-def melt_sheet(df: pd.DataFrame, sheet_name: str):
-    # Skip empty sheets
-    if df.empty:
+def melt_qc_sheet(df: pd.DataFrame, sheet_name: str, question_hint: str|None) -> pd.DataFrame:
+    """Unpivot a single QC sheet into long format."""
+    if df is None or df.empty:
         return pd.DataFrame()
 
-    # Identify question from sheet name (e.g., QC_Q1A_Main → Q1)
-    qmatch = re.search(r"(Q[1-5])", sheet_name)
-    question = qmatch.group(1) if qmatch else ""
+    # Ensure ID columns exist
+    for c in ID_COLS_ALL:
+        if c not in df.columns:
+            df[c] = ""
 
-    # Ensure standard columns exist
-    for col in ["Entity / Group","Subquestion","Worker Category","Job Function"]:
-        if col not in df.columns:
-            df[col] = ""
+    id_cols_present = [c for c in ID_COLS_ALL if c in df.columns]
+    if not set(ID_COLS_MIN).issubset(set(id_cols_present)):
+        # Must have at least the 3 core IDs
+        return pd.DataFrame()
 
-    id_cols = ["Entity / Group","Subquestion","Worker Category","Job Function"]
-
-    melted_frames = []
+    melted = []
     for col in df.columns:
-        metric_type, metric_period = classify_column(col)
-        if not metric_type:
+        if col in ID_COLS_ALL:
             continue
-        tmp = df[id_cols].copy()
-        tmp["MetricType"] = metric_type
-        tmp["MetricPeriod"] = metric_period
-        # Convert "N/A" or blank to NaN
-        tmp["Value"] = pd.to_numeric(
+        mtype, mperiod = classify_col(col)
+        if not mtype:
+            continue
+
+        block = df[id_cols_present].copy()
+        block["MetricType"] = mtype
+        block["MetricPeriod"] = mperiod
+        block["Value"] = pd.to_numeric(
             df[col].replace(["N/A","NA","na","n/a",""], pd.NA),
             errors="coerce"
         )
-        tmp["Sheet"] = sheet_name
-        tmp["Question"] = question
-        melted_frames.append(tmp)
+        block["Sheet"] = sheet_name
+        # Infer question label (Q1..Q5) from sheet name if not provided
+        if question_hint:
+            block["Question"] = question_hint
+        else:
+            qm = re.search(r"(Q[1-5])", sheet_name)
+            block["Question"] = qm.group(1) if qm else ""
+        melted.append(block)
 
-    if not melted_frames:
-        return pd.DataFrame()
-    return pd.concat(melted_frames, ignore_index=True)
+    return pd.concat(melted, ignore_index=True) if melted else pd.DataFrame()
 
 def main():
-    print(f"Loading QC workbook: {INPUT_PATH}")
-    sheets = safe_read_excel(INPUT_PATH)
-    if not sheets:
-        print("No sheets found!")
+    in_path = Path(INPUT_QC)
+    if not in_path.exists():
+        print(f"[ERROR] QC workbook not found: {in_path}")
         return
 
-    all_frames = []
-    for name, df in sheets.items():
-        if not name.startswith("QC_"):
+    # Read all QC_ sheets using header row = 6 (0-based index 5)
+    xls = pd.ExcelFile(in_path, engine="openpyxl")
+    qc_sheet_names = [s for s in xls.sheet_names if s.startswith("QC_")]
+    if not qc_sheet_names:
+        print("[WARN] No QC_ sheets found in workbook.")
+        return
+
+    quarter, year = read_about(in_path)
+
+    frames = []
+    for s in qc_sheet_names:
+        print(f"Processing {s} ...")
+        try:
+            df = pd.read_excel(in_path, sheet_name=s, engine="openpyxl", header=HEADER_ROW_0BASED)
+        except Exception as e:
+            print(f"  -> skip (read error): {e}")
             continue
-        print(f"Processing {name}...")
-        melted = melt_sheet(df, name)
-        if not melted.empty:
-            all_frames.append(melted)
+        long_df = melt_qc_sheet(df, s, question_hint=None)
+        if long_df.empty:
+            print("  -> no metric columns recognized.")
+            continue
+        if year is not None:
+            long_df["Year"] = int(year)
+        if quarter is not None:
+            long_df["Quarter"] = str(quarter)
+        frames.append(long_df)
 
-    if not all_frames:
-        print("No QC sheets produced data.")
+    if not frames:
+        print("[WARN] Nothing to export.")
         return
 
-    combined = pd.concat(all_frames, ignore_index=True)
-    print(f"Combined rows: {len(combined)}")
+    out = pd.concat(frames, ignore_index=True)
 
-    # Clean up for Power BI
-    combined = combined.sort_values(["Question","Sheet","Entity / Group","MetricType","MetricPeriod"])
-    combined.reset_index(drop=True, inplace=True)
+    # Order and sort for convenience
+    desired_cols = [
+        "Question","Sheet","Year","Quarter",
+        "Entity / Group","Subquestion","Worker Category","Job Function",
+        "MetricType","MetricPeriod","Value"
+    ]
+    for c in desired_cols:
+        if c not in out.columns:
+            out[c] = "" if c != "Value" else pd.NA
 
-    # Write to Excel
-    combined.to_excel(OUTPUT_PATH, index=False, engine="openpyxl")
-    print(f"[✓] Power BI source saved → {OUTPUT_PATH}")
+    out = out[desired_cols].sort_values(
+        ["Question","Sheet","Entity / Group","Subquestion","Worker Category","Job Function","MetricType","MetricPeriod"],
+        kind="mergesort"
+    ).reset_index(drop=True)
+
+    # Save
+    if OUTPUT.lower().endswith(".csv"):
+        out.to_csv(OUTPUT, index=False)
+    else:
+        out.to_excel(OUTPUT, index=False, engine="openpyxl")
+
+    print(f"[DONE] Exported {len(out):,} rows → {OUTPUT}")
 
 if __name__ == "__main__":
     main()
