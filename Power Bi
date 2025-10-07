@@ -1,85 +1,351 @@
-# build_powerbi_from_qc.py
+# app.py
 from __future__ import annotations
-import argparse
+import re
 from pathlib import Path
+
 import pandas as pd
+import streamlit as st
+import plotly.express as px
+import plotly.graph_objects as go
 
-def read_qc_sheets(qc_path: Path, verbose=False) -> pd.DataFrame:
+# ----------------------------
+# Helpers / constants
+# ----------------------------
+Q_TO_MONTHS = {
+    "Q1": ["Jan","Feb","Mar"],
+    "Q2": ["Apr","May","Jun"],
+    "Q3": ["Jul","Aug","Sep"],
+    "Q4": ["Oct","Nov","Dec"],
+}
+MONTHS_FULL = sum(Q_TO_MONTHS.values(), [])
+
+def is_percent_series(colname: str) -> bool:
+    # MoM Feb, %Diff Q2, YoY Q4, YoY Jan, etc.
+    return (
+        colname.startswith("MoM ") or
+        colname.startswith("%Diff ") or
+        colname.startswith("YoY ")
+    )
+
+def available_quarters_in(df: pd.DataFrame) -> list[str]:
+    return [q for q in ["Q1","Q2","Q3","Q4"] if q in df.columns]
+
+def available_mom_cols(df: pd.DataFrame) -> list[str]:
+    return [c for c in df.columns if c.startswith("MoM ")]
+
+def available_qoq_cols(df: pd.DataFrame) -> list[str]:
+    return [c for c in df.columns if c.startswith("%Diff ")]
+
+def available_yoy_cols(df: pd.DataFrame) -> list[str]:
+    return [c for c in df.columns if c.startswith("YoY ")]
+
+def available_months(df: pd.DataFrame) -> list[str]:
+    return [m for m in MONTHS_FULL if m in df.columns]
+
+def qc_sheets_by_question(book_sheets: dict[str, pd.DataFrame]) -> dict[str, list[str]]:
     """
-    Read every QC_* sheet from the QC workbook and combine into one clean CSV dataset.
-    - Keeps all numeric/calculated columns (Jan–Dec, Diff, MoM, QoQ, YoY, etc.)
-    - Converts 'N/A' → blank (None)
-    - Adds a 'question' column based on sheet name
+    Group sheet names by question (Q1..Q5) using their QC_ prefix.
     """
-    if verbose: print(f"[INFO] Reading QC workbook: {qc_path.name}")
-    xls = pd.ExcelFile(qc_path, engine="openpyxl")
-
-    all_parts = []
-    for sheet in xls.sheet_names:
-        if sheet.startswith("QC_"):
-            if verbose: print(f"  [+] Reading sheet: {sheet}")
-            df = pd.read_excel(xls, sheet_name=sheet, engine="openpyxl")
-            if df.empty:
-                if verbose: print(f"    [!] Sheet empty, skipped: {sheet}")
-                continue
-
-            # Replace various NA forms with actual NaN (blank)
-            df = df.replace(["N/A", "n/a", "#N/A", "NA", "na"], pd.NA)
-
-            # Add a question identifier
-            df.insert(0, "question", sheet)
-
-            all_parts.append(df)
-
-        elif sheet.lower().startswith("_about"):
-            if verbose: print(f"  [!] Skipping metadata sheet: {sheet}")
+    out = {f"Q{i}": [] for i in range(1,6)}
+    for name in book_sheets.keys():
+        if not name.startswith("QC_"):
             continue
+        m = re.match(r"QC_(Q[1-5])", name)
+        if m:
+            out[m.group(1)].append(name)
+    # keep stable order
+    for q in out:
+        out[q] = sorted(out[q])
+    return out
 
-    if not all_parts:
-        print("[WARN] No QC_* sheets found.")
+def clean_numeric(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    d = df.copy()
+    for c in cols:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+    return d
+
+def build_long_from_months(df: pd.DataFrame, months: list[str], value_col: str = "value") -> pd.DataFrame:
+    if not months:
         return pd.DataFrame()
+    id_cols = [c for c in df.columns if c not in months]
+    long_df = df[id_cols + months].melt(id_vars=id_cols, value_vars=months,
+                                        var_name="Month", value_name=value_col)
+    # drop all-NaNs
+    long_df = long_df.dropna(subset=[value_col], how="all")
+    return long_df
 
-    combined = pd.concat(all_parts, ignore_index=True)
-    if verbose:
-        print(f"[=] Combined {len(all_parts)} sheets → {len(combined):,} rows, {len(combined.columns)} columns")
+def band_for_month(m: str) -> str:
+    for q, ml in Q_TO_MONTHS.items():
+        if m in ml:
+            return q
+    return ""
 
-    # Clean column names: strip spaces, unify case slightly
-    combined.columns = [str(c).strip() for c in combined.columns]
+def color_for_band(q: str) -> str:
+    # Light bands like QC template
+    return {
+        "Q1": "#E8F2FF",
+        "Q2": "#EAFBEA",
+        "Q3": "#FFF2E6",
+        "Q4": "#FCEEFF",
+    }.get(q, "#F2F2F2")
 
-    # Convert numeric-like columns where possible
-    for c in combined.columns:
-        # skip obvious text columns
-        if c.lower() in ["question", "entity / group", "subquestion", "worker category", "job function"]:
+def add_threshold_shapes(fig: go.Figure, y_threshold: float, abs_cutoff: float|None = None, is_percent: bool=True):
+    """
+    Draw horizontal bands for +/- threshold.
+    - If is_percent=True, y_threshold is a fraction (e.g., 0.25 → 25%)
+    - abs_cutoff is handled via point-coloring in traces; we still show threshold lines
+    """
+    th = y_threshold
+    fig.add_hline(y= th, line_color="#E6B800", line_dash="dash", annotation_text="+threshold", annotation_position="top left")
+    fig.add_hline(y=-th, line_color="#E6B800", line_dash="dash", annotation_text="-threshold", annotation_position="bottom left")
+    return fig
+
+def make_point_colors(y_values, pct_threshold: float, abs_filter=None):
+    """
+    Return a list of colors per point:
+      - red if |y| >= pct_threshold and abs_filter is True (i.e., abs condition met)
+      - yellow if |y| >= pct_threshold and abs_filter is False/None
+      - default otherwise
+    """
+    colors = []
+    for i, y in enumerate(y_values):
+        if y is None or pd.isna(y):
+            colors.append(None)
             continue
-        # try numeric
-        combined[c] = pd.to_numeric(combined[c], errors="ignore")
+        try:
+            ya = abs(float(y))
+        except:
+            colors.append(None)
+            continue
+        if ya >= pct_threshold:
+            if abs_filter is not None and abs_filter[i] is True:
+                colors.append("#FFB3B3")  # red-ish
+            else:
+                colors.append("#FFF2B2")  # yellow-ish
+        else:
+            colors.append(None)
+    return colors
 
-    return combined
+# ----------------------------
+# UI
+# ----------------------------
+st.set_page_config(page_title="RLMS QC Dashboard", layout="wide")
+st.title("RLMS QC Dashboard (from QC workbook)")
 
+with st.sidebar:
+    st.header("Workbook")
+    qc_path = st.text_input("QC workbook path (.xlsx)", value="qc_workbook.xlsx")
+    st.caption("Uses all sheets named like **QC_Q…** directly; no CSVs needed.")
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="Build Power BI-ready CSV directly from QC workbook.")
-    ap.add_argument("--qc", required=True, help="Path to QC workbook, e.g. qc_workbook_2025Q2.xlsx")
-    ap.add_argument("--out", required=True, help="Output CSV path for Power BI (e.g. analysis_base.csv)")
-    ap.add_argument("--verbose", action="store_true", help="Print progress information")
-    args = ap.parse_args()
+    st.header("Highlight thresholds")
+    mom_pct = st.number_input("MoM / %Diff / YoY threshold (±%)", value=25.0, step=1.0) / 100.0
+    abs_cut = st.number_input("Abs cutoff (for red points)", value=50.0, step=10.0)
 
-    qc_path = Path(args.qc)
-    if not qc_path.exists():
-        print(f"[ERROR] File not found: {qc_path}")
-        return 2
+    st.header("Chart")
+    show_table = st.checkbox("Show data table below chart", value=True)
 
-    df = read_qc_sheets(qc_path, verbose=args.verbose)
-    if df.empty:
-        print("[WARN] No data written — workbook appears empty or no QC_* sheets found.")
-        return 0
+# Load workbook
+if not Path(qc_path).exists():
+    st.warning("Select a valid QC workbook file.")
+    st.stop()
 
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(args.out, index=False)
-    if args.verbose:
-        print(f"[DONE] Wrote {len(df):,} rows × {len(df.columns)} cols → {args.out}")
-    return 0
+try:
+    sheets = pd.read_excel(qc_path, sheet_name=None, engine="openpyxl")
+except Exception as e:
+    st.error(f"Failed to read workbook: {e}")
+    st.stop()
 
+by_q = qc_sheets_by_question(sheets)
+tabs = st.tabs([f"Q{i}" for i in range(1,6)])
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+for qi, qname in enumerate([f"Q{i}" for i in range(1,6)]):
+    with tabs[qi]:
+        st.subheader(qname)
+
+        q_sheets = by_q.get(qname, [])
+        if not q_sheets:
+            st.info("No QC sheets for this question in the workbook.")
+            continue
+
+        qc_sheet = st.selectbox(f"Select {qname} sheet", q_sheets, key=f"{qname}_sheet")
+        df = sheets[qc_sheet].copy()
+
+        if df.empty:
+            st.info("Sheet is empty.")
+            continue
+
+        # Try to ensure expected columns exist for filtering without breaking
+        for col in ["Entity / Group","Subquestion","Worker Category","Job Function"]:
+            if col not in df.columns:
+                df[col] = ""
+
+        # Identify columns by type
+        months = available_months(df)
+        qcols  = available_quarters_in(df)
+        momcols = available_mom_cols(df)
+        qoqcols = available_qoq_cols(df)
+        yoycols = available_yoy_cols(df)
+
+        # Numeric coercion
+        num_cols = months + qcols + momcols + qoqcols + yoycols
+        df = clean_numeric(df, num_cols)
+
+        # Filters panel
+        c1, c2, c3, c4 = st.columns([1.8,1.4,1.2,1.2])
+        with c1:
+            # “Entity / Group” may contain rollups and FI names; let user multi-select
+            all_entities = df["Entity / Group"].dropna().astype(str).unique().tolist()
+            sel_entities = st.multiselect("Entity / Group", all_entities, default=all_entities[:15])
+        with c2:
+            all_subq = sorted([s for s in df["Subquestion"].dropna().astype(str).unique().tolist() if s.strip()!=""])
+            sel_subq = st.multiselect("Subquestion", all_subq, default=all_subq)
+        with c3:
+            all_wc = sorted([s for s in df["Worker Category"].dropna().astype(str).unique().tolist() if s.strip()!=""])
+            sel_wc = st.multiselect("Worker Category", all_wc, default=all_wc)
+        with c4:
+            if "Job Function" in df.columns and df["Job Function"].notna().any():
+                all_jf = sorted([s for s in df["Job Function"].dropna().astype(str).unique().tolist() if s.strip()!=""])
+                sel_jf = st.multiselect("Job Function", all_jf, default=all_jf)
+            else:
+                sel_jf = []
+
+        # Apply filters
+        mask = df["Entity / Group"].astype(str).isin(sel_entities)
+        if sel_subq:
+            mask &= df["Subquestion"].astype(str).isin(sel_subq)
+        if sel_wc:
+            mask &= df["Worker Category"].astype(str).isin(sel_wc)
+        if "Job Function" in df.columns and sel_jf:
+            mask &= df["Job Function"].astype(str).isin(sel_jf)
+        fdf = df[mask].copy()
+
+        if fdf.empty:
+            st.warning("No rows match the current filters.")
+            continue
+
+        # What to plot?
+        st.markdown("**Metric to plot**")
+        plot_mode = st.radio(
+            "Choose",
+            ["Monthly","Quarter totals","MoM %","QoQ %","YoY %"],
+            horizontal=True,
+            key=f"{qname}_mode"
+        )
+
+        # Build data for the chart
+        if plot_mode == "Monthly":
+            if not months:
+                st.info("No monthly columns in this sheet.")
+                continue
+            ldf = build_long_from_months(fdf, months, value_col="Value")
+            # Quarter band & color
+            ldf["QuarterBand"] = ldf["Month"].map(band_for_month)
+            band_colors = {q: color_for_band(q) for q in ["Q1","Q2","Q3","Q4"]}
+            # Chart
+            fig = px.line(
+                ldf, x="Month", y="Value",
+                color="Entity / Group",
+                line_group="Entity / Group",
+                hover_data=["Subquestion","Worker Category","Job Function"] if "Job Function" in ldf.columns else ["Subquestion","Worker Category"],
+            )
+            # add month band rectangles
+            # (Plotly doesn't have per-point band color; we add vertical rectangles by month index groups)
+            month_order = months
+            for q, ml in Q_TO_MONTHS.items():
+                xs = [m for m in month_order if m in ml]
+                if not xs: 
+                    continue
+                fig.add_vrect(
+                    x0=xs[0], x1=xs[-1],
+                    fillcolor=band_colors[q],
+                    opacity=0.2, line_width=0, layer="below"
+                )
+            fig.update_layout(yaxis_title=None, xaxis_title=None, legend_title="Entity / Group")
+            st.plotly_chart(fig, use_container_width=True)
+
+            if show_table:
+                st.dataframe(fdf.reset_index(drop=True))
+
+        elif plot_mode == "Quarter totals":
+            if not qcols:
+                st.info("No quarter total columns in this sheet.")
+                continue
+            id_cols = [c for c in fdf.columns if c not in qcols]
+            ldf = fdf[id_cols + qcols].melt(id_vars=id_cols, value_vars=qcols,
+                                            var_name="Quarter", value_name="Value")
+            fig = px.line(
+                ldf, x="Quarter", y="Value",
+                color="Entity / Group",
+                line_group="Entity / Group",
+                markers=True,
+                hover_data=["Subquestion","Worker Category","Job Function"] if "Job Function" in ldf.columns else ["Subquestion","Worker Category"],
+            )
+            fig.update_layout(yaxis_title=None, xaxis_title=None, legend_title="Entity / Group")
+            st.plotly_chart(fig, use_container_width=True)
+            if show_table:
+                st.dataframe(fdf.reset_index(drop=True))
+
+        elif plot_mode == "MoM %":
+            cols = momcols
+            if not cols:
+                st.info("No MoM % columns in this sheet.")
+                continue
+            id_cols = [c for c in fdf.columns if c not in cols]
+            ldf = fdf[id_cols + cols].melt(id_vars=id_cols, value_vars=cols,
+                                           var_name="Metric", value_name="Percent")
+            # Color points by threshold; we can’t compute abs-diff pairing here, so highlight on % only
+            fig = px.line(
+                ldf, x="Metric", y="Percent",
+                color="Entity / Group",
+                line_group="Entity / Group",
+                markers=True,
+                hover_data=["Subquestion","Worker Category","Job Function"] if "Job Function" in ldf.columns else ["Subquestion","Worker Category"],
+            )
+            fig = add_threshold_shapes(fig, y_threshold=mom_pct, is_percent=True)
+            fig.update_layout(yaxis_tickformat=".1%", yaxis_title=None, xaxis_title=None, legend_title="Entity / Group")
+            st.plotly_chart(fig, use_container_width=True)
+            if show_table:
+                st.dataframe(fdf.reset_index(drop=True))
+
+        elif plot_mode == "QoQ %":
+            cols = qoqcols
+            if not cols:
+                st.info("No QoQ %Diff columns in this sheet.")
+                continue
+            id_cols = [c for c in fdf.columns if c not in cols]
+            ldf = fdf[id_cols + cols].melt(id_vars=id_cols, value_vars=cols,
+                                           var_name="Metric", value_name="Percent")
+            fig = px.line(
+                ldf, x="Metric", y="Percent",
+                color="Entity / Group",
+                line_group="Entity / Group",
+                markers=True,
+                hover_data=["Subquestion","Worker Category","Job Function"] if "Job Function" in ldf.columns else ["Subquestion","Worker Category"],
+            )
+            fig = add_threshold_shapes(fig, y_threshold=mom_pct, is_percent=True)
+            fig.update_layout(yaxis_tickformat=".1%", yaxis_title=None, xaxis_title=None, legend_title="Entity / Group")
+            st.plotly_chart(fig, use_container_width=True)
+            if show_table:
+                st.dataframe(fdf.reset_index(drop=True))
+
+        elif plot_mode == "YoY %":
+            cols = yoycols
+            if not cols:
+                st.info("No YoY % columns in this sheet.")
+                continue
+            id_cols = [c for c in fdf.columns if c not in cols]
+            ldf = fdf[id_cols + cols].melt(id_vars=id_cols, value_vars=cols,
+                                           var_name="Metric", value_name="Percent")
+            fig = px.line(
+                ldf, x="Metric", y="Percent",
+                color="Entity / Group",
+                line_group="Entity / Group",
+                markers=True,
+                hover_data=["Subquestion","Worker Category","Job Function"] if "Job Function" in ldf.columns else ["Subquestion","Worker Category"],
+            )
+            fig = add_threshold_shapes(fig, y_threshold=mom_pct, is_percent=True)
+            fig.update_layout(yaxis_tickformat=".1%", yaxis_title=None, xaxis_title=None, legend_title="Entity / Group")
+            st.plotly_chart(fig, use_container_width=True)
+            if show_table:
+                st.dataframe(fdf.reset_index(drop=True))
