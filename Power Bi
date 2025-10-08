@@ -3,84 +3,134 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 
-# --- 1. Load and Prepare the Data from the Excel file ---
-@st.cache_data
-def load_data():
-    # Define the path to the Excel workbook
+# --- Page Configuration (Do this first) ---
+st.set_page_config(
+    page_title="FI Data Quality Dashboard",
+    page_icon="📊",
+    layout="wide"
+)
+
+# --- 1. Data Loading Logic ---
+@st.cache_data # Cache the data to improve performance
+def load_data(sheet_name):
+    """Loads data from a specific sheet in the Excel workbook."""
     file_path = "submission/qc_workbook_2025.xlsx"
-    
-    # Read the specific sheet ("QC_Q1A_Main") from the Excel file
-    df = pd.read_excel(file_path, sheet_name="QC_Q1A_Main", header=5)
-    return df
+    try:
+        # Read the specified sheet from the Excel file
+        df = pd.read_excel(file_path, sheet_name=sheet_name, header=5)
+        return df
+    except Exception as e:
+        # Return the error to be displayed in the app
+        return e
 
-# Use a try-except block to handle file not found errors gracefully
-try:
-    df = load_data()
+# --- 2. Main Dashboard Interface ---
+st.title("📊 Financial Institution QC Dashboard")
+st.markdown("An interactive tool to perform trend analysis and detect outliers based on a **±25%** month-over-month threshold.")
 
-    # --- 2. Create the Dashboard Interface ---
-    st.title('Financial Institution QC Trend Analysis 📊')
-    st.write("Use the dropdown menu below to select an institution and view its monthly employment trend.")
+# --- 3. Sidebar for Controls and Filters ---
+st.sidebar.header("Dashboard Controls")
 
-    # Get a unique list of all entities for the dropdown menu
-    total_employment_df = df[df['Worker Category'] == 'TOTAL Employment']
-    entity_list = total_employment_df['Entity / Group'].unique()
+# Dictionary to map user-friendly names to actual sheet names
+SHEET_MAP = {
+    'Q1A: Number of Employees': 'QC_Q1A_Main',
+    'Q2A: Salary & Wages': 'QC_Q2A_Main',
+    'Q3: Hours Worked': 'QC_Q3',
+    'Q4: Job Vacancies': 'QC_Q4',
+    'Q5: Employee Separations': 'QC_Q5'
+}
 
-    # Create a dropdown menu
-    selected_entity = st.selectbox(
-        'Select an Entity / Group:',
+# Dropdown to select the question/sheet
+selected_question = st.sidebar.selectbox(
+    "1. Select a Question to Analyze:",
+    options=list(SHEET_MAP.keys())
+)
+
+# Load the data based on the selection
+sheet_to_load = SHEET_MAP[selected_question]
+df = load_data(sheet_to_load)
+
+# Check if data loading was successful
+if isinstance(df, Exception):
+    st.error(f"Failed to load data from sheet '{sheet_to_load}'.")
+    st.error(f"Error details: {df}")
+else:
+    # --- Dynamic Filters based on loaded data ---
+    entity_list = df['Entity / Group'].unique()
+    selected_entity = st.sidebar.selectbox(
+        "2. Select an Entity / Group:",
         options=entity_list
     )
 
-    # --- 3. Filter and Display Data for the Selected Entity ---
-    if selected_entity:
-        entity_df = total_employment_df[
-            (total_employment_df['Entity / Group'] == selected_entity) &
-            (total_employment_df['Subquestion'] == 'Employment = A + B(i) + B(ii)')
-        ]
+    # Filter dataframe based on selected entity
+    df_filtered_entity = df[df['Entity / Group'] == selected_entity]
 
-        if not entity_df.empty:
-            # --- 4. Extract, Calculate, and Plot ---
-            months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-            monthly_values = entity_df[months].iloc[0].astype(float)
+    subquestion_list = df_filtered_entity['Subquestion'].unique()
+    selected_subquestion = st.sidebar.selectbox(
+        "3. Select a Subquestion:",
+        options=subquestion_list
+    )
 
-            upper_band = [np.nan]
-            lower_band = [np.nan]
-            for i in range(1, len(monthly_values)):
-                # Ensure the previous month's value is not zero to avoid dividing by zero or having a zero threshold
-                prev_month_value = monthly_values.iloc[i-1]
-                if prev_month_value > 0:
-                    upper_band.append(prev_month_value * 1.25)
-                    lower_band.append(prev_month_value * 0.75)
-                else: # If previous month is 0, the band is also 0
-                    upper_band.append(0)
-                    lower_band.append(0)
+    # Filter dataframe further based on subquestion
+    df_filtered_subquestion = df_filtered_entity[df_filtered_entity['Subquestion'] == selected_subquestion]
+    
+    worker_cat_list = df_filtered_subquestion['Worker Category'].unique()
+    selected_worker_cat = st.sidebar.selectbox(
+        "4. Select a Worker Category:",
+        options=worker_cat_list
+    )
 
+    # --- 4. Final Data Filtering and Analysis ---
+    final_filtered_df = df_filtered_subquestion[df_filtered_subquestion['Worker Category'] == selected_worker_cat]
 
-            # Create the plot
-            fig, ax = plt.subplots(figsize=(12, 7))
-            ax.plot(months, monthly_values, marker='o', linestyle='-', label='Actual Employment Trend')
-            ax.plot(months, upper_band, linestyle='--', color='r', label='Upper Threshold (+25%)')
-            ax.plot(months, lower_band, linestyle='--', color='g', label='Lower Threshold (-25%)')
-            ax.fill_between(months, lower_band, upper_band, color='grey', alpha=0.15)
-            
-            # Formatting
-            ax.set_title(f'Monthly Employment Trend for: {selected_entity}', fontsize=16)
-            ax.set_ylabel('Number of Employees')
-            plt.xticks(rotation=45)
-            ax.legend()
-            plt.grid(True)
-            plt.tight_layout()
-
-            # Display the plot in the Streamlit app
-            st.pyplot(fig)
-        else:
-            st.warning(f"No 'TOTAL Employment' data found for '{selected_entity}'.")
-
-except FileNotFoundError:
-    st.error("Error: The data file was not found. Please make sure your Excel workbook is located at 'submission/qc_workbook_2025.xlsx'")
-except ValueError as e:
-    # This will catch errors if the sheet name is wrong
-    if "Worksheet" in str(e):
-        st.error(f"Error: Could not find the sheet named 'QC_Q1A_Main' in the Excel file. Please check the tab name.")
+    if final_filtered_df.empty:
+        st.warning("No data available for the selected combination of filters. Please try another selection.")
     else:
-        st.error(f"An unexpected error occurred: {e}")
+        # --- 5. Display Key Metrics and Chart ---
+        st.header(f"Analysis for: {selected_entity}")
+        st.subheader(f"{selected_subquestion} - {selected_worker_cat}")
+        
+        months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+        monthly_values = final_filtered_df[months].iloc[0].astype(float)
+
+        # --- Display KPI Cards ---
+        col1, col2, col3 = st.columns(3)
+        latest_month_value = monthly_values.iloc[-1]
+        year_max = monthly_values.max()
+        year_avg = monthly_values.mean()
+        
+        col1.metric("Latest Month's Value (Dec)", f"{latest_month_value:,.0f}")
+        col2.metric("Highest Month Value", f"{year_max:,.0f}")
+        col3.metric("Average Monthly Value", f"{year_avg:,.2f}")
+
+        # --- Calculate Thresholds ---
+        upper_band = [np.nan]
+        lower_band = [np.nan]
+        for i in range(1, len(monthly_values)):
+            prev_month_value = monthly_values.iloc[i-1]
+            if prev_month_value > 0:
+                upper_band.append(prev_month_value * 1.25)
+                lower_band.append(prev_month_value * 0.75)
+            else: # Handle cases where the previous month's value is zero
+                upper_band.append(0)
+                lower_band.append(0)
+
+        # --- Create and Display Plot ---
+        fig, ax = plt.subplots(figsize=(12, 6))
+        ax.plot(months, monthly_values, marker='o', linestyle='-', label='Actual Monthly Trend', zorder=5)
+        ax.plot(months, upper_band, linestyle='--', color='red', label='Upper Threshold (+25%)')
+        ax.plot(months, lower_band, linestyle='--', color='green', label='Lower Threshold (-25%)')
+        ax.fill_between(months, lower_band, upper_band, color='grey', alpha=0.15, label='Acceptable Range')
+
+        # Formatting
+        ax.set_title("Monthly Trend with ±25% Threshold", fontsize=16)
+        ax.set_ylabel("Value")
+        plt.xticks(rotation=45)
+        ax.legend()
+        ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+        plt.tight_layout()
+
+        st.pyplot(fig)
+
+        # --- Optional: Show Raw Data ---
+        with st.expander("Click to see the raw data for this selection"):
+            st.dataframe(final_filtered_df)
