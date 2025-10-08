@@ -1,15 +1,308 @@
-Traceback (most recent call last):
-  File "C:\Users\ttamarz\OneDrive - Bank Negara Malaysia\RLMS\qc_template\stats_qc.py", line 373, in <module>
+#!/usr/bin/env python3
+from __future__ import annotations
+import sys
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+
+import pandas as pd
+from openpyxl import load_workbook
+
+# ---------------------------
+# Constants
+# ---------------------------
+MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+QUARTERS = ["Q1","Q2","Q3","Q4"]
+
+# ---------------------------
+# Utilities
+# ---------------------------
+def to_num(obj):
+    """
+    Robust numeric converter:
+    - If a DataFrame (e.g., due to duplicate headers), convert each column.
+    - If a Series/array-like, convert directly.
+    """
+    if isinstance(obj, pd.DataFrame):
+        return obj.apply(pd.to_numeric, errors="coerce")
+    return pd.to_numeric(obj, errors="coerce")
+
+def dedupe_headers(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Make column names unique/stable and drop 'Unnamed' empties.
+    We keep the *first* occurrence of any duplicate header label.
+    """
+    # Drop empties like 'Unnamed: 12'
+    keep = [c for c in df.columns if str(c).strip() and not str(c).startswith("Unnamed")]
+    df = df.loc[:, keep]
+    # Strip whitespace
+    df.columns = [str(c).strip() for c in df.columns]
+    # De-duplicate (keep first)
+    df = df.loc[:, ~pd.Index(df.columns).duplicated(keep="first")]
+    return df
+
+def read_qc_table(xlsx: Path, sheet_name: str) -> pd.DataFrame:
+    """
+    Read a QC sheet produced by qc_common.write_qc_sheet().
+    - Info rows: 1..4
+    - Band row (quarter labels): row 5
+    - Header row: row 6
+    - Data begins at row 7
+    So: skiprows=5 → header is first row of the DataFrame.
+    """
+    try:
+        df = pd.read_excel(xlsx, sheet_name=sheet_name, engine="openpyxl",
+                           skiprows=5, header=0)
+    except Exception:
+        return pd.DataFrame()
+
+    # Clean up headers and drop fully empty rows
+    df = dedupe_headers(df)
+    df = df.dropna(how="all")
+    return df
+
+def detect_thresholds(xlsx: Path, sheet_name: str) -> Tuple[float, float, float, float]:
+    """
+    Read Threshold (±%), Abs cutoff from the info band (cells D2:E3).
+    If anything fails, return sensible defaults.
+    """
+    try:
+        wb = load_workbook(xlsx, data_only=True, read_only=True)
+        ws = wb[sheet_name]
+        # D2 = "Threshold (±%)", E2 = value
+        # D3 = "Abs cutoff",     E3 = value
+        mom = ws["E2"].value
+        abv = ws["E3"].value
+        # Use same % for MoM/QoQ/YoY by default (your QC runner lets you vary per Q)
+        mom = float(mom) if mom is not None else 0.25
+        abv = float(abv) if abv is not None else 50.0
+        qoq = mom
+        yoy = mom
+        return mom, qoq, yoy, abv
+    except Exception:
+        return 0.25, 0.25, 0.25, 50.0
+
+def build_flags(df: pd.DataFrame, thr: Tuple[float, float, float, float]) -> pd.DataFrame:
+    """
+    Compute row-level flags using columns that exist in the QC sheet.
+    Rules (replicating QC colour logic):
+      - MoM m:  RED   if |MoM m| >= mom_thr AND |Diff m| >= abs_cutoff
+                YELLOW if |MoM m| >= mom_thr AND |Diff m|  < abs_cutoff
+      - %Diff Q: RED/YELLOW using qoq_thr and Diff Q
+      - YoY X:   RED if |YoY X| >= yoy_thr (no abs diff available)
+    Returns a tidy table of alerts with raw context columns preserved.
+    """
+    mom_thr, qoq_thr, yoy_thr, abs_cut = thr
+
+    # Convert numeric-like columns
+    num_cols = []
+    for c in df.columns:
+        if (c in MONTHS) or (c in QUARTERS) or \
+           c.startswith("Diff ") or c.startswith("MoM ") or \
+           c.startswith("%Diff ") or c.startswith("YoY ") or c.startswith("Prior "):
+            num_cols.append(c)
+    for c in num_cols:
+        df[c] = to_num(df[c])
+
+    # Keys that describe the row
+    key_cols = [c for c in ["Entity / Group","Subquestion","Worker Category","Job Function"]
+                if c in df.columns]
+
+    alerts: List[Dict] = []
+
+    # Helper to append a record
+    def add_alert(row_idx: int, level: str, axis: str, period: str,
+                  status: str, msg: str, context: Dict):
+        rec = {
+            "Row": row_idx + 1,  # human-friendly
+            "Level": level,      # MoM / QoQ / YoY
+            "Axis": axis,        # Month / Quarter
+            "Period": period,    # e.g., "Feb" or "Q2"
+            "Status": status,    # RED / YELLOW
+            "Message": msg,
+        }
+        # Add keys
+        for k in key_cols:
+            rec[k] = context.get(k)
+        # Add helpful numeric context (present if exists)
+        for k in ["Current", "Previous", "Diff", "Pct"]:
+            if k in context:
+                rec[k] = context[k]
+        # Add direct raw values if we have them (month/quarter/prior)
+        for k in ["Prior", "QuarterValue"]:
+            if k in context:
+                rec[k] = context[k]
+        alerts.append(rec)
+
+    # Iterate rows
+    for i, row in df.iterrows():
+        base_ctx = {k: row.get(k) for k in key_cols}
+
+        # -------- MoM over months present --------
+        months_present = [m for m in MONTHS if m in df.columns]
+        for j in range(1, len(months_present)):
+            m = months_present[j]
+            prev = months_present[j-1]
+            mom_col = f"MoM {m}"
+            diff_col = f"Diff {m}"
+            if mom_col in df.columns and diff_col in df.columns:
+                pct = row.get(mom_col)
+                diff = row.get(diff_col)
+                # pct could be "N/A" (string); coerce to float safely
+                try:
+                    pct_f = float(pct)
+                except Exception:
+                    pct_f = float("nan")
+                diff_f = float(diff) if pd.notna(diff) else float("nan")
+
+                if pd.notna(pct_f):
+                    if abs(pct_f) >= mom_thr:
+                        status = "RED" if (pd.notna(diff_f) and abs(diff_f) >= abs_cut) else "YELLOW"
+                        msg = f"MoM {m}: {pct} (Diff {diff})"
+                        ctx = dict(base_ctx)
+                        ctx.update({
+                            "Current": row.get(m),
+                            "Previous": row.get(prev),
+                            "Diff": diff,
+                            "Pct": pct
+                        })
+                        add_alert(i, "MoM", "Month", m, status, msg, ctx)
+
+        # -------- QoQ over quarters present --------
+        qs_present = [q for q in QUARTERS if q in df.columns]
+        for j in range(1, len(qs_present)):
+            q = qs_present[j]
+            prevq = qs_present[j-1]
+            pct_col = f"%Diff {q}"
+            diff_col = f"Diff {q}"
+            if pct_col in df.columns and diff_col in df.columns:
+                pct = row.get(pct_col)
+                diff = row.get(diff_col)
+                try:
+                    pct_f = float(pct)
+                except Exception:
+                    pct_f = float("nan")
+                diff_f = float(diff) if pd.notna(diff) else float("nan")
+
+                if pd.notna(pct_f):
+                    if abs(pct_f) >= qoq_thr:
+                        status = "RED" if (pd.notna(diff_f) and abs(diff_f) >= abs_cut) else "YELLOW"
+                        msg = f"%Diff {q}: {pct} (Diff {diff})"
+                        ctx = dict(base_ctx)
+                        ctx.update({
+                            "QuarterValue": row.get(q),
+                            "Previous": row.get(prevq),
+                            "Diff": diff,
+                            "Pct": pct
+                        })
+                        add_alert(i, "QoQ", "Quarter", q, status, msg, ctx)
+
+        # -------- YoY (month or quarter) --------
+        # Month-based YoY
+        for m in months_present:
+            yoy_col = f"YoY {m}"
+            if yoy_col in df.columns:
+                pct = row.get(yoy_col)
+                try:
+                    pct_f = float(pct)
+                except Exception:
+                    pct_f = float("nan")
+                if pd.notna(pct_f) and abs(pct_f) >= yoy_thr:
+                    msg = f"YoY {m}: {pct}"
+                    ctx = dict(base_ctx)
+                    ctx.update({"Pct": pct, "Current": row.get(m), "Prior": row.get(f"Prior {m}")})
+                    add_alert(i, "YoY", "Month", m, "RED", msg, ctx)
+
+        # Quarter-based YoY
+        for q in qs_present:
+            yoy_col = f"YoY {q}"
+            if yoy_col in df.columns:
+                pct = row.get(yoy_col)
+                try:
+                    pct_f = float(pct)
+                except Exception:
+                    pct_f = float("nan")
+                if pd.notna(pct_f) and abs(pct_f) >= yoy_thr:
+                    msg = f"YoY {q}: {pct}"
+                    ctx = dict(base_ctx)
+                    ctx.update({"Pct": pct, "QuarterValue": row.get(q), "Prior": row.get(f"Prior {q}")})
+                    add_alert(i, "YoY", "Quarter", q, "RED", msg, ctx)
+
+    if not alerts:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(alerts)
+    # Order columns nicely
+    order = ["Level","Axis","Period","Status","Message"] + \
+            [c for c in ["Entity / Group","Subquestion","Worker Category","Job Function"] if c in out.columns] + \
+            [c for c in ["Current","Previous","Diff","Pct","QuarterValue","Prior"] if c in out.columns] + \
+            ["Row"]
+    out = out.reindex(columns=[c for c in order if c in out.columns])
+    return out
+
+def add_context(df: pd.DataFrame, alerts: pd.DataFrame) -> pd.DataFrame:
+    """
+    Return a copy of the alert rows with the *full* raw row appended,
+    so analysts can see all month and quarter numbers for that record.
+    """
+    if alerts.empty:
+        return alerts
+    key_cols = [c for c in ["Entity / Group","Subquestion","Worker Category","Job Function"] if c in df.columns]
+    idx_map = alerts["Row"].astype(int) - 1  # reverse (we stored 1-based)
+    rows = df.iloc[idx_map.values].copy()
+    # Re-attach the alert meta as left columns
+    meta = alerts.drop(columns=[c for c in key_cols if c in alerts.columns and c in rows.columns], errors="ignore")
+    meta = meta.reset_index(drop=True)
+    rows = rows.reset_index(drop=True)
+    ctx = pd.concat([meta, rows], axis=1)
+    return ctx
+
+def main() -> int:
+    print("=== RLMS QC → Alerts extractor ===")
+    qc_path = input("Path to QC workbook (.xlsx): ").strip()
+    out_path = input("Path to output alerts workbook (.xlsx) [alerts_output.xlsx]: ").strip() or "alerts_output.xlsx"
+
+    xlsx = Path(qc_path)
+    if not xlsx.exists():
+        print("ERROR: QC workbook not found.")
+        return 1
+
+    # Load sheet names that look like QC sheets
+    wb = load_workbook(xlsx, read_only=True)
+    qc_sheets = [s for s in wb.sheetnames if s.startswith("QC_") and not s.endswith("_PRIOR_Q") and not s.endswith("_PRIOR_M")]
+
+    if not qc_sheets:
+        print("No QC_* sheets found.")
+        return 1
+
+    writer = pd.ExcelWriter(out_path, engine="openpyxl")
+
+    for s in qc_sheets:
+        print(f"  • Processing {s} …")
+        df = read_qc_table(xlsx, s)
+        if df.empty:
+            print("    (empty, skipped)")
+            continue
+
+        thr = detect_thresholds(xlsx, s)
+        alerts = build_flags(df, thr)
+        if alerts.empty:
+            # Write empty placeholders to keep workbook structure tidy
+            pd.DataFrame(columns=["No alerts"]).to_excel(writer, sheet_name=f"ALERT_{s}", index=False)
+            pd.DataFrame(columns=["No alerts"]).to_excel(writer, sheet_name=f"CONTEXT_{s}", index=False)
+            print("    (no alerts)")
+            continue
+
+        # Context sheet with raw row beside alert meta
+        ctx = add_context(df, alerts)
+
+        # Save both
+        alerts.to_excel(writer, sheet_name=f"ALERT_{s}", index=False)
+        ctx.to_excel(writer, sheet_name=f"CONTEXT_{s}", index=False)
+        print(f"    → {len(alerts)} alerts")
+
+    writer.close()
+    print(f"\n[DONE] Wrote {out_path}")
+    return 0
+
+if __name__ == "__main__":
     sys.exit(main())
-             ~~~~^^
-  File "C:\Users\ttamarz\OneDrive - Bank Negara Malaysia\RLMS\qc_template\stats_qc.py", line 358, in main
-    alerts = build_flags(df, thr)
-  File "C:\Users\ttamarz\OneDrive - Bank Negara Malaysia\RLMS\qc_template\stats_qc.py", line 113, in build_flags
-    df[c] = to_num(df[c])
-            ~~~~~~^^^^^^^
-  File "C:\Users\ttamarz\OneDrive - Bank Negara Malaysia\RLMS\qc_template\stats_qc.py", line 108, in to_num
-    def to_num(s): return pd.to_numeric(s, errors="coerce")
-                          ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\ttamarz\AppData\Roaming\Python\Python313\site-packages\pandas\core\tools\numeric.py", line 209, in to_numeric
-    raise TypeError("arg must be a list, tuple, 1-d array, or Series")
-TypeError: arg must be a list, tuple, 1-d array, or Series
