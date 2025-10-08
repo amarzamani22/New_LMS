@@ -2,279 +2,313 @@
 from __future__ import annotations
 import sys
 from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+
 import pandas as pd
+import numpy as np
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+from openpyxl.worksheet.table import Table, TableStyleInfo
 
-from qc_common import (
-    new_empty_workbook, append_about_sheet_last, write_qc_sheet, QCArgs,
-    normalize_quarter_label, months_up_to, MONTHS_FULL
-)
+# --------- Constants (match your QC structure) ----------
+QC_SHEETS_ORDER = [
+    "QC_Q1A_Main", "QC_Q1A_JobFunc_Q4", "QC_Q1B",
+    "QC_Q2A_Main", "QC_Q2A_JobFunc_Q4", "QC_Q2B",
+    "QC_Q3", "QC_Q4", "QC_Q5",
+]
+MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+QMAP = {"Jan":"Q1","Feb":"Q1","Mar":"Q1",
+        "Apr":"Q2","May":"Q2","Jun":"Q2",
+        "Jul":"Q3","Aug":"Q3","Sep":"Q3",
+        "Oct":"Q4","Nov":"Q4","Dec":"Q4"}
 
-def _load_sheet(xlsx: Path, name: str) -> pd.DataFrame:
+# Simple styles for the output workbook
+FILL_HEADER = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+BTHIN = Border(*(Side(style="thin", color="DDDDDD") for _ in range(4)))
+
+# --------- Helpers to read QC tables robustly ----------
+def read_qc_table(xlsx: Path, sheet_name: str) -> Tuple[pd.DataFrame, Dict[str,float]]:
+    """
+    Return (df, thresholds) for a QC sheet.
+    - Finds the header row (first row containing 'Entity / Group')
+    - Reads the table beneath it
+    - Grabs Threshold (±%) and Abs cutoff from the info band (cells near D2/E2)
+    """
     try:
-        return pd.read_excel(xlsx, sheet_name=name, engine="openpyxl")
+        raw = pd.read_excel(xlsx, sheet_name=sheet_name, header=None, engine="openpyxl")
     except Exception:
+        return pd.DataFrame(), {"mom":0.25, "qoq":0.25, "yoy":0.25, "abs":50.0}
+
+    if raw.empty:
+        return pd.DataFrame(), {"mom":0.25, "qoq":0.25, "yoy":0.25, "abs":50.0}
+
+    # Find header row
+    header_idx = None
+    for i in range(min(len(raw), 30)):  # headers are always near the top
+        row_vals = raw.iloc[i].astype(str).str.strip().tolist()
+        if "Entity / Group" in row_vals:
+            header_idx = i
+            break
+    if header_idx is None:
+        return pd.DataFrame(), {"mom":0.25, "qoq":0.25, "yoy":0.25, "abs":50.0}
+
+    # Try to read thresholds from the small info band above the header:
+    # The pattern in QC is "Threshold (±%)" text in col D, value in col E (0-based: 3 and 4),
+    # and "Abs cutoff" text in next row same columns.
+    thresh = {"mom":0.25, "qoq":0.25, "yoy":0.25, "abs":50.0}
+    try:
+        # search the first ~10 rows for the labels
+        band = raw.iloc[:header_idx+1].copy()
+        val = None
+        for r in range(len(band)):
+            row = band.iloc[r].astype(str).tolist()
+            if any("Threshold" in str(x) for x in row):
+                # value usually next cell to the right of the "Threshold..." cell
+                c = next((k for k, x in enumerate(row) if "Threshold" in str(x)), None)
+                if c is not None and c+1 < len(row):
+                    try:
+                        v = float(band.iloc[r, c+1])
+                        thresh["mom"] = v
+                        thresh["qoq"] = v
+                        thresh["yoy"] = v
+                    except Exception:
+                        pass
+            if any("Abs cutoff" in str(x) for x in row):
+                c = next((k for k, x in enumerate(row) if "Abs cutoff" in str(x)), None)
+                if c is not None and c+1 < len(row):
+                    try:
+                        v = float(band.iloc[r, c+1])
+                        thresh["abs"] = v
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    # Build clean dataframe
+    header = raw.iloc[header_idx].astype(str).str.replace(r"^Unnamed:\s*\d+$", "", regex=True).tolist()
+    data = raw.iloc[header_idx+1:].copy()
+    data.columns = header
+    # Drop entirely empty columns
+    data = data.drop(columns=[c for c in data.columns if (c == "" or c.startswith("Unnamed")) and data[c].isna().all()])
+    # Keep only real table rows
+    if "Entity / Group" in data.columns:
+        data = data[~data["Entity / Group"].isna()].reset_index(drop=True)
+
+    # Normalize dimension name casing (just in case)
+    ren = {}
+    if "subquestion" in data.columns and "Subquestion" not in data.columns: ren["subquestion"] = "Subquestion"
+    if "worker_category" in data.columns and "Worker Category" not in data.columns: ren["worker_category"] = "Worker Category"
+    if "job_function" in data.columns and "Job Function" not in data.columns: ren["job_function"] = "Job Function"
+    data = data.rename(columns=ren)
+
+    return data, thresh
+
+# --------- Flag logic (mirror QC conditional formatting) ----------
+def build_flags(df: pd.DataFrame, thresh: Dict[str,float]) -> pd.DataFrame:
+    """
+    For a QC table, return a long-form table with one row per flagged cell:
+      Severity (Yellow/Red), MetricType (MoM/QoQ/YoY), Period, Current, Previous, Diff, Percent, Thresholds…
+    """
+    if df.empty:
         return pd.DataFrame()
 
-def _pick_year(*dfs: pd.DataFrame, explicit: int | None) -> int | None:
-    if explicit is not None:
-        return int(explicit)
-    years = []
-    for d in dfs:
-        if d is not None and not d.empty and "year" in d.columns:
-            years.append(d["year"])
-    if not years:
-        return None
-    s = pd.concat(years, ignore_index=True)
-    return int(s.mode().iat[0]) if not s.empty else None
+    # Ensure numeric
+    def to_num(s): return pd.to_numeric(s, errors="coerce")
+    for c in df.columns:
+        if c in MONTHS or c in ("Q1","Q2","Q3","Q4") or \
+           c.startswith("Diff ") or c.startswith("MoM ") or \
+           c.startswith("%Diff ") or c.startswith("YoY ") or c.startswith("Prior "):
+            df[c] = to_num(df[c])
 
-def _months_present(df: pd.DataFrame, up_to_quarter: str) -> list[str]:
-    # show only months that exist in df & not beyond current quarter
-    allowed = set(months_up_to(up_to_quarter))
-    return [m for m in MONTHS_FULL if m in df.columns and m in allowed]
+    dim_cols = ["Entity / Group"]
+    if "Subquestion" in df.columns:     dim_cols.append("Subquestion")
+    if "Worker Category" in df.columns: dim_cols.append("Worker Category")
+    if "Job Function" in df.columns:    dim_cols.append("Job Function")
 
-def _ask_path(prompt: str, required: bool = False) -> Path | None:
-    while True:
-        s = input(prompt).strip()
-        if not s and not required:
-            return None
-        p = Path(s)
-        if p.exists():
-            return p
-        print("  → Path not found. Try again.")
+    out_rows: List[Dict] = []
 
-def _ask_float(prompt: str, default: float) -> float:
-    s = input(f"{prompt} [{default}]: ").strip()
-    if not s:
-        return default
-    try:
-        return float(s)
-    except Exception:
-        print("  → Not a number. Using default.")
-        return default
+    # ---- MoM (monthly) ----
+    mom_cols = [c for c in df.columns if isinstance(c, str) and c.startswith("MoM ")]
+    for mc in mom_cols:
+        m = mc.replace("MoM ","",1).strip()
+        prev_m = None
+        try:
+            idx = MONTHS.index(m)
+            if idx > 0: prev_m = MONTHS[idx-1]
+        except Exception:
+            prev_m = None
+        diff_col = f"Diff {m}"
+        for i, row in df.iterrows():
+            pct = row.get(mc, np.nan)
+            if pd.isna(pct): continue
+            passes = abs(pct) >= float(thresh["mom"])
+            if not passes: continue
+            diff = row.get(diff_col, np.nan)
+            severity = "Yellow"
+            if pd.notna(diff) and abs(diff) >= float(thresh["abs"]):
+                severity = "Red"
+            out_rows.append({
+                "Severity": severity,
+                "MetricType": "MoM",
+                "Period": m,
+                "Quarter": QMAP.get(m, ""),
+                "Percent": pct,
+                "Diff": diff if pd.notna(diff) else None,
+                "Current": row.get(m, None),
+                "Previous": row.get(prev_m, None) if prev_m else None,
+                "AbsCutoff": float(thresh["abs"]),
+                "PctThreshold": float(thresh["mom"]),
+                **{k: row.get(k,"") for k in dim_cols}
+            })
 
-def _ask_int(prompt: str, default: int | None) -> int | None:
-    s = input(f"{prompt}{' ['+str(default)+']' if default is not None else ''}: ").strip()
-    if not s:
-        return default
-    try:
-        return int(s)
-    except Exception:
-        print("  → Not an integer. Leaving empty.")
-        return None
+    # ---- QoQ (quarters) ----
+    q_pct_cols = [c for c in df.columns if isinstance(c, str) and c.startswith("%Diff ")]
+    for qc in q_pct_cols:
+        q = qc.replace("%Diff ","",1).strip()
+        diff_col = f"Diff {q}"
+        for i, row in df.iterrows():
+            pct = row.get(qc, np.nan)
+            if pd.isna(pct): continue
+            passes = abs(pct) >= float(thresh["qoq"])
+            if not passes: continue
+            diff = row.get(diff_col, np.nan)
+            severity = "Yellow"
+            if pd.notna(diff) and abs(diff) >= float(thresh["abs"]):
+                severity = "Red"
+            out_rows.append({
+                "Severity": severity,
+                "MetricType": "QoQ",
+                "Period": q,
+                "Quarter": q,
+                "Percent": pct,
+                "Diff": diff if pd.notna(diff) else None,
+                "Current": row.get(q, None),
+                # Previous quarter value not stored explicitly; leave None
+                "Previous": None,
+                "AbsCutoff": float(thresh["abs"]),
+                "PctThreshold": float(thresh["qoq"]),
+                **{k: row.get(k,"") for k in dim_cols}
+            })
 
-def qc_make_all(
-    stage: Path,
-    out: Path,
-    prior_q1: Path | None,
-    prior_q2: Path | None,
-    prior_q3: Path | None,
-    prior_q4: Path | None,
-    prior_q5: Path | None,
-    th_q1: tuple[float,float,float,float],
-    th_q2: tuple[float,float,float,float],
-    th_q3: tuple[float,float,float,float],
-    th_q4: tuple[float,float,float,float],
-    th_q5: tuple[float,float,float,float],
-    year: int | None,
-):
-    # ---- Load available staging sheets ----
-    q1a   = _load_sheet(stage, "Q1A_Main")
-    q1jf  = _load_sheet(stage, "Q1A_JobFunc_Q4")
-    q1b   = _load_sheet(stage, "Q1B")
+    # ---- YoY (month or quarter) ----
+    yoy_cols = [c for c in df.columns if isinstance(c, str) and c.startswith("YoY ")]
+    for yc in yoy_cols:
+        lab = yc.replace("YoY ","",1).strip()  # could be 'Feb' or 'Q2' or 'Q4'
+        for i, row in df.iterrows():
+            pct = row.get(yc, np.nan)
+            if pd.isna(pct): continue
+            passes = abs(pct) >= float(thresh["yoy"])
+            if not passes: continue
+            out_rows.append({
+                "Severity": "Yellow",  # no diff cutoff for YoY in QC CF
+                "MetricType": "YoY",
+                "Period": lab,
+                "Quarter": QMAP.get(lab, lab if lab in ("Q1","Q2","Q3","Q4") else ""),
+                "Percent": pct,
+                "Diff": None,
+                "Current": row.get(lab, None) if lab in df.columns else None,
+                "Previous": row.get(f"Prior {lab}", None) if f"Prior {lab}" in df.columns else None,
+                "AbsCutoff": None,
+                "PctThreshold": float(thresh["yoy"]),
+                **{k: row.get(k,"") for k in dim_cols}
+            })
 
-    q2a   = _load_sheet(stage, "Q2A_Main")
-    q2jf  = _load_sheet(stage, "Q2A_JobFunc_Q4")
-    q2b   = _load_sheet(stage, "Q2B")
+    if not out_rows:
+        return pd.DataFrame(columns=["Severity","MetricType","Period","Quarter","Percent","Diff","Current","Previous","AbsCutoff","PctThreshold"] + dim_cols)
 
-    q3    = _load_sheet(stage, "Q3")
-    q4    = _load_sheet(stage, "Q4")
-    q5    = _load_sheet(stage, "Q5")
+    alerts = pd.DataFrame(out_rows)
 
-    if all(d.empty for d in [q1a,q1jf,q1b,q2a,q2jf,q2b,q3,q4,q5]):
-        print("[WARN] No QC-able sheets in the staging workbook.")
-        return
+    # Order columns nicely
+    ordered = dim_cols + ["MetricType","Period","Quarter","Current","Previous","Diff","Percent","PctThreshold","AbsCutoff","Severity"]
+    for c in ordered:
+        if c not in alerts.columns:
+            alerts[c] = np.nan
+    alerts = alerts[ordered]
+    return alerts
 
-    # current quarter from whatever is present
-    qseries = pd.concat([d["quarter"] for d in [q1a,q1jf,q1b,q2a,q2jf,q2b,q3,q4,q5] if not d.empty], ignore_index=True)
-    current_q = normalize_quarter_label(qseries)
+# --------- Output writer ----------
+def write_alert_workbook(out_path: Path, sheets: Dict[str, pd.DataFrame]) -> None:
+    wb = Workbook()
+    # remove default
+    wb.remove(wb.active)
 
-    # decide year (default = modal year across available sheets)
-    year = _pick_year(q1a,q1jf,q1b,q2a,q2jf,q2b,q3,q4,q5, explicit=year)
-    if year is None:
-        print("[ERROR] Could not determine the target year.")
-        return
+    for name in QC_SHEETS_ORDER:
+        if name not in sheets: continue
+        df = sheets[name]
+        title = f"ALERT_{name}"
+        ws = wb.create_sheet(title)
+        if df.empty:
+            ws["A1"] = f"{title} (no flags)"; ws["A1"].font = Font(bold=True)
+            continue
 
-    # filter current year
-    def _fy(d):
-        return d[d["year"]==year] if (d is not None and not d.empty and "year" in d.columns) else d
+        # Header
+        ws.append(list(df.columns))
+        header_row = 1
+        for j, h in enumerate(df.columns, start=1):
+            c = ws.cell(header_row, j)
+            c.font = Font(bold=True)
+            c.alignment = Alignment(horizontal="center", vertical="center")
+            c.fill = FILL_HEADER
+            c.border = BTHIN
 
-    q1a  = _fy(q1a);  q1jf = _fy(q1jf); q1b  = _fy(q1b)
-    q2a  = _fy(q2a);  q2jf = _fy(q2jf); q2b  = _fy(q2b)
-    q3   = _fy(q3);   q4   = _fy(q4);   q5   = _fy(q5)
+        # Data
+        for _, r in df.iterrows():
+            ws.append([r.get(c, "") for c in df.columns])
 
-    # prior data (prior year only, per question)
-    def _prior_df(p: Path | None, sheet: str) -> pd.DataFrame | None:
-        if not p: return None
-        df = _load_sheet(p, sheet)
-        if df.empty: return None
-        if "year" in df.columns:
-            return df[df["year"]==(year-1)]
-        return df
+        # As a formal table (filters on)
+        last_row = ws.max_row
+        last_col = ws.max_column
+        ref = f"A1:{ws.cell(last_row, last_col).coordinate}"
+        tbl = Table(displayName=title.replace(" ","_"), ref=ref)
+        tbl.tableStyleInfo = TableStyleInfo(name="TableStyleLight9", showRowStripes=True)
+        ws.add_table(tbl)
 
-    # thresholds (mom, qoq, yoy, abs)
-    mom1,qoq1,yoy1,abs1 = th_q1
-    mom2,qoq2,yoy2,abs2 = th_q2
-    mom3,qoq3,yoy3,abs3 = th_q3
-    mom4,qoq4,yoy4,abs4 = th_q4
-    mom5,qoq5,yoy5,abs5 = th_q5
+        # Column formats
+        fmt_num = {"Current":"#,##0", "Previous":"#,##0", "Diff":"#,##0"}
+        fmt_pct = {"Percent":"0.0%", "PctThreshold":"0.0%"}
+        for j, h in enumerate(df.columns, start=1):
+            nf = None
+            if h in fmt_num: nf = fmt_num[h]
+            if h in fmt_pct: nf = fmt_pct[h]
+            if nf:
+                for r in range(2, last_row+1):
+                    ws.cell(r, j).number_format = nf
 
-    # create single workbook, write all QC sheets using qc_common so style is identical
-    wb = new_empty_workbook()
+        # Auto width
+        for j in range(1, last_col+1):
+            maxw = max(len(str(ws.cell(1, j).value or "")), 10)
+            for r in range(2, min(200, last_row+1)):
+                v = ws.cell(r, j).value
+                if v is not None:
+                    maxw = max(maxw, len(str(v)))
+            ws.column_dimensions[ws.cell(1, j).column_letter].width = min(maxw+2, 40)
 
-    # ===== Q1 =====
-    if not q1a.empty:
-        mshow = [m for m in _months_present(q1a, current_q)]
-        write_qc_sheet(QCArgs(
-            sheet_name="QC_Q1A_Main",
-            df=q1a, wb=wb, year=year, current_q=current_q,
-            prior_df=_prior_df(prior_q1, "Q1A_Main"),
-            months_to_show=mshow,
-            include_job_function=False,
-            mom_pct_threshold=mom1, qoq_pct_threshold=qoq1, yoy_pct_threshold=yoy1, abs_cutoff=abs1
-        ))
-    if not q1jf.empty:
-        write_qc_sheet(QCArgs(
-            sheet_name="QC_Q1A_JobFunc_Q4",
-            df=q1jf, wb=wb, year=year, current_q=current_q,
-            prior_df=_prior_df(prior_q1, "Q1A_JobFunc_Q4"),
-            months_to_show=[],  # value-based (Q4) in df['value']
-            include_job_function=True, yoy_quarters=["Q4"],
-            mom_pct_threshold=mom1, qoq_pct_threshold=qoq1, yoy_pct_threshold=yoy1, abs_cutoff=abs1
-        ))
-    if not q1b.empty:
-        poss = [m for m in ["Jun","Dec"] if m in q1b.columns]
-        mshow = [m for m in poss if m in months_up_to(current_q)]
-        write_qc_sheet(QCArgs(
-            sheet_name="QC_Q1B",
-            df=q1b, wb=wb, year=year, current_q=current_q,
-            prior_df=_prior_df(prior_q1, "Q1B"),
-            months_to_show=mshow,
-            include_job_function=False,
-            mom_pct_threshold=mom1, qoq_pct_threshold=qoq1, yoy_pct_threshold=yoy1, abs_cutoff=abs1
-        ))
+    wb.save(out_path)
 
-    # ===== Q2 =====
-    if not q2a.empty:
-        mshow = [m for m in _months_present(q2a, current_q)]
-        write_qc_sheet(QCArgs(
-            sheet_name="QC_Q2A_Main",
-            df=q2a, wb=wb, year=year, current_q=current_q,
-            prior_df=_prior_df(prior_q2, "Q2A_Main"),
-            months_to_show=mshow,
-            include_job_function=False,
-            mom_pct_threshold=mom2, qoq_pct_threshold=qoq2, yoy_pct_threshold=yoy2, abs_cutoff=abs2
-        ))
-    if not q2jf.empty:
-        write_qc_sheet(QCArgs(
-            sheet_name="QC_Q2A_JobFunc_Q4",
-            df=q2jf, wb=wb, year=year, current_q=current_q,
-            prior_df=_prior_df(prior_q2, "Q2A_JobFunc_Q4"),
-            months_to_show=[], include_job_function=True, yoy_quarters=["Q4"],
-            mom_pct_threshold=mom2, qoq_pct_threshold=qoq2, yoy_pct_threshold=yoy2, abs_cutoff=abs2
-        ))
-    if not q2b.empty:
-        poss = [m for m in ["Jun","Dec"] if m in q2b.columns]
-        mshow = [m for m in poss if m in months_up_to(current_q)]
-        write_qc_sheet(QCArgs(
-            sheet_name="QC_Q2B",
-            df=q2b, wb=wb, year=year, current_q=current_q,
-            prior_df=_prior_df(prior_q2, "Q2B"),
-            months_to_show=mshow,
-            include_job_function=False,
-            mom_pct_threshold=mom2, qoq_pct_threshold=qoq2, yoy_pct_threshold=yoy2, abs_cutoff=abs2
-        ))
-
-    # ===== Q3 (no subquestion, no job function) =====
-    if not q3.empty:
-        mshow = [m for m in _months_present(q3, current_q)]
-        if "subquestion" not in q3.columns:
-            q3 = q3.copy(); q3["subquestion"] = ""
-        write_qc_sheet(QCArgs(
-            sheet_name="QC_Q3",
-            df=q3, wb=wb, year=year, current_q=current_q,
-            prior_df=_prior_df(prior_q3, "Q3"),
-            months_to_show=mshow, include_job_function=False,
-            mom_pct_threshold=mom3, qoq_pct_threshold=qoq3, yoy_pct_threshold=yoy3, abs_cutoff=abs3
-        ))
-
-    # ===== Q4 =====
-    if not q4.empty:
-        mshow = [m for m in _months_present(q4, current_q)]
-        write_qc_sheet(QCArgs(
-            sheet_name="QC_Q4",
-            df=q4, wb=wb, year=year, current_q=current_q,
-            prior_df=_prior_df(prior_q4, "Q4"),
-            months_to_show=mshow, include_job_function=False,
-            mom_pct_threshold=mom4, qoq_pct_threshold=qoq4, yoy_pct_threshold=yoy4, abs_cutoff=abs4
-        ))
-
-    # ===== Q5 =====
-    if not q5.empty:
-        mshow = [m for m in _months_present(q5, current_q)]
-        write_qc_sheet(QCArgs(
-            sheet_name="QC_Q5",
-            df=q5, wb=wb, year=year, current_q=current_q,
-            prior_df=_prior_df(prior_q5, "Q5"),
-            months_to_show=mshow, include_job_function=False,
-            mom_pct_threshold=mom5, qoq_pct_threshold=qoq5, yoy_pct_threshold=yoy5, abs_cutoff=abs5
-        ))
-
-    # Single About sheet at the end
-    append_about_sheet_last(wb, "RLMS – QC (All Questions)", year, current_q)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(out)
-    print(f"\n[DONE] {out}\n")
-
+# --------- CLI ----------
 def main() -> int:
-    print("=== RLMS QC – Build ALL Questions (Interactive) ===")
+    if len(sys.argv) < 2:
+        print("Usage: python qc_extract_flags.py <QC_WORKBOOK.xlsx> [OUTPUT.xlsx]")
+        return 2
+    qc_path = Path(sys.argv[1])
+    out_path = Path(sys.argv[2]) if len(sys.argv) >= 3 else qc_path.with_name(f"ALERTS_{qc_path.name}")
 
-    stage = _ask_path("Path to CURRENT staging workbook (.xlsx): ", required=True)
-    out   = Path(input("Path to OUTPUT QC workbook (.xlsx): ").strip() or "QC_All_Output.xlsx")
+    all_alerts: Dict[str, pd.DataFrame] = {}
+    for sheet in QC_SHEETS_ORDER:
+        df, thr = read_qc_table(qc_path, sheet)
+        if df.empty:
+            continue
+        alerts = build_flags(df, thr)
+        all_alerts[sheet] = alerts
 
-    # prior staging (optional, press Enter to skip)
-    print("\n--- Optional: prior staging workbooks (used for YoY) ---")
-    prior_q1 = _ask_path("  Prior staging for Q1 (.xlsx) [Enter to skip]: ", required=False)
-    prior_q2 = _ask_path("  Prior staging for Q2 (.xlsx) [Enter to skip]: ", required=False)
-    prior_q3 = _ask_path("  Prior staging for Q3 (.xlsx) [Enter to skip]: ", required=False)
-    prior_q4 = _ask_path("  Prior staging for Q4 (.xlsx) [Enter to skip]: ", required=False)
-    prior_q5 = _ask_path("  Prior staging for Q5 (.xlsx) [Enter to skip]: ", required=False)
+    if not all_alerts:
+        print("[INFO] No QC sheets found or no flags detected.")
+        # still create an empty workbook with a note
+        write_alert_workbook(out_path, {})
+        return 0
 
-    # thresholds (defaults shown; you can customize per question)
-    print("\n--- Thresholds (press Enter to accept defaults) ---")
-    def ask_block(tag: str, d_mom=0.25, d_qoq=0.25, d_yoy=0.25, d_abs=50.0):
-        print(f"  {tag}:")
-        mom = _ask_float("    MoM % threshold", d_mom)
-        qoq = _ask_float("    QoQ % threshold", d_qoq)
-        yoy = _ask_float("    YoY % threshold", d_yoy)
-        abv = _ask_float("    Absolute cutoff", d_abs)
-        return (mom, qoq, yoy, abv)
-
-    th_q1 = ask_block("Q1", 0.25, 0.25, 0.25, 50.0)
-    th_q2 = ask_block("Q2", 0.25, 0.25, 0.25, 50.0)
-    th_q3 = ask_block("Q3", 0.25, 0.25, 0.25, 50.0)
-    th_q4 = ask_block("Q4", 0.25, 0.25, 0.25, 50.0)
-    th_q5 = ask_block("Q5", 0.25, 0.25, 0.25, 50.0)
-
-    # optional: lock to a specific year (else auto from staging)
-    y = _ask_int("\nTarget YEAR (leave blank to auto-detect from staging)", None)
-
-    # run
-    qc_make_all(
-        stage=stage, out=out,
-        prior_q1=prior_q1, prior_q2=prior_q2, prior_q3=prior_q3, prior_q4=prior_q4, prior_q5=prior_q5,
-        th_q1=th_q1, th_q2=th_q2, th_q3=th_q3, th_q4=th_q4, th_q5=th_q5,
-        year=y
-    )
+    write_alert_workbook(out_path, all_alerts)
+    print(f"[DONE] {out_path}")
     return 0
 
 if __name__ == "__main__":
