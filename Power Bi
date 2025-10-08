@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
-import re # Import the regular expressions library
+import re
 
 # --- Page Configuration (Set first) ---
 st.set_page_config(
@@ -30,63 +30,92 @@ st.markdown("""
 # --- 1. Helper Functions ---
 @st.cache_data
 def load_data(sheet_name):
+    """Loads and caches data, intelligently renaming quarterly columns."""
     file_path = "submission/qc_workbook_2025.xlsx"
     try:
         df = pd.read_excel(file_path, sheet_name=sheet_name, header=5)
         df.dropna(axis=1, how='all', inplace=True)
-        if 'Q1.1' in df.columns:
-            df.rename(columns={'Q1.1': 'Q1_Total', 'Q2.1': 'Q2_Total', 'Q3.1': 'Q3_Total', 'Q4.1': 'Q4_Total'}, inplace=True)
+        # Fix for pandas renaming duplicate columns (e.g., Q1 -> Q1.1)
+        rename_map = {
+            'Q1.1': 'Q1_Total', 'Q2.1': 'Q2_Total',
+            'Q3.1': 'Q3_Total', 'Q4.1': 'Q4_Total'
+        }
+        df.rename(columns=rename_map, inplace=True)
         return df
     except Exception as e:
         return e
 
-# --- NEW: Function to get the reporting quarter from the workbook ---
 @st.cache_data
 def get_reporting_quarter():
     """Reads the _About sheet to determine the reporting quarter."""
     try:
-        # We need to read the CSV without a header to parse it line by line
         about_df = pd.read_csv("submission/qc_workbook_2025.xlsx - _About.csv", header=None)
-        # Find the row where the first column is 'Quarter'
         quarter_row = about_df[about_df[0] == 'Quarter']
         if not quarter_row.empty:
-            # Extract the value (e.g., 'Q4')
-            quarter_str = quarter_row.iloc[0, 1]
-            # Use regex to find the number in the string
-            q_num = int(re.search(r'\d+', quarter_str).group())
+            q_num = int(re.search(r'\d+', quarter_row.iloc[0, 1]).group())
             return q_num
     except Exception:
-        # Fallback if the file is missing or malformed
-        return 4 # Default to Q4
+        return 4 # Default to Q4 if file is not found
 
 def find_outliers(data_series, pct_thresh, abs_thresh, iqr_multiplier):
-    # This function remains the same as before
+    """The core hybrid outlier detection engine."""
     outliers = []
     if data_series.isnull().all() or len(data_series) < 2: return pd.DataFrame()
-    q1 = data_series.quantile(0.25); q3 = data_series.quantile(0.75)
+
+    q1, q3 = data_series.quantile(0.25), data_series.quantile(0.75)
     iqr = q3 - q1 if len(data_series) >= 4 else 0
-    iqr_lower_bound = q1 - (iqr_multiplier * iqr); iqr_upper_bound = q3 + (iqr_multiplier * iqr)
+    iqr_lower_bound, iqr_upper_bound = q1 - (iqr_multiplier * iqr), q3 + (iqr_multiplier * iqr)
+
     for i in range(len(data_series)):
-        current_period_name = data_series.index[i]; current_period_value = data_series.iloc[i]
-        reasons = [];
+        current_period_name, current_period_value = data_series.index[i], data_series.iloc[i]
+        reasons = []
         if pd.isna(current_period_value): continue
+
         if i > 0:
             prev_val = data_series.iloc[i-1]
             if not pd.isna(prev_val) and prev_val != 0:
-                abs_change = current_period_value - prev_val; pct_change = abs_change / prev_val
+                abs_change = current_period_value - prev_val
+                pct_change = abs_change / prev_val
                 if abs(pct_change) > pct_thresh and abs(abs_change) > abs_thresh:
                     reasons.append(f"High Volatility ({pct_change:+.1%})")
+
         if iqr > 0 and (current_period_value < iqr_lower_bound or current_period_value > iqr_upper_bound):
             reasons.append("Annual Anomaly")
+        
         if reasons:
             outliers.append({"Period": current_period_name, "Value": f"{current_period_value:,.2f}", "Reason(s)": ", ".join(reasons)})
+            
     return pd.DataFrame(outliers)
+
+def generate_full_report(sheet_map, abs_thresh, iqr_mult, months_to_scan, quarters_to_scan):
+    """Scans all sheets and entities to generate a master list of all outliers."""
+    master_outlier_list = []
+    progress_bar = st.progress(0, text="Initializing Scan...")
+    
+    total_sheets = len(sheet_map)
+    for i, (question_name, sheet_name) in enumerate(sheet_map.items()):
+        progress_bar.progress(i / total_sheets, text=f"Scanning: {question_name}")
+        df = load_data(sheet_name)
+        if isinstance(df, Exception): continue
+
+        for _, row in df.iterrows():
+            entity = row['Entity / Group']
+            wc = row['Worker Category']
+            subq = row.get('Subquestion', 'N/A')
+            
+            # Monthly Scan
+            monthly_series = row[months_to_scan].astype(float)
+            outliers_monthly = find_outliers(monthly_series, 0.25, abs_thresh, iqr_mult)
+            for _, o_row in outliers_monthly.iterrows():
+                master_outlier_list.append([question_name, entity, subq, wc, 'Monthly', o_row['Period'], o_row['Value'], o_row['Reason(s)']])
+
+    progress_bar.progress(1.0, text="Scan Complete!")
+    return pd.DataFrame(master_outlier_list, columns=['Question', 'Entity / Group', 'Subquestion', 'Worker Category', 'View', 'Period', 'Value', 'Reason(s)'])
 
 
 # --- Main Dashboard Interface ---
 st.title("🤖 Advanced QC Dashboard")
 
-# --- Use the new function to set the context ---
 reporting_quarter = get_reporting_quarter()
 last_month_index = reporting_quarter * 3
 all_months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
@@ -96,14 +125,14 @@ quarters_to_analyze = all_quarters[:reporting_quarter]
 
 st.info(f"**Data-Aware Analysis:** Workbook is for **Q{reporting_quarter}**. Analysis will include all data up to the end of this period.")
 
-# --- Sidebar Controls ---
 st.sidebar.header("Analysis Controls")
-# ... The rest of the code is identical to the previous final version ...
-analysis_view = st.sidebar.radio("Select Analysis View:", ('Interactive Analysis',))
+analysis_view = st.sidebar.radio("Select Analysis View:", ('Interactive Analysis', 'Full Outlier Report'))
 st.sidebar.markdown("---")
+
 SHEET_MAP = {'Q1A: Number of Employees': 'QC_Q1A_Main', 'Q2A: Salary & Wages': 'QC_Q2A_Main', 'Q3: Hours Worked': 'QC_Q3', 'Q4: Job Vacancies': 'QC_Q4', 'Q5: Employee Separations': 'QC_Q5'}
 
 if analysis_view == 'Interactive Analysis':
+    # ... Interactive analysis code ...
     st.sidebar.subheader("Threshold Configuration")
     abs_threshold = st.sidebar.slider("Absolute Change Threshold", 10, 1000, 50, 10)
     iqr_mult = st.sidebar.slider("IQR Sensitivity", 1.0, 3.0, 1.5, 0.1)
@@ -126,15 +155,13 @@ if analysis_view == 'Interactive Analysis':
         st.header(f"Analysis for: {entity}"); st.caption(f"Category: {worker_cat}")
         
         if time_view == 'Monthly':
-            periods_to_use = months_to_analyze
+            data_series = data_row[months_to_analyze].iloc[0].astype(float) if not data_row.empty else pd.Series()
             title = "Monthly Trend"
-            data_series = data_row[periods_to_use].iloc[0].astype(float) if not data_row.empty else pd.Series()
-        else: # Quarterly
-            periods_to_use = quarters_to_analyze
-            q_total_cols = [f'Q{i+1}_Total' for i in range(len(periods_to_use))]
-            if not all(p in data_row.columns for p in q_total_cols): st.error("Quarterly columns not found."); st.stop()
-            data_series = data_row[q_total_cols].iloc[0].astype(float) if not data_row.empty else pd.Series()
-            data_series.index = periods_to_use
+        else:
+            q_cols = [f'Q{i+1}_Total' for i in range(len(quarters_to_analyze))]
+            if not all(p in data_row.columns for p in q_cols): st.error("Quarterly total columns not found."); st.stop()
+            data_series = data_row[q_cols].iloc[0].astype(float) if not data_row.empty else pd.Series()
+            data_series.index = quarters_to_analyze
             title = "Quarterly Trend"
         
         if data_series.empty or data_series.isnull().all(): st.warning("No data found for the selected filters or period.")
@@ -142,16 +169,221 @@ if analysis_view == 'Interactive Analysis':
             outlier_df = find_outliers(data_series, 0.25, abs_threshold, iqr_mult)
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("Latest Value", f"{data_series.iloc[-1]:,.0f}"); col2.metric("Period Average", f"{data_series.mean():,.0f}"); col3.metric("Period High", f"{data_series.max():,.0f}"); col4.metric("True Outliers", len(outlier_df))
-            
             fig, ax = plt.subplots(figsize=(12, 6))
             ax.plot(data_series.index, data_series, marker='o', linestyle='-', label=title, zorder=10)
-            upper_band = [np.nan] + [data_series.iloc[i-1] * 1.25 for i in range(1, len(data_series))]
-            lower_band = [np.nan] + [data_series.iloc[i-1] * 0.75 for i in range(1, len(data_series))]
-            ax.plot(data_series.index, upper_band, linestyle='--', color='gray', label='±25% Threshold', alpha=0.7)
-            ax.fill_between(data_series.index, lower_band, upper_band, color='gray', alpha=0.1)
-            if not outlier_df.empty:
-                ax.scatter(outlier_df['Period'], data_series[outlier_df['Period']], s=250, c='red', marker='X', zorder=20, label='True Outlier')
+            upper_band = [np.nan] + [data_series.iloc[i-1] * 1.25 for i in range(1, len(data_series))]; lower_band = [np.nan] + [data_series.iloc[i-1] * 0.75 for i in range(1, len(data_series))]
+            ax.plot(data_series.index, upper_band, linestyle='--', color='gray', label='±25% Threshold', alpha=0.7); ax.fill_between(data_series.index, lower_band, upper_band, color='gray', alpha=0.1)
+            if not outlier_df.empty: ax.scatter(outlier_df['Period'], data_series[outlier_df['Period']], s=250, c='red', marker='X', zorder=20, label='True Outlier')
             ax.legend(); st.pyplot(fig)
-            
             if not outlier_df.empty: st.error("🚨 True Outlier(s) Detected!"); st.dataframe(outlier_df, use_container_width=True)
             else: st.success("✅ No significant outliers detected.")
+            with st.expander("Show Raw Data for This Selection"): st.dataframe(data_row)
+
+elif analysis_view == 'Full Outlier Report':
+    st.header("Master Outlier Report"); st.write("This report scans the entire workbook to find all significant outliers based on the thresholds you set below.")
+    st.sidebar.subheader("Report Thresholds")
+    abs_thresh_report = st.sidebar.slider("Absolute Change Threshold", 10, 1000, 50, 10)
+    iqr_mult_report = st.sidebar.slider("IQR Sensitivity", 1.0, 3.0, 1.5, 0.1)
+    if st.sidebar.button("🚀 Generate Report", use_container_width=True):
+        final_report = generate_full_report(SHEET_MAP, abs_thresh_report, iqr_mult_report, months_to_analyze, quarters_to_analyze)
+        st.success(f"Scan complete! Found **{len(final_report)}** potential outliers.")
+        if not final_report.empty:
+            st.dataframe(final_report, use_container_width=True)
+            csv = final_report.to_csv(index=False).encode('utf-8')
+            st.download_button(label="📥 Download Report as CSV", data=csv, file_name="master_outlier_report.csv", mime="text/csv")
+    else:
+        st.info("Click the 'Generate Report' button in the sidebar to begin the scan.")import streamlit as st
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+import re
+
+# --- Page Configuration (Set first) ---
+st.set_page_config(
+    page_title="Advanced QC Dashboard",
+    page_icon="🤖",
+    layout="wide"
+)
+
+# --- Modern CSS Styling ---
+st.markdown("""
+<style>
+    .stMetric {
+        border-radius: 10px;
+        padding: 15px;
+        background-color: #f0f2f6;
+        color: #262730;
+    }
+    body[data-theme="dark"] .stMetric {
+        background-color: #262730;
+        color: #FAFAFA;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# --- 1. Helper Functions ---
+@st.cache_data
+def load_data(sheet_name):
+    """Loads and caches data, intelligently renaming quarterly columns."""
+    file_path = "submission/qc_workbook_2025.xlsx"
+    try:
+        df = pd.read_excel(file_path, sheet_name=sheet_name, header=5)
+        df.dropna(axis=1, how='all', inplace=True)
+        # Fix for pandas renaming duplicate columns (e.g., Q1 -> Q1.1)
+        rename_map = {
+            'Q1.1': 'Q1_Total', 'Q2.1': 'Q2_Total',
+            'Q3.1': 'Q3_Total', 'Q4.1': 'Q4_Total'
+        }
+        df.rename(columns=rename_map, inplace=True)
+        return df
+    except Exception as e:
+        return e
+
+@st.cache_data
+def get_reporting_quarter():
+    """Reads the _About sheet to determine the reporting quarter."""
+    try:
+        about_df = pd.read_csv("submission/qc_workbook_2025.xlsx - _About.csv", header=None)
+        quarter_row = about_df[about_df[0] == 'Quarter']
+        if not quarter_row.empty:
+            q_num = int(re.search(r'\d+', quarter_row.iloc[0, 1]).group())
+            return q_num
+    except Exception:
+        return 4 # Default to Q4 if file is not found
+
+def find_outliers(data_series, pct_thresh, abs_thresh, iqr_multiplier):
+    """The core hybrid outlier detection engine."""
+    outliers = []
+    if data_series.isnull().all() or len(data_series) < 2: return pd.DataFrame()
+
+    q1, q3 = data_series.quantile(0.25), data_series.quantile(0.75)
+    iqr = q3 - q1 if len(data_series) >= 4 else 0
+    iqr_lower_bound, iqr_upper_bound = q1 - (iqr_multiplier * iqr), q3 + (iqr_multiplier * iqr)
+
+    for i in range(len(data_series)):
+        current_period_name, current_period_value = data_series.index[i], data_series.iloc[i]
+        reasons = []
+        if pd.isna(current_period_value): continue
+
+        if i > 0:
+            prev_val = data_series.iloc[i-1]
+            if not pd.isna(prev_val) and prev_val != 0:
+                abs_change = current_period_value - prev_val
+                pct_change = abs_change / prev_val
+                if abs(pct_change) > pct_thresh and abs(abs_change) > abs_thresh:
+                    reasons.append(f"High Volatility ({pct_change:+.1%})")
+
+        if iqr > 0 and (current_period_value < iqr_lower_bound or current_period_value > iqr_upper_bound):
+            reasons.append("Annual Anomaly")
+        
+        if reasons:
+            outliers.append({"Period": current_period_name, "Value": f"{current_period_value:,.2f}", "Reason(s)": ", ".join(reasons)})
+            
+    return pd.DataFrame(outliers)
+
+def generate_full_report(sheet_map, abs_thresh, iqr_mult, months_to_scan, quarters_to_scan):
+    """Scans all sheets and entities to generate a master list of all outliers."""
+    master_outlier_list = []
+    progress_bar = st.progress(0, text="Initializing Scan...")
+    
+    total_sheets = len(sheet_map)
+    for i, (question_name, sheet_name) in enumerate(sheet_map.items()):
+        progress_bar.progress(i / total_sheets, text=f"Scanning: {question_name}")
+        df = load_data(sheet_name)
+        if isinstance(df, Exception): continue
+
+        for _, row in df.iterrows():
+            entity = row['Entity / Group']
+            wc = row['Worker Category']
+            subq = row.get('Subquestion', 'N/A')
+            
+            # Monthly Scan
+            monthly_series = row[months_to_scan].astype(float)
+            outliers_monthly = find_outliers(monthly_series, 0.25, abs_thresh, iqr_mult)
+            for _, o_row in outliers_monthly.iterrows():
+                master_outlier_list.append([question_name, entity, subq, wc, 'Monthly', o_row['Period'], o_row['Value'], o_row['Reason(s)']])
+
+    progress_bar.progress(1.0, text="Scan Complete!")
+    return pd.DataFrame(master_outlier_list, columns=['Question', 'Entity / Group', 'Subquestion', 'Worker Category', 'View', 'Period', 'Value', 'Reason(s)'])
+
+
+# --- Main Dashboard Interface ---
+st.title("🤖 Advanced QC Dashboard")
+
+reporting_quarter = get_reporting_quarter()
+last_month_index = reporting_quarter * 3
+all_months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+all_quarters = ['Q1', 'Q2', 'Q3', 'Q4']
+months_to_analyze = all_months[:last_month_index]
+quarters_to_analyze = all_quarters[:reporting_quarter]
+
+st.info(f"**Data-Aware Analysis:** Workbook is for **Q{reporting_quarter}**. Analysis will include all data up to the end of this period.")
+
+st.sidebar.header("Analysis Controls")
+analysis_view = st.sidebar.radio("Select Analysis View:", ('Interactive Analysis', 'Full Outlier Report'))
+st.sidebar.markdown("---")
+
+SHEET_MAP = {'Q1A: Number of Employees': 'QC_Q1A_Main', 'Q2A: Salary & Wages': 'QC_Q2A_Main', 'Q3: Hours Worked': 'QC_Q3', 'Q4: Job Vacancies': 'QC_Q4', 'Q5: Employee Separations': 'QC_Q5'}
+
+if analysis_view == 'Interactive Analysis':
+    # ... Interactive analysis code ...
+    st.sidebar.subheader("Threshold Configuration")
+    abs_threshold = st.sidebar.slider("Absolute Change Threshold", 10, 1000, 50, 10)
+    iqr_mult = st.sidebar.slider("IQR Sensitivity", 1.0, 3.0, 1.5, 0.1)
+    time_view = st.sidebar.radio("Timeframe:", ('Monthly', 'Quarterly'), horizontal=True)
+    st.sidebar.markdown("---")
+    selected_question = st.sidebar.selectbox("1. Select a dataset:", options=list(SHEET_MAP.keys()))
+    df = load_data(SHEET_MAP[selected_question])
+
+    if isinstance(df, Exception): st.error(f"Failed to load data. Error: {df}")
+    else:
+        entity = st.sidebar.selectbox("2. Select an Entity / Group:", options=df['Entity / Group'].unique())
+        if 'Subquestion' in df.columns and df[df['Entity / Group'] == entity]['Subquestion'].nunique() > 1:
+            subquestion = st.sidebar.selectbox("3. Select a Subquestion:", options=df[df['Entity / Group'] == entity]['Subquestion'].unique())
+            worker_cat = st.sidebar.selectbox("4. Select a Worker Category:", options=df[(df['Entity / Group'] == entity) & (df['Subquestion'] == subquestion)]['Worker Category'].unique())
+            data_row = df[(df['Entity / Group'] == entity) & (df['Subquestion'] == subquestion) & (df['Worker Category'] == worker_cat)]
+        else:
+            worker_cat = st.sidebar.selectbox("3. Select a Worker Category:", options=df[df['Entity / Group'] == entity]['Worker Category'].unique())
+            data_row = df[(df['Entity / Group'] == entity) & (df['Worker Category'] == worker_cat)]
+
+        st.header(f"Analysis for: {entity}"); st.caption(f"Category: {worker_cat}")
+        
+        if time_view == 'Monthly':
+            data_series = data_row[months_to_analyze].iloc[0].astype(float) if not data_row.empty else pd.Series()
+            title = "Monthly Trend"
+        else:
+            q_cols = [f'Q{i+1}_Total' for i in range(len(quarters_to_analyze))]
+            if not all(p in data_row.columns for p in q_cols): st.error("Quarterly total columns not found."); st.stop()
+            data_series = data_row[q_cols].iloc[0].astype(float) if not data_row.empty else pd.Series()
+            data_series.index = quarters_to_analyze
+            title = "Quarterly Trend"
+        
+        if data_series.empty or data_series.isnull().all(): st.warning("No data found for the selected filters or period.")
+        else:
+            outlier_df = find_outliers(data_series, 0.25, abs_threshold, iqr_mult)
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Latest Value", f"{data_series.iloc[-1]:,.0f}"); col2.metric("Period Average", f"{data_series.mean():,.0f}"); col3.metric("Period High", f"{data_series.max():,.0f}"); col4.metric("True Outliers", len(outlier_df))
+            fig, ax = plt.subplots(figsize=(12, 6))
+            ax.plot(data_series.index, data_series, marker='o', linestyle='-', label=title, zorder=10)
+            upper_band = [np.nan] + [data_series.iloc[i-1] * 1.25 for i in range(1, len(data_series))]; lower_band = [np.nan] + [data_series.iloc[i-1] * 0.75 for i in range(1, len(data_series))]
+            ax.plot(data_series.index, upper_band, linestyle='--', color='gray', label='±25% Threshold', alpha=0.7); ax.fill_between(data_series.index, lower_band, upper_band, color='gray', alpha=0.1)
+            if not outlier_df.empty: ax.scatter(outlier_df['Period'], data_series[outlier_df['Period']], s=250, c='red', marker='X', zorder=20, label='True Outlier')
+            ax.legend(); st.pyplot(fig)
+            if not outlier_df.empty: st.error("🚨 True Outlier(s) Detected!"); st.dataframe(outlier_df, use_container_width=True)
+            else: st.success("✅ No significant outliers detected.")
+            with st.expander("Show Raw Data for This Selection"): st.dataframe(data_row)
+
+elif analysis_view == 'Full Outlier Report':
+    st.header("Master Outlier Report"); st.write("This report scans the entire workbook to find all significant outliers based on the thresholds you set below.")
+    st.sidebar.subheader("Report Thresholds")
+    abs_thresh_report = st.sidebar.slider("Absolute Change Threshold", 10, 1000, 50, 10)
+    iqr_mult_report = st.sidebar.slider("IQR Sensitivity", 1.0, 3.0, 1.5, 0.1)
+    if st.sidebar.button("🚀 Generate Report", use_container_width=True):
+        final_report = generate_full_report(SHEET_MAP, abs_thresh_report, iqr_mult_report, months_to_analyze, quarters_to_analyze)
+        st.success(f"Scan complete! Found **{len(final_report)}** potential outliers.")
+        if not final_report.empty:
+            st.dataframe(final_report, use_container_width=True)
+            csv = final_report.to_csv(index=False).encode('utf-8')
+            st.download_button(label="📥 Download Report as CSV", data=csv, file_name="master_outlier_report.csv", mime="text/csv")
+    else:
+        st.info("Click the 'Generate Report' button in the sidebar to begin the scan.")
