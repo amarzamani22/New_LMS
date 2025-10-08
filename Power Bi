@@ -18,10 +18,6 @@ st.markdown("""
         padding: 15px;
         background-color: #262730;
     }
-    .st-emotion-cache-176r98r {
-        # This is a bit of a hack to target metric labels, might need adjustment if Streamlit updates
-        font-size: 1.1em;
-    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -33,7 +29,6 @@ def load_data(sheet_name):
     file_path = "submission/qc_workbook_2025.xlsx"
     try:
         df = pd.read_excel(file_path, sheet_name=sheet_name, header=5)
-        # Drop columns that are entirely empty, which can happen with Excel files
         df.dropna(axis=1, how='all', inplace=True)
         return df
     except Exception as e:
@@ -126,7 +121,6 @@ else:
         st.caption(f"{subquestion} | {worker_cat}")
         
         months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-        # Ensure all month columns exist, fill with 0 if not.
         for month in months:
             if month not in data_row.columns:
                 data_row[month] = 0
@@ -139,23 +133,41 @@ else:
         col1.metric("Latest Value (Dec)", f"{monthly_values['Dec']:,.0f}")
         col2.metric("Annual Average", f"{monthly_values.mean():,.0f}")
         col3.metric("Annual High", f"{monthly_values.max():,.0f}")
-        col4.metric("Significant Outliers", len(outlier_df))
+        col4.metric("True Outliers", len(outlier_df))
 
         # --- Charting ---
         fig, ax = plt.subplots(figsize=(12, 6))
-        ax.plot(months, monthly_values, marker='o', linestyle='-', label='Monthly Trend', color='#1f77b4', zorder=5)
-        ax.set_title("Annual Trend & Detected Outliers", fontsize=16)
-        ax.set_ylabel("Value")
-        plt.xticks(rotation=45)
-        ax.grid(True, which='both', linestyle='--', linewidth=0.3)
         
+        # Plot the main trend line
+        ax.plot(months, monthly_values, marker='o', linestyle='-', label='Monthly Trend', color='#1f77b4', zorder=10)
+
+        # --- NEW: Calculate and Plot Threshold Bands ---
+        upper_band = [np.nan]
+        lower_band = [np.nan]
+        for i in range(1, len(monthly_values)):
+            prev_val = monthly_values.iloc[i-1]
+            upper_band.append(prev_val * 1.25)
+            lower_band.append(prev_val * 0.75)
+        
+        ax.plot(months, upper_band, linestyle='--', color='gray', label='MoM Threshold (±25%)', alpha=0.7)
+        ax.plot(months, lower_band, linestyle='--', color='gray', alpha=0.7)
+        ax.fill_between(months, lower_band, upper_band, color='gray', alpha=0.1, label='Acceptable MoM Range')
+
         # Highlight outliers on chart
         if not outlier_df.empty:
             outlier_months = outlier_df['Month'].tolist()
             outlier_values = monthly_values[outlier_months]
-            ax.scatter(outlier_months, outlier_values, s=250, c='red', marker='X', zorder=10, label='True Outlier')
+            ax.scatter(outlier_months, outlier_values, s=250, c='red', marker='X', zorder=20, label='True Outlier')
 
-        ax.legend()
+        # Formatting
+        ax.set_title("Annual Trend with Outlier Detection", fontsize=16)
+        ax.set_ylabel("Value")
+        plt.xticks(rotation=45)
+        ax.grid(True, which='both', linestyle='--', linewidth=0.3)
+        # Tidy up the legend to avoid duplicate labels
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        ax.legend(by_label.values(), by_label.keys())
         plt.tight_layout()
         st.pyplot(fig)
 
