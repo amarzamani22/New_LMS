@@ -3,65 +3,84 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 
-# --- 1. Load and Prepare the Data (Cache it for performance) ---
+# --- 1. Load and Prepare the Data from the Excel file ---
 @st.cache_data
 def load_data():
-    df = pd.read_csv("qc_workbook_2025.xlsx - QC_Q1A_Main.csv", header=5)
+    # Define the path to the Excel workbook
+    file_path = "submission/qc_workbook_2025.xlsx"
+    
+    # Read the specific sheet ("QC_Q1A_Main") from the Excel file
+    df = pd.read_excel(file_path, sheet_name="QC_Q1A_Main", header=5)
     return df
 
-df = load_data()
+# Use a try-except block to handle file not found errors gracefully
+try:
+    df = load_data()
 
-# --- 2. Create the Dashboard Interface ---
-st.title('Financial Institution QC Trend Analysis 📊')
-st.write("Use the dropdown menu below to select an institution and view its monthly employment trend.")
+    # --- 2. Create the Dashboard Interface ---
+    st.title('Financial Institution QC Trend Analysis 📊')
+    st.write("Use the dropdown menu below to select an institution and view its monthly employment trend.")
 
-# Get a unique list of all entities for the dropdown menu.
-# We will focus only on the 'TOTAL Employment' category for this dashboard.
-total_employment_df = df[df['Worker Category'] == 'TOTAL Employment']
-entity_list = total_employment_df['Entity / Group'].unique()
+    # Get a unique list of all entities for the dropdown menu
+    total_employment_df = df[df['Worker Category'] == 'TOTAL Employment']
+    entity_list = total_employment_df['Entity / Group'].unique()
 
-# Create a dropdown menu (selectbox).
-selected_entity = st.selectbox(
-    'Select an Entity / Group:',
-    options=entity_list
-)
+    # Create a dropdown menu
+    selected_entity = st.selectbox(
+        'Select an Entity / Group:',
+        options=entity_list
+    )
 
-# --- 3. Filter and Display Data for the Selected Entity ---
-if selected_entity:
-    # Filter the DataFrame based on the user's selection.
-    entity_df = total_employment_df[
-        (total_employment_df['Entity / Group'] == selected_entity) &
-        (total_employment_df['Subquestion'] == 'Employment = A + B(i) + B(ii)')
-    ]
+    # --- 3. Filter and Display Data for the Selected Entity ---
+    if selected_entity:
+        entity_df = total_employment_df[
+            (total_employment_df['Entity / Group'] == selected_entity) &
+            (total_employment_df['Subquestion'] == 'Employment = A + B(i) + B(ii)')
+        ]
 
-    if not entity_df.empty:
-        # --- 4. Extract, Calculate, and Plot (same logic as before) ---
-        months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-        monthly_values = entity_df[months].iloc[0].astype(float)
+        if not entity_df.empty:
+            # --- 4. Extract, Calculate, and Plot ---
+            months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+            monthly_values = entity_df[months].iloc[0].astype(float)
 
-        upper_band = [np.nan]
-        lower_band = [np.nan]
-        for i in range(1, len(monthly_values)):
-            prev_month_value = monthly_values.iloc[i-1]
-            upper_band.append(prev_month_value * 1.25)
-            lower_band.append(prev_month_value * 0.75)
+            upper_band = [np.nan]
+            lower_band = [np.nan]
+            for i in range(1, len(monthly_values)):
+                # Ensure the previous month's value is not zero to avoid dividing by zero or having a zero threshold
+                prev_month_value = monthly_values.iloc[i-1]
+                if prev_month_value > 0:
+                    upper_band.append(prev_month_value * 1.25)
+                    lower_band.append(prev_month_value * 0.75)
+                else: # If previous month is 0, the band is also 0
+                    upper_band.append(0)
+                    lower_band.append(0)
 
-        # Create the plot
-        fig, ax = plt.subplots(figsize=(12, 7))
-        ax.plot(months, monthly_values, marker='o', linestyle='-', label='Actual Employment Trend')
-        ax.plot(months, upper_band, linestyle='--', color='r', label='Upper Threshold (+25%)')
-        ax.plot(months, lower_band, linestyle='--', color='g', label='Lower Threshold (-25%)')
-        ax.fill_between(months, lower_band, upper_band, color='grey', alpha=0.15)
-        
-        # Formatting
-        ax.set_title(f'Monthly Employment Trend for: {selected_entity}', fontsize=16)
-        ax.set_ylabel('Number of Employees')
-        plt.xticks(rotation=45)
-        ax.legend()
-        plt.grid(True)
-        plt.tight_layout()
 
-        # Display the plot in the Streamlit app.
-        st.pyplot(fig)
+            # Create the plot
+            fig, ax = plt.subplots(figsize=(12, 7))
+            ax.plot(months, monthly_values, marker='o', linestyle='-', label='Actual Employment Trend')
+            ax.plot(months, upper_band, linestyle='--', color='r', label='Upper Threshold (+25%)')
+            ax.plot(months, lower_band, linestyle='--', color='g', label='Lower Threshold (-25%)')
+            ax.fill_between(months, lower_band, upper_band, color='grey', alpha=0.15)
+            
+            # Formatting
+            ax.set_title(f'Monthly Employment Trend for: {selected_entity}', fontsize=16)
+            ax.set_ylabel('Number of Employees')
+            plt.xticks(rotation=45)
+            ax.legend()
+            plt.grid(True)
+            plt.tight_layout()
+
+            # Display the plot in the Streamlit app
+            st.pyplot(fig)
+        else:
+            st.warning(f"No 'TOTAL Employment' data found for '{selected_entity}'.")
+
+except FileNotFoundError:
+    st.error("Error: The data file was not found. Please make sure your Excel workbook is located at 'submission/qc_workbook_2025.xlsx'")
+except ValueError as e:
+    # This will catch errors if the sheet name is wrong
+    if "Worksheet" in str(e):
+        st.error(f"Error: Could not find the sheet named 'QC_Q1A_Main' in the Excel file. Please check the tab name.")
     else:
-        st.warning(f"No 'TOTAL Employment' data found for '{selected_entity}'.")
+        st.error(f"An unexpected error occurred: {e}")
