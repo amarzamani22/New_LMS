@@ -3,134 +3,169 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 
-# --- Page Configuration (Do this first) ---
+# --- Page Configuration (Set first) ---
 st.set_page_config(
-    page_title="FI Data Quality Dashboard",
-    page_icon="📊",
+    page_title="Advanced QC Dashboard",
+    page_icon="🤖",
     layout="wide"
 )
 
+# --- Modern CSS Styling ---
+st.markdown("""
+<style>
+    .stMetric {
+        border-radius: 10px;
+        padding: 15px;
+        background-color: #262730;
+    }
+    .st-emotion-cache-176r98r {
+        # This is a bit of a hack to target metric labels, might need adjustment if Streamlit updates
+        font-size: 1.1em;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
 # --- 1. Data Loading Logic ---
-@st.cache_data # Cache the data to improve performance
+@st.cache_data
 def load_data(sheet_name):
-    """Loads data from a specific sheet in the Excel workbook."""
+    """Loads and caches data from a specific sheet in the Excel workbook."""
     file_path = "submission/qc_workbook_2025.xlsx"
     try:
-        # Read the specified sheet from the Excel file
         df = pd.read_excel(file_path, sheet_name=sheet_name, header=5)
+        # Drop columns that are entirely empty, which can happen with Excel files
+        df.dropna(axis=1, how='all', inplace=True)
         return df
     except Exception as e:
-        # Return the error to be displayed in the app
         return e
 
-# --- 2. Main Dashboard Interface ---
-st.title("📊 Financial Institution QC Dashboard")
-st.markdown("An interactive tool to perform trend analysis and detect outliers based on a **±25%** month-over-month threshold.")
+# --- 2. Outlier Detection Engine ---
+def find_outliers(monthly_values, pct_thresh, abs_thresh, iqr_multiplier):
+    """
+    Finds outliers using a hybrid approach: Volatility and Annual Anomaly (IQR).
+    Returns a dataframe of outliers and their reasons.
+    """
+    outliers = []
+    
+    # --- IQR (Annual Anomaly) Calculation ---
+    q1 = monthly_values.quantile(0.25)
+    q3 = monthly_values.quantile(0.75)
+    iqr = q3 - q1
+    iqr_lower_bound = q1 - (iqr_multiplier * iqr)
+    iqr_upper_bound = q3 + (iqr_multiplier * iqr)
 
-# --- 3. Sidebar for Controls and Filters ---
-st.sidebar.header("Dashboard Controls")
+    for i in range(len(monthly_values)):
+        curr_month = monthly_values.index[i]
+        curr_val = monthly_values.iloc[i]
+        
+        reasons = []
+        
+        # --- Check 1: Volatility (MoM Shock) ---
+        if i > 0:
+            prev_val = monthly_values.iloc[i-1]
+            if prev_val != 0:
+                abs_change = curr_val - prev_val
+                pct_change = abs_change / prev_val
+                if abs(pct_change) > pct_thresh and abs(abs_change) > abs_thresh:
+                    reasons.append(f"High Volatility ({pct_change:+.1%})")
 
-# Dictionary to map user-friendly names to actual sheet names
+        # --- Check 2: Annual Anomaly (IQR) ---
+        if curr_val < iqr_lower_bound or curr_val > iqr_upper_bound:
+            reasons.append("Annual Anomaly")
+            
+        if reasons:
+            outliers.append({
+                "Month": curr_month,
+                "Value": f"{curr_val:,.2f}",
+                "Reason(s)": ", ".join(reasons)
+            })
+            
+    return pd.DataFrame(outliers)
+
+
+# --- 3. Main Dashboard Interface ---
+st.title("🤖 Advanced Outlier Detection Dashboard")
+st.markdown("A smart QC tool to identify **true outliers** using a hybrid statistical approach.")
+
+# --- Sidebar Controls ---
+st.sidebar.header("Analysis Controls")
 SHEET_MAP = {
-    'Q1A: Number of Employees': 'QC_Q1A_Main',
-    'Q2A: Salary & Wages': 'QC_Q2A_Main',
-    'Q3: Hours Worked': 'QC_Q3',
-    'Q4: Job Vacancies': 'QC_Q4',
+    'Q1A: Number of Employees': 'QC_Q1A_Main', 'Q2A: Salary & Wages': 'QC_Q2A_Main',
+    'Q3: Hours Worked': 'QC_Q3', 'Q4: Job Vacancies': 'QC_Q4',
     'Q5: Employee Separations': 'QC_Q5'
 }
+selected_question = st.sidebar.selectbox("1. Select a dataset:", options=list(SHEET_MAP.keys()))
+df = load_data(SHEET_MAP[selected_question])
 
-# Dropdown to select the question/sheet
-selected_question = st.sidebar.selectbox(
-    "1. Select a Question to Analyze:",
-    options=list(SHEET_MAP.keys())
-)
-
-# Load the data based on the selection
-sheet_to_load = SHEET_MAP[selected_question]
-df = load_data(sheet_to_load)
-
-# Check if data loading was successful
 if isinstance(df, Exception):
-    st.error(f"Failed to load data from sheet '{sheet_to_load}'.")
-    st.error(f"Error details: {df}")
+    st.error(f"Failed to load data. Error: {df}")
 else:
-    # --- Dynamic Filters based on loaded data ---
-    entity_list = df['Entity / Group'].unique()
-    selected_entity = st.sidebar.selectbox(
-        "2. Select an Entity / Group:",
-        options=entity_list
+    st.sidebar.subheader("Threshold Configuration")
+    abs_threshold = st.sidebar.slider(
+        "Absolute Change Threshold", 10, 1000, 50, 10,
+        help="Flags MoM change if the value changes by more than this number."
     )
-
-    # Filter dataframe based on selected entity
-    df_filtered_entity = df[df['Entity / Group'] == selected_entity]
-
-    subquestion_list = df_filtered_entity['Subquestion'].unique()
-    selected_subquestion = st.sidebar.selectbox(
-        "3. Select a Subquestion:",
-        options=subquestion_list
+    iqr_mult = st.sidebar.slider(
+        "IQR Sensitivity", 1.0, 3.0, 1.5, 0.1,
+        help="Controls sensitivity of the Annual Anomaly check. Higher is less sensitive."
     )
-
-    # Filter dataframe further based on subquestion
-    df_filtered_subquestion = df_filtered_entity[df_filtered_entity['Subquestion'] == selected_subquestion]
+    st.sidebar.info("The relative (MoM %) threshold is fixed at **±25%**.")
     
-    worker_cat_list = df_filtered_subquestion['Worker Category'].unique()
-    selected_worker_cat = st.sidebar.selectbox(
-        "4. Select a Worker Category:",
-        options=worker_cat_list
-    )
+    # --- Dynamic Filters ---
+    entity = st.sidebar.selectbox("2. Select an Entity / Group:", options=df['Entity / Group'].unique())
+    subquestion = st.sidebar.selectbox("3. Select a Subquestion:", options=df[df['Entity / Group'] == entity]['Subquestion'].unique())
+    worker_cat = st.sidebar.selectbox("4. Select a Worker Category:", options=df[(df['Entity / Group'] == entity) & (df['Subquestion'] == subquestion)]['Worker Category'].unique())
 
-    # --- 4. Final Data Filtering and Analysis ---
-    final_filtered_df = df_filtered_subquestion[df_filtered_subquestion['Worker Category'] == selected_worker_cat]
+    # --- Data Filtering & Analysis ---
+    data_row = df[(df['Entity / Group'] == entity) & (df['Subquestion'] == subquestion) & (df['Worker Category'] == worker_cat)]
 
-    if final_filtered_df.empty:
-        st.warning("No data available for the selected combination of filters. Please try another selection.")
+    if data_row.empty:
+        st.warning("No data for this selection.")
     else:
-        # --- 5. Display Key Metrics and Chart ---
-        st.header(f"Analysis for: {selected_entity}")
-        st.subheader(f"{selected_subquestion} - {selected_worker_cat}")
+        st.header(f"Analysis for: {entity}")
+        st.caption(f"{subquestion} | {worker_cat}")
         
         months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-        monthly_values = final_filtered_df[months].iloc[0].astype(float)
-
-        # --- Display KPI Cards ---
-        col1, col2, col3 = st.columns(3)
-        latest_month_value = monthly_values.iloc[-1]
-        year_max = monthly_values.max()
-        year_avg = monthly_values.mean()
+        # Ensure all month columns exist, fill with 0 if not.
+        for month in months:
+            if month not in data_row.columns:
+                data_row[month] = 0
         
-        col1.metric("Latest Month's Value (Dec)", f"{latest_month_value:,.0f}")
-        col2.metric("Highest Month Value", f"{year_max:,.0f}")
-        col3.metric("Average Monthly Value", f"{year_avg:,.2f}")
+        monthly_values = data_row[months].iloc[0].astype(float)
+        outlier_df = find_outliers(monthly_values, 0.25, abs_threshold, iqr_mult)
 
-        # --- Calculate Thresholds ---
-        upper_band = [np.nan]
-        lower_band = [np.nan]
-        for i in range(1, len(monthly_values)):
-            prev_month_value = monthly_values.iloc[i-1]
-            if prev_month_value > 0:
-                upper_band.append(prev_month_value * 1.25)
-                lower_band.append(prev_month_value * 0.75)
-            else: # Handle cases where the previous month's value is zero
-                upper_band.append(0)
-                lower_band.append(0)
+        # --- KPI Cards ---
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Latest Value (Dec)", f"{monthly_values['Dec']:,.0f}")
+        col2.metric("Annual Average", f"{monthly_values.mean():,.0f}")
+        col3.metric("Annual High", f"{monthly_values.max():,.0f}")
+        col4.metric("Significant Outliers", len(outlier_df))
 
-        # --- Create and Display Plot ---
+        # --- Charting ---
         fig, ax = plt.subplots(figsize=(12, 6))
-        ax.plot(months, monthly_values, marker='o', linestyle='-', label='Actual Monthly Trend', zorder=5)
-        ax.plot(months, upper_band, linestyle='--', color='red', label='Upper Threshold (+25%)')
-        ax.plot(months, lower_band, linestyle='--', color='green', label='Lower Threshold (-25%)')
-        ax.fill_between(months, lower_band, upper_band, color='grey', alpha=0.15, label='Acceptable Range')
-
-        # Formatting
-        ax.set_title("Monthly Trend with ±25% Threshold", fontsize=16)
+        ax.plot(months, monthly_values, marker='o', linestyle='-', label='Monthly Trend', color='#1f77b4', zorder=5)
+        ax.set_title("Annual Trend & Detected Outliers", fontsize=16)
         ax.set_ylabel("Value")
         plt.xticks(rotation=45)
-        ax.legend()
-        ax.grid(True, which='both', linestyle='--', linewidth=0.5)
-        plt.tight_layout()
+        ax.grid(True, which='both', linestyle='--', linewidth=0.3)
+        
+        # Highlight outliers on chart
+        if not outlier_df.empty:
+            outlier_months = outlier_df['Month'].tolist()
+            outlier_values = monthly_values[outlier_months]
+            ax.scatter(outlier_months, outlier_values, s=250, c='red', marker='X', zorder=10, label='True Outlier')
 
+        ax.legend()
+        plt.tight_layout()
         st.pyplot(fig)
 
-        # --- Optional: Show Raw Data ---
-        with st.expander("Click to see the raw data for this selection"):
-            st.dataframe(final_filtered_df)
+        # --- Outlier Report ---
+        if not outlier_df.empty:
+            st.error("🚨 True Outlier(s) Detected!")
+            st.write("The following months were flagged by our hybrid detection system:")
+            st.dataframe(outlier_df, use_container_width=True)
+        else:
+            st.success("✅ No significant outliers were detected based on the current thresholds.")
+        
+        with st.expander("Show Raw Data"):
+            st.dataframe(data_row)
