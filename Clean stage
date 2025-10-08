@@ -32,7 +32,7 @@ def read_qc_table(xlsx: Path, sheet_name: str) -> Tuple[pd.DataFrame, Dict[str,f
     Return (df, thresholds) for a QC sheet.
     - Finds the header row (first row containing 'Entity / Group')
     - Reads the table beneath it
-    - Grabs Threshold (±%) and Abs cutoff from the info band (cells near D2/E2)
+    - Grabs Threshold (±%) and Abs cutoff from the info band above
     """
     try:
         raw = pd.read_excel(xlsx, sheet_name=sheet_name, header=None, engine="openpyxl")
@@ -44,7 +44,7 @@ def read_qc_table(xlsx: Path, sheet_name: str) -> Tuple[pd.DataFrame, Dict[str,f
 
     # Find header row
     header_idx = None
-    for i in range(min(len(raw), 30)):  # headers are always near the top
+    for i in range(min(len(raw), 40)):  # headers near top
         row_vals = raw.iloc[i].astype(str).str.strip().tolist()
         if "Entity / Group" in row_vals:
             header_idx = i
@@ -52,49 +52,41 @@ def read_qc_table(xlsx: Path, sheet_name: str) -> Tuple[pd.DataFrame, Dict[str,f
     if header_idx is None:
         return pd.DataFrame(), {"mom":0.25, "qoq":0.25, "yoy":0.25, "abs":50.0}
 
-    # Try to read thresholds from the small info band above the header:
-    # The pattern in QC is "Threshold (±%)" text in col D, value in col E (0-based: 3 and 4),
-    # and "Abs cutoff" text in next row same columns.
+    # Thresholds from info band
     thresh = {"mom":0.25, "qoq":0.25, "yoy":0.25, "abs":50.0}
     try:
-        # search the first ~10 rows for the labels
         band = raw.iloc[:header_idx+1].copy()
-        val = None
         for r in range(len(band)):
             row = band.iloc[r].astype(str).tolist()
             if any("Threshold" in str(x) for x in row):
-                # value usually next cell to the right of the "Threshold..." cell
                 c = next((k for k, x in enumerate(row) if "Threshold" in str(x)), None)
                 if c is not None and c+1 < len(row):
                     try:
                         v = float(band.iloc[r, c+1])
-                        thresh["mom"] = v
-                        thresh["qoq"] = v
-                        thresh["yoy"] = v
+                        thresh["mom"] = v; thresh["qoq"] = v; thresh["yoy"] = v
                     except Exception:
                         pass
             if any("Abs cutoff" in str(x) for x in row):
                 c = next((k for k, x in enumerate(row) if "Abs cutoff" in str(x)), None)
                 if c is not None and c+1 < len(row):
                     try:
-                        v = float(band.iloc[r, c+1])
-                        thresh["abs"] = v
+                        v = float(band.iloc[r, c+1]); thresh["abs"] = v
                     except Exception:
                         pass
     except Exception:
         pass
 
-    # Build clean dataframe
+    # Clean dataframe
     header = raw.iloc[header_idx].astype(str).str.replace(r"^Unnamed:\s*\d+$", "", regex=True).tolist()
     data = raw.iloc[header_idx+1:].copy()
     data.columns = header
-    # Drop entirely empty columns
+    # Drop empty columns
     data = data.drop(columns=[c for c in data.columns if (c == "" or c.startswith("Unnamed")) and data[c].isna().all()])
-    # Keep only real table rows
+    # Keep rows that look like table rows
     if "Entity / Group" in data.columns:
         data = data[~data["Entity / Group"].isna()].reset_index(drop=True)
 
-    # Normalize dimension name casing (just in case)
+    # Normalize dimension names if lowercased
     ren = {}
     if "subquestion" in data.columns and "Subquestion" not in data.columns: ren["subquestion"] = "Subquestion"
     if "worker_category" in data.columns and "Worker Category" not in data.columns: ren["worker_category"] = "Worker Category"
@@ -107,7 +99,7 @@ def read_qc_table(xlsx: Path, sheet_name: str) -> Tuple[pd.DataFrame, Dict[str,f
 def build_flags(df: pd.DataFrame, thresh: Dict[str,float]) -> pd.DataFrame:
     """
     For a QC table, return a long-form table with one row per flagged cell:
-      Severity (Yellow/Red), MetricType (MoM/QoQ/YoY), Period, Current, Previous, Diff, Percent, Thresholds…
+      Severity (Yellow/Red), MetricType (MoM/QoQ/YoY), Period, Current, Previous, Diff, Percent, Thresholds, dims…
     """
     if df.empty:
         return pd.DataFrame()
@@ -138,11 +130,10 @@ def build_flags(df: pd.DataFrame, thresh: Dict[str,float]) -> pd.DataFrame:
         except Exception:
             prev_m = None
         diff_col = f"Diff {m}"
-        for i, row in df.iterrows():
+        for _, row in df.iterrows():
             pct = row.get(mc, np.nan)
             if pd.isna(pct): continue
-            passes = abs(pct) >= float(thresh["mom"])
-            if not passes: continue
+            if abs(pct) < float(thresh["mom"]): continue
             diff = row.get(diff_col, np.nan)
             severity = "Yellow"
             if pd.notna(diff) and abs(diff) >= float(thresh["abs"]):
@@ -166,11 +157,10 @@ def build_flags(df: pd.DataFrame, thresh: Dict[str,float]) -> pd.DataFrame:
     for qc in q_pct_cols:
         q = qc.replace("%Diff ","",1).strip()
         diff_col = f"Diff {q}"
-        for i, row in df.iterrows():
+        for _, row in df.iterrows():
             pct = row.get(qc, np.nan)
             if pd.isna(pct): continue
-            passes = abs(pct) >= float(thresh["qoq"])
-            if not passes: continue
+            if abs(pct) < float(thresh["qoq"]): continue
             diff = row.get(diff_col, np.nan)
             severity = "Yellow"
             if pd.notna(diff) and abs(diff) >= float(thresh["abs"]):
@@ -183,8 +173,7 @@ def build_flags(df: pd.DataFrame, thresh: Dict[str,float]) -> pd.DataFrame:
                 "Percent": pct,
                 "Diff": diff if pd.notna(diff) else None,
                 "Current": row.get(q, None),
-                # Previous quarter value not stored explicitly; leave None
-                "Previous": None,
+                "Previous": None,  # not available explicitly in QC table
                 "AbsCutoff": float(thresh["abs"]),
                 "PctThreshold": float(thresh["qoq"]),
                 **{k: row.get(k,"") for k in dim_cols}
@@ -194,13 +183,12 @@ def build_flags(df: pd.DataFrame, thresh: Dict[str,float]) -> pd.DataFrame:
     yoy_cols = [c for c in df.columns if isinstance(c, str) and c.startswith("YoY ")]
     for yc in yoy_cols:
         lab = yc.replace("YoY ","",1).strip()  # could be 'Feb' or 'Q2' or 'Q4'
-        for i, row in df.iterrows():
+        for _, row in df.iterrows():
             pct = row.get(yc, np.nan)
             if pd.isna(pct): continue
-            passes = abs(pct) >= float(thresh["yoy"])
-            if not passes: continue
+            if abs(pct) < float(thresh["yoy"]): continue
             out_rows.append({
-                "Severity": "Yellow",  # no diff cutoff for YoY in QC CF
+                "Severity": "Yellow",  # QC rule: only % for YoY (no abs diff)
                 "MetricType": "YoY",
                 "Period": lab,
                 "Quarter": QMAP.get(lab, lab if lab in ("Q1","Q2","Q3","Q4") else ""),
@@ -214,74 +202,143 @@ def build_flags(df: pd.DataFrame, thresh: Dict[str,float]) -> pd.DataFrame:
             })
 
     if not out_rows:
-        return pd.DataFrame(columns=["Severity","MetricType","Period","Quarter","Percent","Diff","Current","Previous","AbsCutoff","PctThreshold"] + dim_cols)
+        cols = dim_cols + ["MetricType","Period","Quarter","Current","Previous","Diff","Percent","PctThreshold","AbsCutoff","Severity"]
+        return pd.DataFrame(columns=cols)
 
     alerts = pd.DataFrame(out_rows)
-
     # Order columns nicely
     ordered = dim_cols + ["MetricType","Period","Quarter","Current","Previous","Diff","Percent","PctThreshold","AbsCutoff","Severity"]
-    for c in ordered:
-        if c not in alerts.columns:
-            alerts[c] = np.nan
     alerts = alerts[ordered]
     return alerts
 
+def build_context(df: pd.DataFrame, alerts: pd.DataFrame) -> pd.DataFrame:
+    """Return the raw QC rows (full numeric context) for entities that were flagged."""
+    if df.empty or alerts.empty:
+        return pd.DataFrame()
+
+    # Dimension keys present in both frames
+    dim_candidates = ["Entity / Group","Subquestion","Worker Category","Job Function"]
+    keys = [c for c in dim_candidates if c in df.columns and c in alerts.columns]
+
+    if not keys:
+        return pd.DataFrame()
+
+    # Create a set of flagged keys
+    flagged = set(tuple(x) for x in alerts[keys].astype(str).itertuples(index=False, name=None))
+
+    # Filter df rows that match flagged keys
+    mask = df[keys].astype(str).apply(lambda r: tuple(r.values.tolist()) in flagged, axis=1)
+    ctx = df.loc[mask].copy()
+
+    # Keep only “useful” columns: dims + numeric signals
+    useful = keys[:]
+    numeric_cols = []
+    for c in ctx.columns:
+        if c in MONTHS or c in ("Q1","Q2","Q3","Q4") or \
+           c.startswith("Diff ") or c.startswith("MoM ") or \
+           c.startswith("%Diff ") or c.startswith("YoY ") or c.startswith("Prior "):
+            numeric_cols.append(c)
+    # Preserve original order
+    ctx = ctx[useful + numeric_cols]
+
+    return ctx
+
 # --------- Output writer ----------
-def write_alert_workbook(out_path: Path, sheets: Dict[str, pd.DataFrame]) -> None:
+def write_alert_workbook(out_path: Path, sheets: Dict[str, Tuple[pd.DataFrame,pd.DataFrame]]) -> None:
     wb = Workbook()
-    # remove default
     wb.remove(wb.active)
 
     for name in QC_SHEETS_ORDER:
-        if name not in sheets: continue
-        df = sheets[name]
-        title = f"ALERT_{name}"
-        ws = wb.create_sheet(title)
-        if df.empty:
-            ws["A1"] = f"{title} (no flags)"; ws["A1"].font = Font(bold=True)
+        if name not in sheets:
             continue
+        alerts, context = sheets[name]
 
-        # Header
-        ws.append(list(df.columns))
-        header_row = 1
-        for j, h in enumerate(df.columns, start=1):
-            c = ws.cell(header_row, j)
-            c.font = Font(bold=True)
-            c.alignment = Alignment(horizontal="center", vertical="center")
-            c.fill = FILL_HEADER
-            c.border = BTHIN
+        # --- ALERT sheet ---
+        title_a = f"ALERT_{name}"
+        ws = wb.create_sheet(title_a)
+        if alerts.empty:
+            ws["A1"] = f"{title_a} (no flags)"; ws["A1"].font = Font(bold=True)
+        else:
+            ws.append(list(alerts.columns))
+            header_row = 1
+            for j, h in enumerate(alerts.columns, start=1):
+                c = ws.cell(header_row, j)
+                c.font = Font(bold=True)
+                c.alignment = Alignment(horizontal="center", vertical="center")
+                c.fill = FILL_HEADER
+                c.border = BTHIN
 
-        # Data
-        for _, r in df.iterrows():
-            ws.append([r.get(c, "") for c in df.columns])
+            for _, r in alerts.iterrows():
+                ws.append([r.get(c, "") for c in alerts.columns])
 
-        # As a formal table (filters on)
-        last_row = ws.max_row
-        last_col = ws.max_column
-        ref = f"A1:{ws.cell(last_row, last_col).coordinate}"
-        tbl = Table(displayName=title.replace(" ","_"), ref=ref)
-        tbl.tableStyleInfo = TableStyleInfo(name="TableStyleLight9", showRowStripes=True)
-        ws.add_table(tbl)
+            last_row = ws.max_row
+            last_col = ws.max_column
+            ref = f"A1:{ws.cell(last_row, last_col).coordinate}"
+            tbl = Table(displayName=title_a.replace(" ","_"), ref=ref)
+            tbl.tableStyleInfo = TableStyleInfo(name="TableStyleLight9", showRowStripes=True)
+            ws.add_table(tbl)
 
-        # Column formats
-        fmt_num = {"Current":"#,##0", "Previous":"#,##0", "Diff":"#,##0"}
-        fmt_pct = {"Percent":"0.0%", "PctThreshold":"0.0%"}
-        for j, h in enumerate(df.columns, start=1):
-            nf = None
-            if h in fmt_num: nf = fmt_num[h]
-            if h in fmt_pct: nf = fmt_pct[h]
-            if nf:
-                for r in range(2, last_row+1):
-                    ws.cell(r, j).number_format = nf
+            # Formats
+            fmt_num = {"Current":"#,##0", "Previous":"#,##0", "Diff":"#,##0"}
+            fmt_pct = {"Percent":"0.0%", "PctThreshold":"0.0%"}
+            for j, h in enumerate(alerts.columns, start=1):
+                nf = None
+                if h in fmt_num: nf = fmt_num[h]
+                if h in fmt_pct: nf = fmt_pct[h]
+                if nf:
+                    for r in range(2, last_row+1):
+                        ws.cell(r, j).number_format = nf
 
-        # Auto width
-        for j in range(1, last_col+1):
-            maxw = max(len(str(ws.cell(1, j).value or "")), 10)
-            for r in range(2, min(200, last_row+1)):
-                v = ws.cell(r, j).value
-                if v is not None:
-                    maxw = max(maxw, len(str(v)))
-            ws.column_dimensions[ws.cell(1, j).column_letter].width = min(maxw+2, 40)
+            # Widths
+            for j in range(1, last_col+1):
+                maxw = max(len(str(ws.cell(1, j).value or "")), 12)
+                for r in range(2, min(200, last_row+1)):
+                    v = ws.cell(r, j).value
+                    if v is not None:
+                        maxw = max(maxw, len(str(v)))
+                ws.column_dimensions[ws.cell(1, j).column_letter].width = min(maxw+2, 44)
+
+        # --- CONTEXT sheet ---
+        title_c = f"CONTEXT_{name}"
+        ws2 = wb.create_sheet(title_c)
+        if context.empty:
+            ws2["A1"] = f"{title_c} (no flagged rows to show)"; ws2["A1"].font = Font(bold=True)
+        else:
+            ws2.append(list(context.columns))
+            header_row = 1
+            for j, h in enumerate(context.columns, start=1):
+                c = ws2.cell(header_row, j)
+                c.font = Font(bold=True)
+                c.alignment = Alignment(horizontal="center", vertical="center")
+                c.fill = FILL_HEADER
+                c.border = BTHIN
+
+            for _, r in context.iterrows():
+                ws2.append([r.get(c, "") for c in context.columns])
+
+            last_row = ws2.max_row
+            last_col = ws2.max_column
+            ref = f"A1:{ws2.cell(last_row, last_col).coordinate}"
+            tbl = Table(displayName=title_c.replace(" ","_"), ref=ref)
+            tbl.tableStyleInfo = TableStyleInfo(name="TableStyleLight9", showRowStripes=True)
+            ws2.add_table(tbl)
+
+            # Simple formats
+            for j, h in enumerate(context.columns, start=1):
+                if h in MONTHS or h in ("Q1","Q2","Q3","Q4") or h.startswith("Diff "):
+                    for r in range(2, last_row+1):
+                        ws2.cell(r, j).number_format = "#,##0"
+                elif h.startswith("MoM ") or h.startswith("%Diff ") or h.startswith("YoY "):
+                    for r in range(2, last_row+1):
+                        ws2.cell(r, j).number_format = "0.0%"
+
+            for j in range(1, last_col+1):
+                maxw = max(len(str(ws2.cell(1, j).value or "")), 12)
+                for r in range(2, min(200, last_row+1)):
+                    v = ws2.cell(r, j).value
+                    if v is not None:
+                        maxw = max(maxw, len(str(v)))
+                ws2.column_dimensions[ws2.cell(1, j).column_letter].width = min(maxw+2, 44)
 
     wb.save(out_path)
 
@@ -293,21 +350,22 @@ def main() -> int:
     qc_path = Path(sys.argv[1])
     out_path = Path(sys.argv[2]) if len(sys.argv) >= 3 else qc_path.with_name(f"ALERTS_{qc_path.name}")
 
-    all_alerts: Dict[str, pd.DataFrame] = {}
+    all_out: Dict[str, Tuple[pd.DataFrame,pd.DataFrame]] = {}
     for sheet in QC_SHEETS_ORDER:
         df, thr = read_qc_table(qc_path, sheet)
         if df.empty:
             continue
         alerts = build_flags(df, thr)
-        all_alerts[sheet] = alerts
+        context = build_context(df, alerts)
+        all_out[sheet] = (alerts, context)
 
-    if not all_alerts:
+    if not all_out:
         print("[INFO] No QC sheets found or no flags detected.")
-        # still create an empty workbook with a note
+        # still create a thin workbook so you have a file
         write_alert_workbook(out_path, {})
         return 0
 
-    write_alert_workbook(out_path, all_alerts)
+    write_alert_workbook(out_path, all_out)
     print(f"[DONE] {out_path}")
     return 0
 
