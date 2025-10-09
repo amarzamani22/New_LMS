@@ -46,7 +46,7 @@ def load_data(year, sheet_name):
     """Loads data for a specific year and sheet."""
     file_path = f"submission/qc_workbook_{year}.xlsx"
     if not os.path.exists(file_path):
-        return f"Error: File not found. Please ensure '{file_path}' exists."
+        return f"Error: File not found. Please ensure '{file_path}' exists in a 'submission' subfolder."
     try:
         df = pd.read_excel(file_path, sheet_name=sheet_name, header=5)
         df.dropna(axis=1, how='all', inplace=True)
@@ -69,7 +69,6 @@ def get_reporting_quarter(year):
         return 4 # Default to Q4 if sheet is missing or malformed
 
 def find_outliers(data_series, prior_year_series, pct_thresh, abs_thresh, iqr_multiplier, yoy_thresh):
-    # This core engine remains the same
     outliers = []
     if data_series.isnull().all() or len(data_series) < 2: return pd.DataFrame()
 
@@ -98,8 +97,7 @@ def find_outliers(data_series, prior_year_series, pct_thresh, abs_thresh, iqr_mu
             
     return pd.DataFrame(outliers)
 
-# ... (Full report generation function remains the same) ...
-def generate_full_report(sheet_map, years, questions_to_scan, thresholds):
+def generate_full_report(sheet_map, years, questions_to_scan, thresholds, all_months):
     master_outlier_list = []
     progress_bar = st.progress(0, text="Initializing Scan...")
     
@@ -150,6 +148,7 @@ months_to_analyze = all_months[:reporting_quarter * 3]
 quarters_to_analyze = [f'Q{i+1}' for i in range(reporting_quarter)]
 st.sidebar.info(f"Analyzing **{current_year}** data up to **Q{reporting_quarter}**.")
 
+# --- View 1: Interactive Analysis ---
 if analysis_view == 'Interactive Analysis':
     st.sidebar.subheader("Thresholds")
     abs_thresh = st.sidebar.slider("Absolute Change", 10, 1000, 50, 10)
@@ -184,7 +183,8 @@ if analysis_view == 'Interactive Analysis':
             title = "Monthly Trend"
             if not isinstance(df_prior, str) and df_prior is not None:
                 prior_row = df_prior[(df_prior['Entity / Group'] == entity) & (df_prior.get('Subquestion', 'N/A') == subquestion) & (df_prior['Worker Category'] == worker_cat)]
-                if not prior_row.empty: prior_series = prior_row[actual_months].iloc[0].astype(float)
+                if not prior_row.empty and all(m in prior_row.columns for m in actual_months):
+                    prior_series = prior_row[actual_months].iloc[0].astype(float)
         else: # Quarterly
             q_cols = [f'Q{i+1}_Total' for i in range(len(quarters_to_analyze))]
             if all(p in data_row.columns for p in q_cols):
@@ -208,13 +208,27 @@ if analysis_view == 'Interactive Analysis':
             if prior_series is not None: ax.plot(prior_series.index, prior_series, marker='.', linestyle='--', label=f'{comparison_year} Trend', color='gray', alpha=0.8)
             upper_band = [np.nan] + [current_series.iloc[i-1] * 1.25 for i in range(1, len(current_series))]; lower_band = [np.nan] + [current_series.iloc[i-1] * 0.75 for i in range(1, len(current_series))]
             ax.fill_between(current_series.index, lower_band, upper_band, color='gray', alpha=0.1, label='MoM ±25% Range')
-
             if not outlier_df.empty: ax.scatter(outlier_df['Period'], current_series[outlier_df['Period']], s=250, c='red', marker='X', zorder=20, label='True Outlier')
             ax.legend(); ax.grid(True, alpha=0.3); st.pyplot(fig)
             
             if not outlier_df.empty: st.error("🚨 True Outlier(s) Detected!"); st.dataframe(outlier_df, use_container_width=True)
             else: st.success("✅ No significant outliers detected.")
-            with st.expander("Show Raw Data for This Selection"): st.dataframe(data_row)
+            
+            # --- NEW: Upgraded Raw Data Section ---
+            with st.expander("Show Raw Data for Comparison"):
+                st.subheader(f"Data for {current_year}")
+                st.dataframe(data_row)
+                
+                if comparison_year:
+                    st.subheader(f"Data for {comparison_year}")
+                    if not isinstance(df_prior, str) and df_prior is not None:
+                        prior_row_display = df_prior[(df_prior['Entity / Group'] == entity) & (df_prior.get('Subquestion', 'N/A') == subquestion) & (df_prior['Worker Category'] == worker_cat)]
+                        if not prior_row_display.empty:
+                            st.dataframe(prior_row_display)
+                        else:
+                            st.warning(f"No matching data found for this selection in the {comparison_year} workbook.")
+                    else:
+                        st.error(f"Could not load data for {comparison_year}. Please check the file.")
 
 # --- View 2: Full Outlier Report ---
 elif analysis_view == 'Full Outlier Report':
@@ -234,7 +248,7 @@ elif analysis_view == 'Full Outlier Report':
             with st.spinner("Analyzing workbook(s)... This may take a moment."):
                 report_thresholds = {'pct_thresh': 0.25, 'abs_thresh': abs_thresh_report, 'iqr_multiplier': iqr_mult_report, 'yoy_thresh': yoy_thresh_report}
                 years = {'current': current_year, 'prior': comparison_year}
-                final_report = generate_full_report(SHEET_MAP, years, questions_to_scan, report_thresholds)
+                final_report = generate_full_report(SHEET_MAP, years, questions_to_scan, report_thresholds, all_months)
             
             st.success(f"Scan complete! Found **{len(final_report)}** potential outliers.")
             if not final_report.empty:
