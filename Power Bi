@@ -326,29 +326,70 @@ if analysis_view == 'Interactive Analysis':
             col3.metric("Period High", f"{np.nanmax(current_series):,.0f}")
             col4.metric("True Outliers", len(outlier_df))
             
-            fig, ax = plt.subplots(figsize=(12, 6))
-            ax.plot(current_series.index, current_series, marker='o', linestyle='-', label=f'{current_year} Trend', zorder=10)
-            if prior_series is not None and not prior_series.empty:
-                ax.plot(prior_series.index, prior_series, marker='.', linestyle='--', label=f'{comparison_year} Trend', alpha=0.8)
-            # MoM band (for monthly series the band makes sense; for quarterly, it still provides volatility context)
-            if len(current_series) >= 2:
-                upper_band = [np.nan] + [current_series.iloc[i-1] * 1.25 for i in range(1, len(current_series))]
-                lower_band = [np.nan] + [current_series.iloc[i-1] * 0.75 for i in range(1, len(current_series))]
-                ax.fill_between(range(len(current_series)), lower_band, upper_band, alpha=0.1, label='MoM ±25% Range')
-                # Map x positions back to tick labels
-                ax.set_xticks(range(len(current_series)))
-                ax.set_xticklabels(list(current_series.index))
+           # --- Plotly interactive chart (drop-in replacement for the Matplotlib block) ---
+x = list(current_series.index)
+y = current_series.values.astype(float)
 
-            if not outlier_df.empty:
-                # Scatter using indices to match fill_between x-range
-                x_pos = [list(current_series.index).index(p) for p in outlier_df['Period'] if p in current_series.index]
-                y_pos = [current_series[p] for p in outlier_df['Period'] if p in current_series.index]
-                ax.scatter(x_pos, y_pos, s=250, c='red', marker='X', zorder=20, label='True Outlier')
+fig = go.Figure()
 
-            ax.set_title(title)
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            st.pyplot(fig)
+# Current year line
+fig.add_trace(go.Scatter(
+    x=x, y=y, mode='lines+markers', name=f'{current_year} Trend',
+    hovertemplate='Period: %{x}<br>Value: %{y:,.0f}<extra></extra>'
+))
+
+# Prior year line (if available)
+if prior_series is not None and not prior_series.empty:
+    fig.add_trace(go.Scatter(
+        x=list(prior_series.index),
+        y=prior_series.values.astype(float),
+        mode='lines+markers',
+        name=f'{comparison_year} Trend',
+        line=dict(dash='dash'),
+        hovertemplate='Period: %{x}<br>Value: %{y:,.0f}<extra></extra>'
+    ))
+
+# MoM ±25% band (same logic you already use)
+if len(y) >= 2:
+    upper = [None] + [y[i-1] * 1.25 for i in range(1, len(y))]
+    lower = [None] + [y[i-1] * 0.75 for i in range(1, len(y))]
+
+    # Lower boundary (invisible, used for fill anchor)
+    fig.add_trace(go.Scatter(
+        x=x, y=lower, mode='lines', line=dict(width=0),
+        name='MoM −25% Range', showlegend=False, hoverinfo='skip'
+    ))
+    # Upper boundary (fills to previous trace)
+    fig.add_trace(go.Scatter(
+        x=x, y=upper, mode='lines', line=dict(width=0),
+        fill='tonexty', name='MoM ±25% Range', opacity=0.15,
+        hovertemplate='Prev×1.25: %{y:,.0f}<extra></extra>'
+    ))
+
+# Outlier markers (if any)
+if not outlier_df.empty:
+    # match outlier x to current_series
+    o_x = [p for p in outlier_df['Period'] if p in current_series.index]
+    o_y = [current_series[p] for p in o_x]
+    o_reason = [outlier_df.set_index('Period').loc[p, 'Reason(s)'] for p in o_x]
+    fig.add_trace(go.Scatter(
+        x=o_x, y=o_y, mode='markers', name='True Outlier',
+        marker=dict(symbol='x', size=14),
+        hovertemplate='Period: %{x}<br>Value: %{y:,.0f}<br>%{customdata}<extra></extra>',
+        customdata=o_reason
+    ))
+
+fig.update_layout(
+    title=title,
+    hovermode='x unified',   # single tooltip when moving along x
+    legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='left', x=0),
+    margin=dict(l=10, r=10, t=50, b=10),
+)
+
+# Make x labels readable
+fig.update_xaxes(tickangle=45)
+
+st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True})
             
             if not outlier_df.empty:
                 st.error("🚨 True Outlier(s) Detected!")
