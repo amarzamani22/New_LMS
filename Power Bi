@@ -1,4 +1,14 @@
 # app.py
+# -----------------------------
+# QC Intelligence Console (Streamlit)
+# -----------------------------
+# Features:
+# - Explore: Plotly chart with MoM band + 3M rolling mean (fixed), optional comparison year
+# - Anomalies: Clear alert flags per period + severity label (True/Probable/Watchlist)
+# - Attribution: Only for True Outliers (All FI -> Sector -> Subsector -> Institution)
+# - Report: Batch monthly scan & CSV export
+# -----------------------------
+
 import os
 import re
 import numpy as np
@@ -6,25 +16,20 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 
-# =========================
-# Page & Theme
-# =========================
+# ---------- Page ----------
 st.set_page_config(page_title="QC Intelligence Console", page_icon="📊", layout="wide")
-
 st.markdown("""
 <style>
-    .stApp { background-color: #F5F7FB; }
+    .stApp { background-color:#F5F7FB; }
     .kpi-card {
-        padding: 16px; border-radius: 10px; background: #fff; border: 1px solid #e7e7e7;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.03); text-align:center;
+        padding:14px; border-radius:10px; background:#fff; border:1px solid #e7e7e7;
+        box-shadow:0 2px 8px rgba(0,0,0,0.03); text-align:center;
     }
     .subtle { color:#666; font-size:0.9rem; }
 </style>
 """, unsafe_allow_html=True)
 
-# =========================
-# Constants
-# =========================
+# ---------- Constants ----------
 ALL_MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
 SHEET_MAP = {
     'Q1A: Employees': 'QC_Q1A_Main',
@@ -34,23 +39,25 @@ SHEET_MAP = {
     'Q5: Separations': 'QC_Q5'
 }
 
-COMPOSITE_WEIGHTS_MONTHLY = dict(MoM=0.35, YoY=0.30, IQR=0.20, ROLL=0.15)
-COMPOSITE_WEIGHTS_QUARTERLY = dict(MoM=0.25, YoY=0.40, IQR=0.25, ROLL=0.10)
-
+# Composite label thresholds (we keep numbers internal; UI shows labels only)
 COMPOSITE_LABELS = [
     (0.75, "True Outlier"),
     (0.65, "Probable Outlier"),
     (0.50, "Watchlist"),
 ]
 
-# Rolling defaults (exposed in UI)
-DEFAULT_ROLL_WIN = 3
-DEFAULT_ROLL_KSIG = 2.5
-DEFAULT_ROLL_REL = 0.25  # 25%
+# Rolling (fixed — as requested)
+ROLL_W = 3
+ROLL_KSIG = 2.5      # std-dev multiple for 0.6 score
+ROLL_KSIG_STRONG = 3.0
+ROLL_REL = 0.25      # 25% from rolling mean (fallback if std is tiny)
+ROLL_REL_STRONG = 0.40
 
-# =========================
-# Data Loaders
-# =========================
+# Weights (kept internal; monthly vs quarterly)
+WEIGHTS_MONTHLY   = dict(MoM=0.35, YoY=0.30, IQR=0.20, ROLL=0.15)
+WEIGHTS_QUARTERLY = dict(MoM=0.25, YoY=0.40, IQR=0.25, ROLL=0.10)
+
+# ---------- Data Loaders ----------
 @st.cache_data
 def load_data(year: int|None, sheet_name: str):
     if year is None:
@@ -81,19 +88,17 @@ def get_reporting_quarter(year: int):
 @st.cache_data
 def load_hierarchy_map(path="submission/entity_hierarchy.csv"):
     if not os.path.exists(path):
-        return None, "Hierarchy map not found. Expect submission/entity_hierarchy.csv with Institution,Sector,Subsector."
+        return None, "Hierarchy map not found. Place submission/entity_hierarchy.csv (columns: Institution,Sector,Subsector)."
     try:
         h = pd.read_csv(path)
-        required = {'Institution','Sector','Subsector'}
-        if not required.issubset(set(h.columns)):
-            return None, f"Hierarchy map missing columns. Need {required}"
+        req = {'Institution','Sector','Subsector'}
+        if not req.issubset(set(h.columns)):
+            return None, f"Hierarchy map missing columns. Need {req}"
         return h, None
     except Exception as e:
         return None, f"Error reading hierarchy map: {e}"
 
-# =========================
-# Helpers
-# =========================
+# ---------- Helpers ----------
 def _row_filter(df, entity, worker_cat, subq):
     cond = (df['Entity / Group'] == entity) & (df['Worker Category'] == worker_cat)
     if 'Subquestion' in df.columns:
@@ -102,9 +107,9 @@ def _row_filter(df, entity, worker_cat, subq):
 
 def build_quarter_series(data_row, year, reporting_quarter):
     if data_row.empty: return pd.Series(dtype=float)
-    # Use Qx_Total if present, else compute from months
     labels, vals = [], []
     have_any = False
+    # Prefer Qx_Total when present
     for q in range(1, reporting_quarter+1):
         col = f'Q{q}_Total'
         if col in data_row.columns:
@@ -112,11 +117,12 @@ def build_quarter_series(data_row, year, reporting_quarter):
             if not pd.isna(v):
                 have_any = True
                 labels.append(f"Q{q} {year}"); vals.append(float(v))
+    # Compute from months for missing quarters
     if not have_any or len(labels) < reporting_quarter:
         q_map = {1: ALL_MONTHS[0:3], 2: ALL_MONTHS[3:6], 3: ALL_MONTHS[6:9], 4: ALL_MONTHS[9:12]}
-        present = {int(l.split()[0][1:]) for l in labels}
+        present_qs = {int(l.split()[0][1:]) for l in labels}
         for q in range(1, reporting_quarter+1):
-            if q in present: continue
+            if q in present_qs: continue
             mlist = [m for m in q_map[q] if m in data_row.columns]
             if mlist:
                 ser = pd.to_numeric(data_row[mlist].iloc[0], errors='coerce').astype(float)
@@ -124,46 +130,39 @@ def build_quarter_series(data_row, year, reporting_quarter):
                     labels.append(f"Q{q} {year}")
                     vals.append(float(np.nansum(ser.values)))
     if not labels: return pd.Series(dtype=float)
-    # sort by Q number
     order = np.argsort([int(l.split()[0][1:]) for l in labels])
     labels = [labels[i] for i in order]; vals = [vals[i] for i in order]
     return pd.Series(vals, index=labels, dtype=float)
 
-def plot_series(current_series, prior_series, title):
-    x = list(current_series.index)
-    y = current_series.values.astype(float)
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=x, y=y, mode='lines+markers', name='Current',
-        hovertemplate='Period: %{x}<br>Value: %{y:,.0f}<extra></extra>'
-    ))
-    if prior_series is not None and not prior_series.empty:
-        fig.add_trace(go.Scatter(
-            x=list(prior_series.index),
-            y=prior_series.values.astype(float),
-            mode='lines+markers', name='Comparison', line=dict(dash='dash'),
-            hovertemplate='Period: %{x}<br>Value: %{y:,.0f}<extra></extra>'
-        ))
-    fig.update_layout(
-        title=title, hovermode='x unified',
-        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='left', x=0),
-        margin=dict(l=10, r=10, t=50, b=10)
-    )
-    fig.update_xaxes(tickangle=45)
-    st.plotly_chart(fig, use_container_width=True)
-
-# =========================
-# 4-Pillar Scoring
-# =========================
-def _rolling_stats(series, window):
+def _rolling(series: pd.Series, window=ROLL_W):
     m = series.rolling(window=window, min_periods=max(2, window//2)).mean()
     s = series.rolling(window=window, min_periods=max(2, window//2)).std()
     return m, s
 
-def score_pillars(series, prior_series, mom_pct_thresh, mom_abs_thresh, yoy_pct_thresh, iqr_k, roll_w, roll_ksig, roll_rel):
-    idx = list(series.index)
-    out = []
+def _compose_label(score: float, consensus_ok: bool):
+    if not consensus_ok:
+        return ""
+    for thr, name in COMPOSITE_LABELS:
+        if score >= thr:
+            return name
+    return ""
 
+def _weights(view):  # Monthly vs Quarterly
+    return WEIGHTS_MONTHLY if view == "Monthly" else WEIGHTS_QUARTERLY
+
+# ---------- 4-Pillar Alerts ----------
+def score_pillars(series, prior_series, mom_pct_thresh, mom_abs_floor, yoy_pct_thresh, iqr_k, view):
+    """
+    Returns a DataFrame (index=period) with columns:
+    - Alerts (list[str]) e.g. ["High Volatility","YoY Anomaly"]
+    - Label (str) in {"True Outlier","Probable Outlier","Watchlist",""}
+    - Composite (float) kept internal
+    - Value (float), RollingMean (float)
+    """
+    idx = list(series.index)
+    out_rows = []
+
+    # IQR bounds
     valid = series.dropna()
     if len(valid) >= 4:
         q1, q3 = valid.quantile(0.25), valid.quantile(0.75)
@@ -172,22 +171,24 @@ def score_pillars(series, prior_series, mom_pct_thresh, mom_abs_thresh, yoy_pct_
     else:
         lb = ub = iqr = None
 
-    r_mean, r_std = _rolling_stats(series, roll_w)
+    r_mean, r_std = _rolling(series, ROLL_W)
+    W = _weights(view)
 
     for i, p in enumerate(idx):
         v = series.iloc[i]
-        reasons = []
+        alerts = []
+        # Pillar scores for internal composite
         s_mom = s_yoy = s_iqr = s_roll = 0.0
 
-        # MoM
+        # MoM Shock
         if i > 0 and not pd.isna(v):
             prev = series.iloc[i-1]
             if not pd.isna(prev) and prev != 0:
                 d_abs = v - prev
                 d_pct = d_abs / prev
-                if abs(d_pct) > mom_pct_thresh and abs(d_abs) > mom_abs_thresh:
+                if abs(d_pct) > mom_pct_thresh and abs(d_abs) > mom_abs_floor:
+                    alerts.append("High Volatility (MoM)")
                     s_mom = 1.0 if abs(d_pct) > max(0.5, mom_pct_thresh*2) else 0.6
-                    reasons.append(f"MoM {d_pct:+.1%} (Δ {d_abs:+,.0f})")
 
         # YoY
         if prior_series is not None and p in prior_series.index and not pd.isna(v):
@@ -195,68 +196,108 @@ def score_pillars(series, prior_series, mom_pct_thresh, mom_abs_thresh, yoy_pct_
             if not pd.isna(prev_y) and prev_y != 0:
                 yoy = (v - prev_y) / prev_y
                 if abs(yoy) > yoy_pct_thresh:
-                    s_yoy = 1.0 if abs(yoy) > max(0.6, yoy_pct_thresh*2) else 0.6
-                    reasons.append(f"YoY {yoy:+.1%}")
+                    alerts.append("YoY Anomaly")
+                    s_yoy = 1.0 if abs(yoy) > max(0.60, yoy_pct_thresh*2) else 0.6
 
         # IQR
         if lb is not None and not pd.isna(v):
             if v < lb or v > ub:
-                # distance approx
+                alerts.append("IQR Range Break")
+                # distance approx to grade 0.6 vs 1.0
                 dist = 0.0
                 if iqr and iqr != 0:
-                    dist = (ub - v)/iqr if v > ub else (v - lb)/iqr
-                    dist = abs(dist)
+                    if v > ub: dist = (v - ub)/iqr
+                    elif v < lb: dist = (lb - v)/iqr
                 s_iqr = 1.0 if dist >= 1.0 else 0.6
-                reasons.append("IQR outlier")
 
-        # Rolling
+        # Rolling Deviation (3M)
         mu = r_mean.iloc[i] if len(r_mean) > i else np.nan
         sd = r_std.iloc[i] if len(r_std) > i else np.nan
         if not pd.isna(v) and not pd.isna(mu):
             if not pd.isna(sd) and sd > 0:
-                z = abs(v - mu) / sd
-                if z >= 3.0:
-                    s_roll = 1.0; reasons.append(f"Rolling {z:.1f}σ")
-                elif z >= roll_ksig:
-                    s_roll = 0.6; reasons.append(f"Rolling {z:.1f}σ")
+                z = abs(v - mu)/sd
+                if z >= ROLL_KSIG_STRONG:
+                    alerts.append("Rolling Break (3M)")
+                    s_roll = 1.0
+                elif z >= ROLL_KSIG:
+                    alerts.append("Rolling Break (3M)")
+                    s_roll = 0.6
             else:
+                # fallback to relative from mean
                 if mu != 0:
                     rel = abs(v - mu)/abs(mu)
-                    if rel >= 0.40:
-                        s_roll = 1.0; reasons.append(f"Rolling {rel:.0%}")
-                    elif rel >= roll_rel:
-                        s_roll = 0.6; reasons.append(f"Rolling {rel:.0%}")
+                    if rel >= ROLL_REL_STRONG:
+                        alerts.append("Rolling Break (3M)")
+                        s_roll = 1.0
+                    elif rel >= ROLL_REL:
+                        alerts.append("Rolling Break (3M)")
+                        s_roll = 0.6
 
-        out.append(dict(Period=p, MoM_score=s_mom, YoY_score=s_yoy, IQR_score=s_iqr, ROLL_score=s_roll, Reasons=reasons))
-    return pd.DataFrame(out).set_index("Period")
+        # Composite & label (consensus)
+        comp = (W['MoM']*s_mom + W['YoY']*s_yoy + W['IQR']*s_iqr + W['ROLL']*s_roll)
+        strong = sum(x >= 0.6 for x in [s_mom, s_yoy, s_iqr, s_roll])
+        any1 = any(abs(x - 1.0) < 1e-9 for x in [s_mom, s_yoy, s_iqr, s_roll])
+        any04 = sum(x >= 0.4 for x in [s_mom, s_yoy, s_iqr, s_roll]) >= 2
+        consensus_ok = (strong >= 2) or (any1 and any04)
+        label = _compose_label(comp, consensus_ok)
 
-def compose_score(scores_df, view):
-    if scores_df.empty:
-        return scores_df.assign(Composite=0.0, Label="")
-    W = COMPOSITE_WEIGHTS_MONTHLY if view == "Monthly" else COMPOSITE_WEIGHTS_QUARTERLY
-    comp = (W['MoM']*scores_df['MoM_score'] + W['YoY']*scores_df['YoY_score'] +
-            W['IQR']*scores_df['IQR_score'] + W['ROLL']*scores_df['ROLL_score'])
-    pillars = scores_df[['MoM_score','YoY_score','IQR_score','ROLL_score']]
-    strong = (pillars >= 0.6).sum(axis=1)
-    any1 = (pillars >= 0.999).sum(axis=1) >= 1
-    any04 = (pillars >= 0.4).sum(axis=1) >= 2
-    consensus = (strong >= 2) | (any1 & any04)
-    labels = []
-    for c, ok in zip(comp, consensus):
-        label = ""
-        if ok:
-            for thr, name in COMPOSITE_LABELS:
-                if c >= thr:
-                    label = name; break
-        labels.append(label)
-    out = scores_df.copy()
-    out['Composite'] = comp
-    out['Label'] = labels
-    return out
+        out_rows.append(dict(
+            Period=p, Value=float(v) if not pd.isna(v) else np.nan,
+            RollingMean=float(mu) if not pd.isna(mu) else np.nan,
+            Alerts=alerts, Label=label, Composite=float(comp)
+        ))
 
-# =========================
-# Hierarchical Aggregation
-# =========================
+    df = pd.DataFrame(out_rows).set_index("Period")
+    # Sort: True → Probable → Watchlist → (none), then by Composite desc
+    level_order = {"True Outlier":0, "Probable Outlier":1, "Watchlist":2, "":3}
+    df = df.assign(_ord=df['Label'].map(level_order)).sort_values(['_ord','Composite'], ascending=[True,False]).drop(columns=['_ord'])
+    return df
+
+# ---------- Plot ----------
+def plot_series(series_cur, series_prior, title, show_mom_band=True, show_rolling=True):
+    x = list(series_cur.index)
+    y = series_cur.values.astype(float)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=x, y=y, mode='lines+markers', name='Current',
+        hovertemplate='Period: %{x}<br>Value: %{y:,.0f}<extra></extra>'
+    ))
+    if series_prior is not None and not series_prior.empty:
+        fig.add_trace(go.Scatter(
+            x=list(series_prior.index),
+            y=series_prior.values.astype(float),
+            mode='lines+markers', name='Comparison', line=dict(dash='dash'),
+            hovertemplate='Period: %{x}<br>Value: %{y:,.0f}<extra></extra>'
+        ))
+
+    # MoM ±25% band
+    if show_mom_band and len(y) >= 2:
+        upper = [None] + [y[i-1]*1.25 for i in range(1, len(y))]
+        lower = [None] + [y[i-1]*0.75 for i in range(1, len(y))]
+        # lower boundary
+        fig.add_trace(go.Scatter(x=x, y=lower, mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
+        # upper with fill
+        fig.add_trace(go.Scatter(x=x, y=upper, mode='lines', line=dict(width=0), fill='tonexty',
+                                 name='MoM ±25% Range', opacity=0.15, hoverinfo='skip'))
+
+    # Rolling mean (3M)
+    if show_rolling and len(y) >= 2:
+        r_mean = pd.Series(y).rolling(window=ROLL_W, min_periods=max(2, ROLL_W//2)).mean().values
+        fig.add_trace(go.Scatter(
+            x=x, y=r_mean, mode='lines', name=f'Rolling Mean ({ROLL_W}M)', hovertemplate='Rolling: %{y:,.0f}<extra></extra>',
+            line=dict(width=1.5)
+        ))
+
+    fig.update_layout(
+        title=title, hovermode='x unified',
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='left', x=0),
+        margin=dict(l=10, r=10, t=50, b=10)
+    )
+    fig.update_xaxes(tickangle=45)
+    st.plotly_chart(fig, use_container_width=True)
+
+# ---------- Attribution ----------
 def aggregate_monthly(df_slice, months):
     work = df_slice.copy()
     for m in months:
@@ -266,22 +307,22 @@ def aggregate_monthly(df_slice, months):
 
 def build_level_series(df_sheet, cols, hmap):
     merged = df_sheet.merge(hmap, left_on='Entity / Group', right_on='Institution', how='left')
-    # L3 institution
+
     inst = {}
     for name, g in merged.groupby('Institution', dropna=False):
         if name is None or pd.isna(name): continue
         s = g[cols].sum(numeric_only=True); s.index = cols; inst[name] = s
-    # L2 subsector
+
     sub = {}
     for (sec, subsec), g in merged.groupby(['Sector','Subsector'], dropna=False):
         if pd.isna(sec) or pd.isna(subsec): continue
         s = g[cols].sum(numeric_only=True); s.index = cols; sub[(sec, subsec)] = s
-    # L1 sector
+
     secd = {}
     for sec, g in merged.groupby('Sector', dropna=False):
         if pd.isna(sec): continue
         s = g[cols].sum(numeric_only=True); s.index = cols; secd[sec] = s
-    # L0 all fi
+
     allfi = merged[cols].sum(numeric_only=True); allfi.index = cols
     return dict(AllFI=allfi, Sector=secd, Subsector=sub, Institution=inst)
 
@@ -299,24 +340,25 @@ def attribute_path(period, agg):
     out['AllFI_value'] = allfi.get(period, np.nan)
     out['AllFI_delta'] = _delta_prev(allfi, period)
 
-    # sector
+    # Sector
     s_contrib = {sec: _delta_prev(s, period) for sec, s in agg['Sector'].items()}
     sec_best = max(s_contrib, key=lambda k: abs(s_contrib[k]) if not pd.isna(s_contrib[k]) else -1) if s_contrib else None
     out['Sector'] = sec_best; out['Sector_delta'] = s_contrib.get(sec_best, np.nan) if sec_best else np.nan
 
-    # subsector within sector
+    # Subsector within sector
     sub_choices = {k: v for k, v in agg['Subsector'].items() if k[0] == sec_best} if sec_best else {}
     sub_contrib = {sub: _delta_prev(s, period) for sub, s in sub_choices.items()}
     sub_best = max(sub_contrib, key=lambda k: abs(sub_contrib[k]) if not pd.isna(sub_contrib[k]) else -1) if sub_contrib else None
     out['Subsector'] = sub_best[1] if sub_best else None
     out['Subsector_delta'] = sub_contrib.get(sub_best, np.nan) if sub_best else np.nan
 
-    # institution within chosen subsector (strict filter if available)
-    inst_contrib = {}
+    # Institution (top absolute Δ within chosen subsector if available, else global)
     if sub_best:
         chosen_sec, chosen_sub = sub_best
-        # Filter institutions by that subsector via a reverse map is faster, but we’ll select by max overall for simplicity
-        inst_contrib = {inst: _delta_prev(s, period) for inst, s in agg['Institution'].items()}
+        inst_contrib = {}
+        for inst, s in agg['Institution'].items():
+            # In a stricter version, filter institutions by subsector via a lookup map; here we pick global top Δ for simplicity.
+            inst_contrib[inst] = _delta_prev(s, period)
     else:
         inst_contrib = {inst: _delta_prev(s, period) for inst, s in agg['Institution'].items()}
 
@@ -325,29 +367,19 @@ def attribute_path(period, agg):
     out['Institution_delta'] = inst_contrib.get(inst_best, np.nan) if inst_best else np.nan
     return out
 
-# =========================
-# Sidebar (global)
-# =========================
+# ---------- Sidebar ----------
 st.sidebar.title("Controls")
 current_year = st.sidebar.selectbox("Current Year", [2026, 2025, 2024, 2023], index=1)
 comparison_year = st.sidebar.selectbox("Comparison Year", [2025, 2024, 2023, None], index=0)
 dataset = st.sidebar.selectbox("Dataset", list(SHEET_MAP.keys()))
 time_view = st.sidebar.radio("Timeframe", ['Monthly','Quarterly'], horizontal=True)
 st.sidebar.markdown("---")
-abs_thresh = st.sidebar.slider("Absolute Change floor", 10, 1000, 50, 10)
+abs_floor = st.sidebar.slider("Absolute Change floor", 10, 1000, 50, 10)
 iqr_k = st.sidebar.slider("IQR Sensitivity (k)", 1.0, 3.0, 1.5, 0.1)
 yoy_pct = st.sidebar.slider("YoY % Threshold", 0, 100, 30, 5, format="%d%%")
-yoy_thresh = yoy_pct/100.0
-roll_w = st.sidebar.slider("Rolling Window (months)", 3, 12, DEFAULT_ROLL_WIN, 1)
-roll_ksig = st.sidebar.slider("Rolling Sigma k", 2.0, 3.5, DEFAULT_ROLL_KSIG, 0.1)
-roll_rel = st.sidebar.slider("Rolling Relative Band (%)", 10, 60, int(DEFAULT_ROLL_REL*100), 5, format="%d%%")/100.0
-st.sidebar.markdown("---")
-multi_year = st.sidebar.checkbox("Multi-year timeline (monthly view)", value=False)
-start_year = st.sidebar.selectbox("Start Year", [2021, 2022, 2023, 2024, 2025, 2026], index=0, disabled=not multi_year)
+yoy_thresh = yoy_pct / 100.0
 
-# =========================
-# Load current/prior
-# =========================
+# ---------- Load data ----------
 sheet_name = SHEET_MAP[dataset]
 df_current = load_data(current_year, sheet_name)
 df_prior = load_data(comparison_year, sheet_name) if comparison_year else None
@@ -382,24 +414,6 @@ if time_view == 'Monthly':
     series_prior = None
     if row_prior is not None and not row_prior.empty and all(m in row_prior.columns for m in months_to_analyze):
         series_prior = pd.to_numeric(row_prior[months_to_analyze].iloc[0], errors='coerce').astype(float)
-
-    # Multi-year option for exploration plot
-    if multi_year and isinstance(start_year, int) and start_year <= current_year:
-        vals, idx = [], []
-        for yr in range(start_year, current_year+1):
-            dfy = load_data(yr, sheet_name)
-            if isinstance(dfy, str): continue
-            ry = _row_filter(dfy, entity, worker_cat, subquestion)
-            if ry.empty: continue
-            qy = get_reporting_quarter(yr)
-            my = [m for m in ALL_MONTHS[:qy*3] if m in ry.columns]
-            if not my: continue
-            sy = pd.to_numeric(ry[my].iloc[0], errors='coerce').astype(float)
-            vals.extend(list(sy.values))
-            idx.extend([f"{yr}-{m}" for m in my])
-        if idx:
-            series_cur = pd.Series(vals, index=idx, dtype=float)
-            series_prior = None
 else:
     series_cur = build_quarter_series(row_cur, current_year, rq)
     series_prior = None
@@ -407,9 +421,7 @@ else:
         rq_prior = get_reporting_quarter(comparison_year)
         series_prior = build_quarter_series(row_prior, comparison_year, rq_prior)
 
-# =========================
-# Header KPIs
-# =========================
+# ---------- KPI Header ----------
 st.markdown("### QC Intelligence Console")
 colA, colB, colC, colD = st.columns(4)
 with colA: st.markdown(f"<div class='kpi-card'><div class='subtle'>Current Year</div><h3>{current_year}</h3></div>", unsafe_allow_html=True)
@@ -419,53 +431,49 @@ with colD:
     latest_val = series_cur.iloc[-1] if not series_cur.empty else np.nan
     st.markdown(f"<div class='kpi-card'><div class='subtle'>Latest Value</div><h3>{latest_val:,.0f}</h3></div>", unsafe_allow_html=True)
 
-# =========================
-# Tabs
-# =========================
+# ---------- Tabs ----------
 tab1, tab2, tab3, tab4 = st.tabs(["🔎 Explore", "🚨 Anomalies", "🧭 Attribution", "🧾 Report"])
 
-# ---- Explore
+# Explore
 with tab1:
     if series_cur.empty or series_cur.isnull().all():
         st.warning("No data for selected filters/period.")
     else:
         title = f"{'Monthly' if time_view=='Monthly' else 'Quarterly'} Trend — {entity} | {worker_cat}"
-        plot_series(series_cur, series_prior, title)
+        plot_series(series_cur, series_prior, title, show_mom_band=True, show_rolling=True)
 
-# ---- Anomalies (Composite)
+# Anomalies
 with tab2:
     if series_cur.empty or series_cur.isnull().all():
-        st.info("Load a series in Explore first.")
+        st.info("No data to analyze.")
     else:
-        scores = score_pillars(
+        # MoM threshold fixed at 25% (as in your original logic)
+        alerts_df = score_pillars(
             series_cur, series_prior,
-            mom_pct_thresh=0.25, mom_abs_thresh=abs_thresh,
-            yoy_pct_thresh=yoy_thresh, iqr_k=iqr_k,
-            roll_w=roll_w, roll_ksig=roll_ksig, roll_rel=roll_rel
+            mom_pct_thresh=0.25, mom_abs_floor=abs_floor,
+            yoy_pct_thresh=yoy_thresh, iqr_k=iqr_k, view=time_view
         )
-        comp = compose_score(scores, time_view)
-        show = comp.copy()
-        show['Reasons'] = show['Reasons'].apply(lambda L: ", ".join(L))
-        show = show.sort_values('Composite', ascending=False)
-        st.markdown("**Composite anomaly table**")
+
+        # Show a clean alerts table
+        show = alerts_df.copy()
+        show['Alerts'] = show['Alerts'].apply(lambda L: ", ".join(sorted(set(L))))
+        show = show[['Value','RollingMean','Alerts','Label']]
+        st.markdown("**Alerts (sorted by severity):**")
         st.dataframe(
-            show.style.format({
-                'Composite':'{:.2f}', 'MoM_score':'{:.1f}', 'YoY_score':'{:.1f}',
-                'IQR_score':'{:.1f}', 'ROLL_score':'{:.1f}'
-            }),
+            show.style.format({'Value':'{:,.0f}','RollingMean':'{:,.0f}'}),
             use_container_width=True
         )
-        csv = show.reset_index().to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Download anomalies (CSV)", csv, "anomalies.csv", "text/csv", use_container_width=True)
 
-# ---- Attribution
+        # Mark points on the chart (optional): list of flagged periods (label not empty)
+        flagged_periods = alerts_df.index[alerts_df['Label'] == "True Outlier"].tolist()
+
+# Attribution (only for True Outliers)
 with tab3:
-    st.markdown("Identify **who** is driving a spike at the aggregate.")
     hmap, herr = load_hierarchy_map()
     if herr:
         st.info(herr)
     else:
-        # Build a consistent slice of the current sheet across institutions for same Subquestion/Worker category
+        # Build a slice of the current sheet for the same subquestion/worker-cat across all institutions
         slice_df = df_current.copy()
         if 'Subquestion' in slice_df.columns:
             slice_df = slice_df[slice_df['Subquestion'] == subquestion]
@@ -474,63 +482,109 @@ with tab3:
         if time_view == 'Monthly':
             if not months_to_analyze:
                 st.warning("No months available.")
+            elif series_cur.empty:
+                st.warning("Load a series in Explore first.")
             else:
-                agg_df = aggregate_monthly(slice_df, months_to_analyze)
-                agg = build_level_series(agg_df, months_to_analyze, hmap)
-                period_pick = st.selectbox("Pick a period to explain", months_to_analyze)
-        else:
-            # Build quarterly per row then widen
+                # Find True Outliers in the current entity series
+                alerts_df = score_pillars(
+                    series_cur, series_prior,
+                    mom_pct_thresh=0.25, mom_abs_floor=abs_floor,
+                    yoy_pct_thresh=yoy_thresh, iqr_k=iqr_k, view=time_view
+                )
+                critical = alerts_df[alerts_df['Label'] == "True Outlier"]
+                if critical.empty:
+                    st.info("No True Outliers under current thresholds — attribution not required.")
+                else:
+                    # Let user pick which critical period to explain
+                    period_pick = st.selectbox("Pick a period (True Outlier) to explain", list(critical.index))
+                    agg_df = aggregate_monthly(slice_df, months_to_analyze)
+                    agg = build_level_series(agg_df, months_to_analyze, hmap)
+
+                    path = attribute_path(period_pick, agg)
+                    if np.isnan(path.get('AllFI_delta', np.nan)):
+                        st.info("Not enough data to compute contributions for the chosen period.")
+                    else:
+                        st.markdown(
+                            f"**Result:** High movement in **All FI** (Δ {path['AllFI_delta']:+,.0f}) "
+                            f"is primarily from **{path['Sector']}** (Δ {path['Sector_delta']:+,.0f}), "
+                            f"specifically **{path.get('Subsector','-')}** — "
+                            f"**{path.get('Institution','-')}** (Δ {path['Institution_delta']:+,.0f}) at **{period_pick}**."
+                        )
+                        # Top contributors table
+                        inst_rows = []
+                        for inst, s in agg['Institution'].items():
+                            d = _delta_prev(s, period_pick)
+                            inst_rows.append((inst, s.get(period_pick, np.nan), d))
+                        top_inst = pd.DataFrame(inst_rows, columns=['Institution','Value','Δ from prev']).dropna()
+                        top_inst['absΔ'] = top_inst['Δ from prev'].abs()
+                        top_inst = top_inst.sort_values('absΔ', ascending=False).drop(columns='absΔ').head(10)
+                        st.dataframe(top_inst, use_container_width=True)
+                        st.download_button("📥 Download top contributions (CSV)",
+                                           top_inst.to_csv(index=False).encode('utf-8'), "attribution.csv",
+                                           "text/csv", use_container_width=True)
+
+        else:  # Quarterly attribution
             periods = list(series_cur.index)
             if not periods:
                 st.warning("No quarters available.")
+            elif series_cur.empty:
+                st.warning("Load a series in Explore first.")
             else:
-                # Create columns for periods and fill from each row’s quarterly series
-                wide = pd.DataFrame(index=slice_df['Entity / Group'].values, columns=periods, dtype=float)
-                for i, r in slice_df.iterrows():
-                    s = build_quarter_series(pd.DataFrame([r]), current_year, rq)
-                    for p in periods:
-                        wide.loc[r['Entity / Group'], p] = s.get(p, np.nan)
-                # Merge back with slice_df to reuse the same aggregator
-                tmp = slice_df[['Entity / Group']].drop_duplicates().copy()
-                for p in periods: tmp[p] = wide[p].values
-                tmp['Worker Category'] = worker_cat
-                if 'Subquestion' in slice_df.columns:
-                    tmp['Subquestion'] = subquestion
-                agg = build_level_series(tmp, periods, hmap)
-                period_pick = st.selectbox("Pick a period to explain", periods)
-
-        if 'agg' in locals() and period_pick:
-            path = attribute_path(period_pick, agg)
-            if np.isnan(path.get('AllFI_delta', np.nan)):
-                st.info("Not enough data to compute contributions for the chosen period.")
-            else:
-                st.markdown(
-                    f"**Result:** High movement in **All FI** (Δ {path['AllFI_delta']:+,.0f}) "
-                    f"is primarily from **{path['Sector']}** (Δ {path['Sector_delta']:+,.0f}), "
-                    f"specifically **{path.get('Subsector','-')}** "
-                    f"— **{path.get('Institution','-')}** (Δ {path['Institution_delta']:+,.0f}) at **{period_pick}**."
+                alerts_df = score_pillars(
+                    series_cur, series_prior,
+                    mom_pct_thresh=0.25, mom_abs_floor=abs_floor,
+                    yoy_pct_thresh=yoy_thresh, iqr_k=iqr_k, view=time_view
                 )
-                # Top contributors table (institutions by absolute Δ)
-                inst_rows = []
-                for inst, s in agg['Institution'].items():
-                    d = _delta_prev(s, period_pick)
-                    inst_rows.append((inst, s.get(period_pick, np.nan), d))
-                top_inst = pd.DataFrame(inst_rows, columns=['Institution','Value','Δ from prev']).dropna()
-                top_inst['absΔ'] = top_inst['Δ from prev'].abs()
-                top_inst = top_inst.sort_values('absΔ', ascending=False).drop(columns='absΔ').head(10)
-                st.dataframe(top_inst, use_container_width=True)
-                csv2 = top_inst.to_csv(index=False).encode('utf-8')
-                st.download_button("📥 Download top contributions (CSV)", csv2, "attribution.csv", "text/csv", use_container_width=True)
+                critical = alerts_df[alerts_df['Label'] == "True Outlier"]
+                if critical.empty:
+                    st.info("No True Outliers under current thresholds — attribution not required.")
+                else:
+                    period_pick = st.selectbox("Pick a quarter (True Outlier) to explain", list(critical.index))
 
-# ---- Report (batch outliers across questions)
+                    # Build quarterly matrix per institution for selected slice
+                    wide = pd.DataFrame(index=slice_df['Entity / Group'].values, columns=periods, dtype=float)
+                    for i, r in slice_df.iterrows():
+                        s = build_quarter_series(pd.DataFrame([r]), current_year, rq)
+                        for p in periods:
+                            wide.loc[r['Entity / Group'], p] = s.get(p, np.nan)
+                    tmp = slice_df[['Entity / Group']].drop_duplicates().copy()
+                    for p in periods: tmp[p] = wide[p].values
+                    tmp['Worker Category'] = worker_cat
+                    if 'Subquestion' in slice_df.columns:
+                        tmp['Subquestion'] = subquestion
+
+                    agg = build_level_series(tmp, periods, hmap)
+                    path = attribute_path(period_pick, agg)
+                    if np.isnan(path.get('AllFI_delta', np.nan)):
+                        st.info("Not enough data to compute contributions for the chosen quarter.")
+                    else:
+                        st.markdown(
+                            f"**Result:** High movement in **All FI** (Δ {path['AllFI_delta']:+,.0f}) "
+                            f"is primarily from **{path['Sector']}** (Δ {path['Sector_delta']:+,.0f}), "
+                            f"specifically **{path.get('Subsector','-')}** — "
+                            f"**{path.get('Institution','-')}** (Δ {path['Institution_delta']:+,.0f}) at **{period_pick}**."
+                        )
+                        inst_rows = []
+                        for inst, s in agg['Institution'].items():
+                            d = _delta_prev(s, period_pick)
+                            inst_rows.append((inst, s.get(period_pick, np.nan), d))
+                        top_inst = pd.DataFrame(inst_rows, columns=['Institution','Value','Δ from prev']).dropna()
+                        top_inst['absΔ'] = top_inst['Δ from prev'].abs()
+                        top_inst = top_inst.sort_values('absΔ', ascending=False).drop(columns='absΔ').head(10)
+                        st.dataframe(top_inst, use_container_width=True)
+                        st.download_button("📥 Download top contributions (CSV)",
+                                           top_inst.to_csv(index=False).encode('utf-8'), "attribution.csv",
+                                           "text/csv", use_container_width=True)
+
+# Report (batch monthly scan)
 with tab4:
-    st.markdown("Scan selected datasets and export a master report of potential outliers.")
+    st.markdown("Scan selected datasets (monthly) and export a master outlier report.")
     pick = st.multiselect("Datasets to scan", list(SHEET_MAP.keys()), default=list(SHEET_MAP.keys()))
     if st.button("🚀 Run scan", use_container_width=True):
         master = []
         progress = st.progress(0, text="Scanning...")
         for i, q in enumerate(pick):
-            progress.progress(i/len(pick), text=f"Scanning: {q}")
+            progress.progress(i/max(1,len(pick)), text=f"Scanning: {q}")
             dfc = load_data(current_year, SHEET_MAP[q])
             dfp = load_data(comparison_year, SHEET_MAP[q]) if comparison_year else None
             if isinstance(dfc, str): continue
@@ -540,30 +594,28 @@ with tab4:
                 ent = r['Entity / Group']
                 wc = r['Worker Category']
                 subq = r['Subquestion'] if 'Subquestion' in dfc.columns else 'N/A'
-                ser_cur = pd.to_numeric(pd.Series(r[months_q]), errors='coerce').astype(float)
-                ser_cur.index = months_q
+                ser_cur = pd.to_numeric(pd.Series(r[months_q]), errors='coerce').astype(float); ser_cur.index = months_q
                 ser_pr = None
                 if isinstance(dfp, pd.DataFrame):
                     rr = dfp[(dfp['Entity / Group']==ent) & (dfp['Worker Category']==wc)]
-                    if 'Subquestion' in dfp.columns:
-                        rr = rr[rr['Subquestion']==subq]
+                    if 'Subquestion' in dfp.columns: rr = rr[rr['Subquestion']==subq]
                     if not rr.empty and all(m in rr.columns for m in months_q):
                         ser_pr = pd.to_numeric(rr[months_q].iloc[0], errors='coerce').astype(float)
-                sc = score_pillars(
+
+                a = score_pillars(
                     ser_cur, ser_pr,
-                    mom_pct_thresh=0.25, mom_abs_thresh=abs_thresh,
-                    yoy_pct_thresh=yoy_thresh, iqr_k=iqr_k,
-                    roll_w=roll_w, roll_ksig=roll_ksig, roll_rel=roll_rel
+                    mom_pct_thresh=0.25, mom_abs_floor=abs_floor,
+                    yoy_pct_thresh=yoy_thresh, iqr_k=iqr_k, view="Monthly"
                 )
-                comp = compose_score(sc, "Monthly")
-                flagged = comp[comp['Label'].isin(["True Outlier","Probable Outlier"])]
+                flagged = a[a['Label'].isin(["True Outlier","Probable Outlier"])]
                 if not flagged.empty:
                     for per, row in flagged.iterrows():
-                        master.append([q, ent, subq, wc, per, float(row['Composite']), row['Label'], ", ".join(row['Reasons'])])
+                        master.append([q, ent, subq, wc, per, row['Label'], ", ".join(sorted(set(row['Alerts']))), float(row['Composite']), float(row['Value'])])
+
         progress.progress(1.0, text="Done")
         if master:
-            out = pd.DataFrame(master, columns=['Question','Entity / Group','Subquestion','Worker Category','Period','Composite','Label','Reasons'])
-            out = out.sort_values(['Composite'], ascending=False)
+            out = pd.DataFrame(master, columns=['Question','Entity / Group','Subquestion','Worker Category','Period','Label','Alerts','_Composite','Value'])
+            out = out.sort_values(['Label','_Composite'], ascending=[True, False]).drop(columns=['_Composite'])
             st.success(f"Found {len(out)} flagged points.")
             st.dataframe(out, use_container_width=True)
             st.download_button("📥 Download master report (CSV)", out.to_csv(index=False).encode('utf-8'),
