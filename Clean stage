@@ -1,20 +1,56 @@
-# --- Worker Category (fix: remove items that are actually Subquestions/TOTALs) ---
-if 'Worker Category' in df_options.columns:
-    wc_raw = [str(x).strip() for x in df_options['Worker Category'].dropna().unique()]
-    subq_set = set([str(x).strip() for x in df_options['Subquestion'].dropna().unique()]) if 'Subquestion' in df_options.columns else set()
+def extract_q4_from_file(path: Path) -> pd.DataFrame:
+    try:
+        wb = load_workbook(str(path), data_only=True, read_only=True)
+    except Exception:
+        return pd.DataFrame()
 
-    def _looks_like_subq_or_total(s: str) -> bool:
-        # e.g. "c(ii) ..." or "TOTAL ..." or "Total ..."
-        return bool(re.match(r"^[A-Za-z]\((?:i|v|x)+\)", s)) or s.upper().startswith("TOTAL ")
+    ent, yr, q = read_cover_meta(wb)
+    if not ent or not yr or not q:
+        try: wb.close()
+        except Exception: pass
+        return pd.DataFrame()
 
-    wc_clean = sorted([w for w in wc_raw if (w not in subq_set and not _looks_like_subq_or_total(w))])
+    months = MONTHS_BY_Q.get(q, [])
+    if len(months) != 3:
+        try: wb.close()
+        except Exception: pass
+        return pd.DataFrame()
 
-    if wc_clean:
-        wc_selected = st.multiselect("Worker Category (leave empty = ALL)", options=wc_clean, default=[])
-        wc_value = wc_selected if wc_selected else "ALL"
-    else:
-        st.caption("Worker Category not applicable / overlaps with Subquestion; using ALL.")
-        wc_value = "ALL"
-else:
-    st.caption("No 'Worker Category' column in this dataset.")
-    wc_value = "ALL"
+    ws = wb[pick_data_sheet(wb)]
+
+    out_rows: List[Dict] = []
+    mcols = ["C", "D", "E"]  # month 1/2/3 are always C/D/E
+
+    # exact subquestion headers and their worker-category rows
+    SUBHEADER_ROWS = [178, 186, 194, 202]
+    for h in SUBHEADER_ROWS:
+        sublabel = ws[f"A{h}"].value
+        sublabel = "" if sublabel is None else str(sublabel).strip()
+        if not sublabel:
+            # if header cell is blank, skip this block safely
+            continue
+
+        # worker categories are A{h+1}..A{h+7}
+        for r in range(h + 1, h + 8):
+            worker = ws[f"A{r}"].value
+            worker_str = "" if worker is None else str(worker).strip()
+            if not worker_str:
+                continue
+
+            row = {
+                "entity_name": ent,
+                "year": yr,
+                "quarter": q,
+                "question": "Q4",
+                "subquestion": sublabel,
+                "worker_category": worker_str,
+                months[0]: read_num(ws, f"{mcols[0]}{r}"),
+                months[1]: read_num(ws, f"{mcols[1]}{r}"),
+                months[2]: read_num(ws, f"{mcols[2]}{r}"),
+            }
+            out_rows.append(row)
+
+    try: wb.close()
+    except Exception: pass
+
+    return pd.DataFrame(out_rows)
