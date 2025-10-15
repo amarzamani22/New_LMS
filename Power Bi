@@ -202,6 +202,103 @@ def generate_full_report(sheet_map, years, questions_to_scan, thresholds, all_mo
     progress_bar.progress(1.0, text="Scan Complete!")
     return pd.DataFrame(master_outlier_list, columns=['Question', 'Entity / Group', 'Subquestion', 'Worker Category', 'View', 'Period', 'Value', 'Reason(s)'])
 
+# =========================
+# NEW HELPERS (ADD-ONLY)
+# =========================
+def _year_range(start_year: int, end_year: int):
+    return [y for y in range(int(start_year), int(end_year) + 1)]
+
+def build_multi_year_monthly_series(entity, worker_cat, subq, selected_question, start_year, end_year, exclusions, all_months, sheet_map):
+    """
+    Returns (series, prior_series_for_yoy) where:
+      - series index is ['YYYY-MMM', ...]
+      - prior_series aligns keys (YYYY-MMM) -> previous year's same month value, if available
+    """
+    vals, idx = [], []
+    for yr in _year_range(start_year, end_year):
+        df_y = load_data(yr, sheet_map[selected_question])
+        if isinstance(df_y, str):
+            continue
+        row_y = _row_filter(df_y, entity, worker_cat, subq)
+        if row_y.empty:
+            continue
+        upto_q_y = get_reporting_quarter(yr)
+        months_y = [m for m in all_months[:upto_q_y * 3] if m in row_y.columns]
+        if not months_y:
+            continue
+        ser_y = pd.to_numeric(row_y[months_y].iloc[0], errors='coerce').astype(float)
+        for m in months_y:
+            label = f"{yr}-{m}"
+            if label in exclusions:
+                continue
+            v = ser_y.get(m, np.nan)
+            vals.append(v)
+            idx.append(label)
+
+    if not idx:
+        return pd.Series(dtype=float), None
+
+    s = pd.Series(vals, index=idx, dtype=float)
+
+    # Build YoY baseline for multi-year monthly timeline
+    prior_vals, prior_idx = [], []
+    for label in s.index:
+        try:
+            yr_str, mon = label.split('-')
+            prev_label = f"{int(yr_str)-1}-{mon}"
+            if prev_label in s.index and not pd.isna(s.loc[prev_label]):
+                prior_vals.append(float(s.loc[prev_label]))
+                prior_idx.append(label)  # align to current label
+        except Exception:
+            continue
+
+    prior = pd.Series(prior_vals, index=prior_idx, dtype=float) if prior_idx else None
+    return s, prior
+
+def build_multi_year_quarterly_series(entity, worker_cat, subq, selected_question, start_year, end_year, exclusions, sheet_map):
+    """
+    Returns (series, prior_series_for_yoy) where:
+      - series index is ['Qx YYYY', ...]
+      - prior_series aligns keys (Qx YYYY) -> (Qx YYYY-1) value, if available
+    """
+    parts = []
+    for yr in _year_range(start_year, end_year):
+        df_y = load_data(yr, sheet_map[selected_question])
+        if isinstance(df_y, str):
+            continue
+        row_y = _row_filter(df_y, entity, worker_cat, subq)
+        if row_y.empty:
+            continue
+        rq = get_reporting_quarter(yr)
+        s_y = build_quarter_series(row_y, yr, rq)
+        if s_y.empty:
+            continue
+        # apply exclusions like "Q3 2023"
+        keep = [lab for lab in s_y.index if lab not in exclusions]
+        parts.append(s_y.loc[keep] if keep else pd.Series(dtype=float))
+
+    if not parts:
+        return pd.Series(dtype=float), None
+
+    s = pd.concat(parts)
+    # ensure chronological order by year then quarter number
+    order = sorted(s.index, key=lambda lab: (int(lab.split()[1]), int(lab.split()[0][1:])))
+    s = s.loc[order]
+
+    # Build YoY baseline for multi-year quarterly timeline
+    prior_vals, prior_idx = [], []
+    for label in s.index:
+        try:
+            q, yr_str = label.split()
+            prev_label = f"{q} {int(yr_str)-1}"
+            if prev_label in s.index and not pd.isna(s.loc[prev_label]):
+                prior_vals.append(float(s.loc[prev_label]))
+                prior_idx.append(label)
+        except Exception:
+            continue
+
+    prior = pd.Series(prior_vals, index=prior_idx, dtype=float) if prior_idx else None
+    return s, prior
 
 # --- Main Dashboard Interface ---
 st.title("🏦 LMS Analysis Dashboard")
@@ -231,16 +328,38 @@ if analysis_view == 'Interactive Analysis':
     yoy_thresh_pct = st.sidebar.slider("YoY % Threshold", 0, 100, 30, 5, format="%d%%")
     yoy_thresh = yoy_thresh_pct / 100.0
     
-    # Optional multi-year timeline toggle (non-breaking)
+    # =========================
+    # NEW MULTI-YEAR CONTROLS
+    # =========================
     st.sidebar.markdown("---")
-    multi_year = st.sidebar.checkbox("Show multi-year monthly timeline", value=False)
-    start_year = None
-    if multi_year:
-        start_year = st.sidebar.selectbox("Start Year:", [2021, 2022, 2023, 2024, 2025, 2026], index=0)
+    enable_multi = st.sidebar.checkbox("Enable multi-year timeline", value=False)
 
+    start_year = current_year
+    end_year = current_year
+    exclude_months = []
+    exclude_quarters = []
+
+    # Choose dataset first to know columns
     time_view = st.sidebar.radio("Frequency:", ('Monthly', 'Quarterly'), horizontal=True)
     selected_question = st.sidebar.selectbox("Dataset:", options=list(SHEET_MAP.keys()))
-    
+
+    if enable_multi:
+        start_year = st.sidebar.number_input("Start year", min_value=2019, max_value=current_year, value=min(2021, current_year))
+        end_year = st.sidebar.number_input("End year", min_value=int(start_year), max_value=current_year, value=current_year)
+
+        if time_view == 'Monthly':
+            month_opts = []
+            for yr in range(int(start_year), int(end_year) + 1):
+                rq = get_reporting_quarter(yr)
+                month_opts.extend([f"{yr}-{m}" for m in all_months[:rq * 3]])
+            exclude_months = st.sidebar.multiselect("Exclude months (e.g., 2023-Feb):", options=month_opts, default=[])
+        else:
+            qtr_opts = []
+            for yr in range(int(start_year), int(end_year) + 1):
+                rq = get_reporting_quarter(yr)
+                qtr_opts.extend([f"Q{q} {yr}" for q in range(1, rq + 1)])
+            exclude_quarters = st.sidebar.multiselect("Exclude quarters (e.g., Q3 2023):", options=qtr_opts, default=[])
+
     df_current = load_data(current_year, SHEET_MAP[selected_question])
     df_prior = load_data(comparison_year, SHEET_MAP[selected_question]) if comparison_year else None
 
@@ -277,30 +396,19 @@ if analysis_view == 'Interactive Analysis':
 
             title = "Monthly Trend"
 
-            # Optional multi-year plot
-            if multi_year and start_year is not None and isinstance(current_year, int) and start_year <= current_year:
-                combined_vals = []
-                combined_index = []
-                for yr in range(start_year, current_year + 1):
-                    df_y = load_data(yr, SHEET_MAP[selected_question])
-                    if isinstance(df_y, str):
-                        continue
-                    row_y = _row_filter(df_y, entity, worker_cat, subquestion)
-                    if row_y.empty:
-                        continue
-                    upto_q_y = get_reporting_quarter(yr)
-                    months_y = [m for m in all_months[:upto_q_y*3] if m in row_y.columns]
-                    if not months_y:
-                        continue
-                    ser_y = pd.to_numeric(row_y[months_y].iloc[0], errors='coerce').astype(float)
-                    # Build datetime-like labels: "YYYY-MMM"
-                    idx_y = [f"{yr}-{m}" for m in months_y]
-                    combined_vals.extend(list(ser_y.values))
-                    combined_index.extend(idx_y)
-                if combined_index:
-                    # Override current_series to the combined multi-year one for plotting
-                    current_series = pd.Series(combined_vals, index=combined_index, dtype=float)
-                    prior_series = None  # multi-year view compares across years already
+            # ---------- NEW: Optional multi-year plot (range + exclusions + YoY baseline)
+            if enable_multi:
+                current_series, prior_series = build_multi_year_monthly_series(
+                    entity=entity,
+                    worker_cat=worker_cat,
+                    subq=subquestion,
+                    selected_question=selected_question,
+                    start_year=int(start_year),
+                    end_year=int(end_year),
+                    exclusions=set(exclude_months),
+                    all_months=all_months,
+                    sheet_map=SHEET_MAP
+                )
 
         else:  # Quarterly
             # Build quarterly series with quarter-year labels, using Qx_Total or computing from months
@@ -315,6 +423,19 @@ if analysis_view == 'Interactive Analysis':
                     prior_rq = get_reporting_quarter(comparison_year)
                     prior_series = build_quarter_series(prior_row, comparison_year, prior_rq)
 
+            # ---------- NEW: Multi-year quarterly timeline (range + exclusions + YoY baseline)
+            if enable_multi:
+                current_series, prior_series = build_multi_year_quarterly_series(
+                    entity=entity,
+                    worker_cat=worker_cat,
+                    subq=subquestion,
+                    selected_question=selected_question,
+                    start_year=int(start_year),
+                    end_year=int(end_year),
+                    exclusions=set(exclude_quarters),
+                    sheet_map=SHEET_MAP
+                )
+
         if current_series.empty or current_series.isnull().all():
             st.warning("No data found for the selected filters or period.")
         else:
@@ -327,25 +448,25 @@ if analysis_view == 'Interactive Analysis':
             col3.metric("Period High", f"{np.nanmax(current_series):,.0f}")
             col4.metric("True Outliers", len(outlier_df))
             
-           # --- Plotly interactive chart (drop-in replacement for the Matplotlib block) ---
+            # --- Plotly interactive chart (drop-in replacement for the Matplotlib block) ---
             x = list(current_series.index)
             y = current_series.values.astype(float)
 
             fig = go.Figure()
 
-            # Current year line
+            # Current year/multi-year line
             fig.add_trace(go.Scatter(
-                x=x, y=y, mode='lines+markers', name=f'{current_year} Trend',
+                x=x, y=y, mode='lines+markers', name=f'{current_year} Trend' if not enable_multi else 'Multi-year Trend',
                 hovertemplate='Period: %{x}<br>Value: %{y:,.0f}<extra></extra>'
             ))
 
-            # Prior year line (if available)
+            # Prior year/baseline line (if available)
             if prior_series is not None and not prior_series.empty:
                 fig.add_trace(go.Scatter(
                     x=list(prior_series.index),
                     y=prior_series.values.astype(float),
                     mode='lines+markers',
-                    name=f'{comparison_year} Trend',
+                    name='Prior Baseline',
                     line=dict(dash='dash'),
                     hovertemplate='Period: %{x}<br>Value: %{y:,.0f}<extra></extra>'
                 ))
@@ -382,9 +503,9 @@ if analysis_view == 'Interactive Analysis':
 
             fig.update_layout(
                 title=dict(
-                    text=title,
-                    font=dict(size=16),  # reduce font size
-                    x=0.5,  # center title
+                    text=("Monthly Trend" if time_view == "Monthly" else "Quarterly Trend") + (" — Multi-year" if enable_multi else ""),
+                    font=dict(size=16),
+                    x=0.5,
                     xanchor='center'
                 ),
                 hovermode='x unified',
@@ -402,6 +523,13 @@ if analysis_view == 'Interactive Analysis':
             fig.update_xaxes(tickangle=45)
 
             st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True})
+
+            # Context caption for active range/exclusions
+            if enable_multi:
+                if time_view == "Monthly":
+                    st.caption(f"Range: {int(start_year)}–{int(end_year)} (monthly). Excluded: {', '.join(exclude_months) if exclude_months else 'None'}")
+                else:
+                    st.caption(f"Range: {int(start_year)}–{int(end_year)} (quarterly). Excluded: {', '.join(exclude_quarters) if exclude_quarters else 'None'}")
             
             if not outlier_df.empty:
                 st.error("🚨 True Outlier(s) Detected!")
