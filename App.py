@@ -167,41 +167,85 @@ def build_quarter_series(data_row, year, reporting_quarter):
     s = pd.Series(series_vals, index=labels, dtype=float)
     return s
 
-def generate_full_report(sheet_map, years, questions_to_scan, thresholds, all_months):
-    master_outlier_list = []
-    progress_bar = st.progress(0, text="Initializing Scan...")
-    
-    total_scans = len(questions_to_scan)
-    for i, q_name in enumerate(questions_to_scan):
-        sheet_name = sheet_map[q_name]
-        progress_bar.progress(i / total_scans, text=f"Scanning: {q_name}")
-        df_current = load_data(years['current'], sheet_name)
-        df_prior = load_data(years['prior'], sheet_name) if years['prior'] else None
+def generate_full_report(
+   sheet_map,
+   years,
+   questions_to_scan,
+   thresholds,
+   all_months,
+   report_filters=None,
+   quarter_mode="current",          # "current" | "up_to_selected" | "exact_selected"
+   selected_quarter=None            # 1..4 when quarter_mode != "current"
+):
+   def months_for_quarter(q: int):
+       q_map = {1: all_months[0:3], 2: all_months[3:6], 3: all_months[6:9], 4: all_months[9:12]}
+       return q_map.get(int(q), [])
+   # ---- detection window (what we compute on) vs focus window (what we show) ----
+   if quarter_mode == "current":
+       rq = get_reporting_quarter(years['current'])
+       months_to_use  = all_months[: rq * 3]       # detect on Q1..Q(rq) so April sees March
+       focus_months   = months_for_quarter(rq)     # BUT only show Q(rq)
+   elif quarter_mode == "up_to_selected" and selected_quarter:
+       months_to_use  = all_months[: int(selected_quarter) * 3]  # detect on Q1..Qn
+       focus_months   = months_to_use                             # and show all up to Qn
+   elif quarter_mode == "exact_selected" and selected_quarter:
+       months_to_use  = all_months[: int(selected_quarter) * 3]  # detect on Q1..Qn (keeps March for Apr MoM)
+       focus_months   = months_for_quarter(int(selected_quarter)) # but only show Qn
+   else:
+       months_to_use  = all_months
+       focus_months   = all_months
+   focus_set = set(focus_months)
 
-        if isinstance(df_current, str): 
-            continue
-        
-        # Align by months *present* in current sheet
-        actual_months = [m for m in all_months if m in df_current.columns]
-
-        for _, row in df_current.iterrows():
-            entity, wc, subq = row['Entity / Group'], row['Worker Category'], row.get('Subquestion', 'N/A')
-            monthly_series = pd.to_numeric(row[actual_months], errors='coerce').astype(float)
-
-            prior_series = None
-            if not isinstance(df_prior, str) and df_prior is not None:
-                prior_row = _row_filter(df_prior, entity, wc, subq)
-                if not prior_row.empty:
-                    # Use same month set for prior to avoid misalignment
-                    prior_series = pd.to_numeric(prior_row[actual_months].iloc[0], errors='coerce').astype(float)
-            
-            outliers_monthly = find_outliers(monthly_series, prior_series, **thresholds)
-            for _, o_row in outliers_monthly.iterrows():
-                master_outlier_list.append([q_name, entity, subq, wc, 'Monthly', o_row['Period'], o_row['Value'], o_row['Reason(s)']])
-
-    progress_bar.progress(1.0, text="Scan Complete!")
-    return pd.DataFrame(master_outlier_list, columns=['Question', 'Entity / Group', 'Subquestion', 'Worker Category', 'View', 'Period', 'Value', 'Reason(s)'])
-
+   master_outlier_list = []
+   progress_bar = st.progress(0, text="Initializing Scan...")
+   total_scans = max(1, len(questions_to_scan))
+   for i, q_name in enumerate(questions_to_scan):
+       sheet_name = sheet_map[q_name]
+       progress_bar.progress(i / total_scans, text=f"Scanning: {q_name}")
+       df_current = load_data(years['current'], sheet_name)
+       df_prior   = load_data(years['prior'], sheet_name) if years.get('prior') else None
+       if isinstance(df_current, str):   # file error
+           continue
+       # align by months present in sheet + quarter scope
+       actual_months = [m for m in months_to_use if m in df_current.columns]
+       if not actual_months:
+           continue
+       # read filter for this dataset (if any)
+       f_cfg = (report_filters or {}).get(q_name, {"subq": "ALL", "wc": "ALL"})
+       subq_filter = f_cfg.get("subq", "ALL")
+       wc_filter   = f_cfg.get("wc", "ALL")
+       # iterate rows with optional filters
+       for _, row in df_current.iterrows():
+           entity = row['Entity / Group']
+           wc     = row['Worker Category']
+           subq   = row['Subquestion'] if 'Subquestion' in df_current.columns else 'N/A'
+           # apply filter(s) if specified
+           if subq_filter != "ALL" and subq not in subq_filter:
+               continue
+           if wc_filter   != "ALL" and wc   not in wc_filter:
+               continue
+           # current series
+           monthly_series = pd.to_numeric(row[actual_months], errors='coerce').astype(float)
+           # build prior aligned series (same months)
+           prior_series = None
+           if not isinstance(df_prior, str) and df_prior is not None:
+               prior_row = _row_filter(df_prior, entity, wc, subq)
+               if not prior_row.empty:
+                   prior_series = pd.to_numeric(prior_row[actual_months].iloc[0], errors='coerce').astype(float)
+           outliers_monthly = find_outliers(monthly_series, prior_series, **thresholds)
+           for _, o_row in outliers_monthly.iterrows():
+            if o_row['Period'] not in focus_set:
+                continue  # show only the selected quarter/month window
+            master_outlier_list.append([
+                q_name, entity, subq, wc,
+                'Monthly', o_row['Period'], o_row['Value'], o_row['Reason(s)']
+            ])
+       # (Optional) You can later extend here to also write a quarterly view if needed.
+   progress_bar.progress(1.0, text="Scan Complete!")
+   return pd.DataFrame(
+       master_outlier_list,
+       columns=['Question', 'Entity / Group', 'Subquestion', 'Worker Category', 'View', 'Period', 'Value', 'Reason(s)']
+   )
 # =========================
 # NEW HELPERS (ADD-ONLY)
 # =========================
@@ -308,8 +352,8 @@ all_months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oc
 SHEET_MAP = {'Q1A: Employees': 'QC_Q1A_Main', 'Q2A: Salary': 'QC_Q2A_Main', 'Q3: Hours Worked': 'QC_Q3', 'Q4: Vacancies': 'QC_Q4', 'Q5: Separations': 'QC_Q5'}
 
 st.sidebar.title("Analysis Controls")
-current_year = st.sidebar.selectbox("Current Year:", [2026, 2025, 2024, 2023])
-comparison_year = st.sidebar.selectbox("Comparison Year:", [2025, 2024, 2023, None], index=0)
+current_year = st.sidebar.selectbox("Current Year:", [2025, 2024, 2023, 2022, 2021])
+comparison_year = st.sidebar.selectbox("Comparison Year:", [2024, 2023, 2022, 2021, 2020, None], index=0)
 st.sidebar.markdown("---")
 analysis_view = st.sidebar.radio("Select View:", ('Interactive Analysis', 'Full Outlier Report'), label_visibility="collapsed")
 st.sidebar.markdown("---")
@@ -396,7 +440,7 @@ if analysis_view == 'Interactive Analysis':
 
             title = "Monthly Trend"
 
-            # ---------- NEW: Optional multi-year plot (range + exclusions + YoY baseline)
+            # ---------- NEW: Optional multi-year plot (range + exclusions)
             if enable_multi:
                 current_series, prior_series = build_multi_year_monthly_series(
                     entity=entity,
@@ -460,18 +504,8 @@ if analysis_view == 'Interactive Analysis':
                 hovertemplate='Period: %{x}<br>Value: %{y:,.0f}<extra></extra>'
             ))
 
-            # Prior year/baseline line (if available)
-            if prior_series is not None and not prior_series.empty:
-                fig.add_trace(go.Scatter(
-                    x=list(prior_series.index),
-                    y=prior_series.values.astype(float),
-                    mode='lines+markers',
-                    name='Prior Baseline',
-                    line=dict(dash='dash'),
-                    hovertemplate='Period: %{x}<br>Value: %{y:,.0f}<extra></extra>'
-                ))
 
-            # MoM ±25% band (same logic you already use)
+            # MoM ±25% band 
             if len(y) >= 2:
                 upper = [None] + [y[i-1] * 1.25 for i in range(1, len(y))]
                 lower = [None] + [y[i-1] * 0.75 for i in range(1, len(y))]
@@ -488,7 +522,7 @@ if analysis_view == 'Interactive Analysis':
                     hovertemplate='Prev×1.25: %{y:,.0f}<extra></extra>'
                 ))
 
-            # Outlier markers (if any)
+            # Outlier markers 
             if not outlier_df.empty:
                 # match outlier x to current_series
                 o_x = [p for p in outlier_df['Period'] if p in current_series.index]
@@ -537,7 +571,7 @@ if analysis_view == 'Interactive Analysis':
             else:
                 st.success("✅ No significant outliers detected.")
             
-            # --- Raw Data Section (unchanged behavior) ---
+            # --- Raw Data Section ---
             with st.expander("Show Raw Data for Comparison"):
                 st.subheader(f"Data for {current_year}")
                 st.dataframe(data_row)
@@ -555,40 +589,96 @@ if analysis_view == 'Interactive Analysis':
 
 # --- View 2: Full Outlier Report ---
 elif analysis_view == 'Full Outlier Report':
-    st.header("Master Outlier Report Generator")
-    st.write("This tool scans the workbook(s) to find all significant outliers based on the thresholds you set.")
-    
-    st.sidebar.subheader("Report Thresholds")
-    abs_thresh_report = st.sidebar.slider("Absolute Change", 10, 1000, 50, 10)
-    iqr_mult_report = st.sidebar.slider("IQR Sensitivity", 1.0, 3.0, 1.5, 0.1)
-    # IMPROVED: 0–100% slider with 5% step; convert to fraction in thresholds
-    yoy_thresh_report_pct = st.sidebar.slider("YoY % Threshold", 0, 100, 30, 5, format="%d%%")
-    yoy_thresh_report = yoy_thresh_report_pct / 100.0
-    
-    questions_to_scan = st.multiselect("Select datasets to include in the report:", options=list(SHEET_MAP.keys()), default=list(SHEET_MAP.keys()))
-
-    if st.button("🚀 Generate Full Report", use_container_width=True):
-        if not questions_to_scan:
-            st.warning("Please select at least one dataset to scan.")
-        else:
-            with st.spinner("Analyzing workbook(s)... This may take a moment."):
-                report_thresholds = {
-                    'pct_thresh': 0.25,
-                    'abs_thresh': abs_thresh_report,
-                    'iqr_multiplier': iqr_mult_report,
-                    'yoy_thresh': yoy_thresh_report
-                }
-                years = {'current': current_year, 'prior': comparison_year}
-                final_report = generate_full_report(SHEET_MAP, years, questions_to_scan, report_thresholds, all_months)
-            
-            st.success(f"Scan complete! Found **{len(final_report)}** potential outliers.")
-            if not final_report.empty:
-                st.dataframe(final_report, use_container_width=True)
-                csv = final_report.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="📥 Download Report as CSV",
-                    data=csv,
-                    file_name="master_outlier_report.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
+   st.header("Master Outlier Report Generator")
+   st.write("Scan selected workbook(s) with precise scope: dataset(s), subquestion(s), worker category(ies), and quarter window.")
+   # --- thresholds ---
+   st.sidebar.subheader("Report Thresholds")
+   abs_thresh_report = st.sidebar.slider("Absolute Change", 10, 1000, 50, 10)
+   iqr_mult_report = st.sidebar.slider("IQR Sensitivity", 1.0, 3.0, 1.5, 0.1)
+   yoy_thresh_report_pct = st.sidebar.slider("YoY % Threshold", 0, 100, 30, 5, format="%d%%")
+   yoy_thresh_report = yoy_thresh_report_pct / 100.0
+   # --- dataset selection ---
+   questions_to_scan = st.multiselect(
+       "Select datasets to include in the report:",
+       options=list(SHEET_MAP.keys()),
+       default=list(SHEET_MAP.keys())
+   )
+   # --- NEW: quarter scope controls ---
+   st.markdown("### Quarter Scope")
+   quarter_mode = st.radio(
+       "Analyze period",
+       options=["Current reporting quarter", "Up to selected quarter", "Only selected quarter"],
+       index=0,
+       horizontal=False
+   )
+   selected_quarter = None
+   if quarter_mode != "Current reporting quarter":
+       selected_quarter = st.selectbox("Quarter:", options=[1, 2, 3, 4], index=get_reporting_quarter(current_year)-1)
+   # normalize mode string to function arg
+   qmode_arg = "current" if quarter_mode == "Current reporting quarter" else \
+               ("up_to_selected" if quarter_mode == "Up to selected quarter" else "exact_selected")
+   # --- NEW: per-dataset filters (Subquestion, Worker Category) ---
+   st.markdown("### Scope by Question / Worker Category (optional)")
+   report_filters = {}
+   if questions_to_scan:
+       for ds in questions_to_scan:
+           with st.expander(f"Filter: {ds}", expanded=False):
+               # Load the CURRENT year sheet to derive the available options
+               df_options = load_data(current_year, SHEET_MAP[ds])
+               if isinstance(df_options, str):
+                   st.warning(df_options)
+                   report_filters[ds] = {"subq": "ALL", "wc": "ALL"}
+                   continue
+               # Worker Category
+               wc_options = sorted(list(df_options['Worker Category'].dropna().unique()))
+               wc_selected = st.multiselect(
+                   "Worker Category (leave empty = ALL)",
+                   options=wc_options, default=[]
+               )
+               wc_value = wc_selected if wc_selected else "ALL"
+               # Subquestion (only if present)
+               if 'Subquestion' in df_options.columns:
+                   subq_options = sorted(list(df_options['Subquestion'].dropna().unique()))
+                   subq_selected = st.multiselect(
+                       "Subquestion (leave empty = ALL)",
+                       options=subq_options, default=[]
+                   )
+                   subq_value = subq_selected if subq_selected else "ALL"
+               else:
+                   st.caption("No 'Subquestion' column in this dataset. Using N/A.")
+                   subq_value = "ALL"
+               report_filters[ds] = {"subq": subq_value, "wc": wc_value}
+   # --- ACTION ---
+   if st.button("🚀 Generate Full Report", use_container_width=True):
+       if not questions_to_scan:
+           st.warning("Please select at least one dataset to scan.")
+       else:
+           with st.spinner("Analyzing workbook(s)..."):
+               report_thresholds = {
+                   'pct_thresh': 0.25,
+                   'abs_thresh': abs_thresh_report,
+                   'iqr_multiplier': iqr_mult_report,
+                   'yoy_thresh': yoy_thresh_report
+               }
+               years = {'current': current_year, 'prior': comparison_year}
+               final_report = generate_full_report(
+                   sheet_map=SHEET_MAP,
+                   years=years,
+                   questions_to_scan=questions_to_scan,
+                   thresholds=report_thresholds,
+                   all_months=all_months,
+                   report_filters=report_filters,
+                   quarter_mode=qmode_arg,
+                   selected_quarter=selected_quarter
+               )
+           st.success(f"Scan complete! Found **{len(final_report)}** potential outliers.")
+           if not final_report.empty:
+               st.dataframe(final_report, use_container_width=True)
+               csv = final_report.to_csv(index=False).encode('utf-8')
+               st.download_button(
+                   label="📥 Download Report as CSV",
+                   data=csv,
+                   file_name="master_outlier_report.csv",
+                   mime="text/csv",
+                   use_container_width=True
+               )
