@@ -43,7 +43,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 1. Helper Functions (Consolidated from your original App.py) ---
+# --- 1. Helper Functions ---
 
 @st.cache_data
 def load_data(year: int, sheet_name: str):
@@ -72,20 +72,23 @@ def get_reporting_quarter(year: int):
             return int(re.search(r'\d+', q_label).group())
     except Exception:
         pass
-    return 4 # Default to Q4
+    return 4 
 
 def _row_filter(df: pd.DataFrame, entity: str, worker_cat: str, subq: str):
     """Robust row filter that tolerates missing Subquestion col."""
+    # Check if the dataframe is empty or if the entity column is missing
+    if df.empty or ENTITY_COL not in df.columns:
+        return pd.DataFrame()
+        
     cond = (df[ENTITY_COL] == entity) & (df[WC_COL] == worker_cat)
     if SUBQ_COL in df.columns and subq != "N/A":
         cond &= (df[SUBQ_COL] == subq)
     return df[cond]
 
-# --- MODIFIED: build_quarter_series (from your original App.py logic) ---
 def build_quarter_series(data_row, year, reporting_quarter):
     """
     Returns a pd.Series indexed by 'Qx YYYY' using existing Qx_Total if present,
-    otherwise computes from months available. (Simplified for this full code)
+    otherwise computes from months available.
     """
     if data_row.empty:
         return pd.Series(dtype=float)
@@ -115,15 +118,11 @@ def build_quarter_series(data_row, year, reporting_quarter):
     if not labels:
         return pd.Series(dtype=float)
         
-    # Keep order Q1..Qn
     s = pd.Series(series_vals, index=labels, dtype=float)
     order = sorted(s.index, key=lambda lab: (int(lab.split()[1]), int(lab.split()[0][1:])))
     return s.loc[order]
 
 
-# ====================================================================
-# MODIFIED: find_outliers - FIXED THE KEYERROR AND ADDED FLAG DETAIL
-# ====================================================================
 def find_outliers(
     data_series: pd.Series, 
     prior_year_series: pd.Series, 
@@ -138,7 +137,6 @@ def find_outliers(
     """
     outliers = []
     if data_series.isnull().all() or len(data_series) < 2: 
-        # Return an empty DataFrame with expected index if no data to analyze
         return pd.DataFrame(columns=["Value", "Reason(s)", "MoM_Diff", "MoM_Pct"])
 
     q1, q3 = data_series.quantile(0.25), data_series.quantile(0.75)
@@ -181,23 +179,19 @@ def find_outliers(
         
         if reasons:
             outliers.append({
-                "Period": period_name, # Temporary column name
+                "Period": period_name, 
                 "Value": current_value, 
                 "Reason(s)": "; ".join(reasons),
                 "MoM_Diff": abs_change,
                 "MoM_Pct": pct_change
             })
             
-    # FIXED: Check if the list is empty before creating DataFrame to avoid KeyError
     if not outliers:
         return pd.DataFrame(columns=["Value", "Reason(s)", "MoM_Diff", "MoM_Pct"])
 
     return pd.DataFrame(outliers).set_index("Period")
 
 
-# ====================================================================
-# NEW: Data Preparation for Attribution Panel
-# ====================================================================
 def prepare_attribution_data(
     df: pd.DataFrame, 
     period_label: str, 
@@ -207,14 +201,11 @@ def prepare_attribution_data(
     Identifies the correct difference/change columns for the selected period
     and renames them for consistent attribution analysis.
     """
-    # Determine the columns based on the selected period
     if time_view == 'Monthly':
-        # Handles period_label like 'Mar' (from series index) or 'Q1 Mar' (if passed from other source)
         month = period_label.split(' ')[-1] 
         diff_col = f"Diff {month}"
         pct_col = f"MoM {month}"
     else: # Quarterly
-        # Handles period_label like 'Q2 2025' (from series index)
         q_label = period_label.split(' ')[0] 
         diff_col = f"Diff {q_label}"
         pct_col = f"%Diff {q_label}"
@@ -224,7 +215,6 @@ def prepare_attribution_data(
         
     df_out = df[[ENTITY_COL, SUBQ_COL, WC_COL, diff_col, pct_col]].copy()
     
-    # Clean and convert the percentage column 
     df_out[pct_col] = (df_out[pct_col].astype(str).str.replace('%', '', regex=False)
                                      .replace("N/A", np.nan).astype(float) / 100)
     
@@ -293,7 +283,13 @@ def main():
 
         # Get the single time series for the major rollup (Current and Prior)
         data_row = _row_filter(df_full, ROLLUP_KEY, major_worker_cat, major_subquestion)
-        prior_row = _row_filter(df_prior_full, ROLLUP_KEY, major_worker_cat, major_subquestion) if df_prior_full else pd.DataFrame()
+        
+        # --- ERROR FIX: Check if df_prior_full is a valid DataFrame before filtering ---
+        prior_row = pd.DataFrame()
+        if isinstance(df_prior_full, pd.DataFrame) and not df_prior_full.empty:
+            prior_row = _row_filter(df_prior_full, ROLLUP_KEY, major_worker_cat, major_subquestion)
+        # --- END FIX ---
+        
 
         # --- Series Building & Outlier Running ---
         current_series, prior_series = pd.Series(dtype=float), None
@@ -303,6 +299,7 @@ def main():
             current_series = pd.to_numeric(data_row[actual_months].iloc[0], errors='coerce').astype(float)
             current_series.index = actual_months
             if not prior_row.empty:
+                 # Ensure prior series aligns its index for YoY calculation
                  prior_series = pd.to_numeric(prior_row[[m for m in actual_months if m in prior_row.columns]].iloc[0], errors='coerce').astype(float)
                  prior_series.index = current_series.index
                  
@@ -312,7 +309,7 @@ def main():
                 prior_series = build_quarter_series(prior_row, comparison_year, get_reporting_quarter(comparison_year) if comparison_year else 4)
                 # Align prior series index keys (e.g., 'Q1 2024') with current series index keys ('Q1 2025') for YoY
                 prior_series.index = current_series.index.map(lambda x: f"{x.split()[0]} {int(x.split()[1])-1}")
-                prior_series = prior_series.loc[prior_series.index.intersection(current_series.index.map(lambda x: f"{x.split()[0]} {int(x.split()[1])-1}"))] # Keep only matching quarters
+                prior_series = prior_series.loc[prior_series.index.intersection(current_series.index.map(lambda x: f"{x.split()[0]} {int(x.split()[1])-1}"))]
 
         # Run the detection engine
         outlier_df = find_outliers(
@@ -401,12 +398,13 @@ def main():
                 }), use_container_width=True)
                 
                 if not df_entity_contrib.empty:
+                    # Determine the primary driver (top row)
                     driving_entity = df_entity_contrib.iloc[0][ENTITY_COL]
                     st.info(f"**Primary Driver:** {driving_entity} contributed the largest absolute change.")
                     
                     # --- Step B: Sub-Metric and Category Breakdown ---
                     st.subheader("B. Sub-Metric & Worker Category Breakdown for Driving Entity")
-                    st.caption(f"Analyze the specific dimensions that caused the change in **{driving_entity}**.")
+                    st.caption(f"Analyze the specific dimensions that caused the change in **{selected_outlier_period}** for **{driving_entity}**.")
 
                     col_driver, col_breakdown = st.columns([1, 2])
                     
@@ -421,14 +419,14 @@ def main():
 
                     df_breakdown = None
                     if breakdown_dim == WC_COL:
-                        # Filter for the major subquestion, but all worker categories
+                        # Filter for the major subquestion, but all worker categories for the selected entity
                         df_breakdown = full_attribution_df[
                             (full_attribution_df[ENTITY_COL] == selected_driver) &
                             (full_attribution_df[SUBQ_COL] == major_subquestion)
                         ]
                         
                     elif breakdown_dim == SUBQ_COL:
-                        # Filter for the major worker category, but all subquestions
+                        # Filter for the major worker category, but all subquestions for the selected entity
                         df_breakdown = full_attribution_df[
                             (full_attribution_df[ENTITY_COL] == selected_driver) &
                             (full_attribution_df[WC_COL] == major_worker_cat)
