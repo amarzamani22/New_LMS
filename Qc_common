@@ -44,36 +44,111 @@ def months_up_to(qlabel: str) -> List[str]:
 # =========================
 # Entity types & rollups
 # =========================
-# Paste your full mapping here. Unknowns will be labeled "Unknown".
-ENTITY_TO_TYPE: Dict[str, str] = {
-    # "AFFIN BANK BERHAD": "Commercial Banks",
-    # ...
-}
-
-# Rollup label -> list of entity_type buckets to include
 ROLLUPS: Dict[str, List[str]] = {
-    # "All Financial Institutions": ["Commercial Banks","Investment Banks",...],
-    # "Banking Institutions": ["Commercial Banks","Investment Banks","Islamic Banks","Digital Banks","International Islamic Banks","Foreign Banks"],
-    # "DFI": ["DFI"],
-    # "Insurers": ["Insurers"],
-    # "Takaful Operators": ["Takaful Operators"],
-    # ...
-}
+    "All Financial Institutions": [
+        "Commercial Banks", "Investment Banks", "Islamic Banks", "DFI",
+        "Insurers", "Takaful Operators", "Foreign Banks",
+        "International Islamic Banks", "Digital Banks"
+    ],
+    "Banking Institutions": [
+        "Commercial Banks", "Investment Banks", "Islamic Banks",
+        "Digital Banks", "Foreign Banks"
+    ],
+    "Development Financial Institution": ["DFI"],
 
-# Order for rollups in the output (rollups first in this order, then individual FIs A→Z)
-ROLLUP_ORDER: List[str] = [
-    "All Financial Institutions",
-    "Banking Institutions",
-    "Commercial Banks",
-    "Investment Banks",
-    "Islamic Banks",
-    "Foreign Banks",
-    "Digital Banks",
-    "International Islamic Banks",
-    "DFI",
-    "Insurers",
-    "Takaful Operators",
+    "Insurans/Takaful": ["Insurers", "Takaful Operators"],
+
+    "Commercial Banks": ["Commercial Banks", "Foreign Banks"],
+    "Investment Banks": ["Investment Banks"],
+    "Islamic Banks": ["Islamic Banks"],
+    "Digital Banks": ["Digital Banks"],
+    "International Islamic Banks": ["International Islamic Banks"],
+    "Foreign Banks": ["Foreign Banks"],
+    "DFI": ["DFI"],
+    "Insurers": ["Insurers"],
+    "Takaful Operators": ["Takaful Operators"],
+}
+ROLLUP_ORDER = [
+    "All Financial Institutions","Banking Institutions","Commercial Banks","Investment Banks",
+    "Islamic Banks","Foreign Banks","Digital Banks","International Islamic Banks","DFI","Insurers","Takaful Operators",
 ]
+
+# =============== Embedded FI → Type mapping (from your list) ===============
+ENTITY_TO_TYPE: Dict[str, str] = {
+    # (Banks/DFIs/Foreign/Islamic/Digital/IIB)
+    "AFFIN BANK BERHAD":"Commercial Banks","AFFIN HWANG INVESTMENT BANK BERHAD":"Investment Banks",
+    "AFFIN ISLAMIC BANK BERHAD":"Islamic Banks","AGROBANK (BANK PERTANIAN MALAYSIA BERHAD)":"DFI",
+    "AL RAJHI BANKING & INVESTMENT CORPORATION (MALAYSIA) BHD":"Islamic Banks",
+    "ALKHAIR INTERNATIONAL ISLAMIC BANK BHD":"International Islamic Banks",
+    "ALLIANCE BANK MALAYSIA BERHAD":"Commercial Banks","ALLIANCE INVESTMENT BANK BERHAD":"Investment Banks",
+    "ALLIANCE ISLAMIC BANK BERHAD":"Islamic Banks","AMBANK (M) BERHAD":"Commercial Banks",
+    "AMBANK ISLAMIC BERHAD":"Islamic Banks","AMINVESTMENT BANK BERHAD":"Investment Banks",
+    "MBSB BANK BERHAD":"Islamic Banks","BANGKOK BANK BERHAD":"Foreign Banks",
+    "BANK ISLAM MALAYSIA BERHAD":"Islamic Banks","BANK KERJASAMA RAKYAT MALAYSIA BERHAD":"Islamic Banks",
+    "BANK MUAMALAT MALAYSIA BERHAD":"Islamic Banks","BANK OF AMERICA MALAYSIA BERHAD":"Foreign Banks",
+    "BANK OF CHINA (MALAYSIA) BERHAD":"Foreign Banks","BANK OF TOKYO-MITSUBISHI UFJ (MALAYSIA) BERHAD":"Foreign Banks",
+    "BANK PEMBANGUNAN MALAYSIA BERHAD":"DFI","BANK SIMPANAN NASIONAL":"DFI",
+    "BNP PARIBAS MALAYSIA BERHAD":"Foreign Banks","CHINA CONSTRUCTION BANK MALAYSIA BERHAD":"Foreign Banks",
+    "CIMB BANK BERHAD":"Commercial Banks","CIMB INVESTMENT BANK BERHAD":"Investment Banks",
+    "CIMB ISLAMIC BANK BERHAD":"Islamic Banks","CITIBANK BERHAD":"Foreign Banks",
+    "DEUTSCHE BANK (MALAYSIA) BERHAD":"Foreign Banks",
+    "DEUTSCHE BANK AG, INTERNATIONAL ISLAMIC BANKING, MALAYSIA BRANCH":"International Islamic Banks",
+    "EXPORT-IMPORT BANK OF MALAYSIA BERHAD":"DFI","HONG LEONG BANK BERHAD":"Commercial Banks",
+    "HONG LEONG INVESTMENT BANK BERHAD":"Investment Banks","HONG LEONG ISLAMIC BANK BERHAD":"Islamic Banks",
+    "HSBC AMANAH MALAYSIA BERHAD":"Islamic Banks","HSBC BANK MALAYSIA BERHAD":"Commercial Banks",
+    "IBDAR BANK BSC":"International Islamic Banks","INDIA INTERNATIONAL BANK (MALAYSIA) BERHAD":"Foreign Banks",
+    "INDUSTRIAL AND COMMERCIAL BANK OF CHINA (MALAYSIA) BERHAD":"Foreign Banks",
+    "J.P MORGAN CHASE BANK BERHAD":"Foreign Banks","KAF INVESTMENT BANK BERHAD":"Investment Banks",
+    "KENANGA INVESTMENT BANK BERHAD":"Investment Banks","KUWAIT FINANCE HOUSE (MALAYSIA) BERHAD":"Islamic Banks",
+    "MALAYAN BANKING BERHAD":"Commercial Banks","MAYBANK INVESTMENT BANK BERHAD":"Investment Banks",
+    "MAYBANK ISLAMIC BERHAD":"Islamic Banks","MIDF AMANAH INVESTMENT BANK BERHAD":"Investment Banks",
+    "MIZUHO CORPORATE BANK (MALAYSIA) BERHAD":"Foreign Banks",
+    "NATIONAL BANK OF ABU DHABI MALAYSIA BERHAD":"Foreign Banks",
+    "OCBC AL-AMIN BANK BERHAD":"Islamic Banks","OCBC BANK (MALAYSIA) BERHAD":"Commercial Banks",
+    "PT. BANK SYARIAH MUALAMAT INDONESIA, TBK":"International Islamic Banks",
+    "PUBLIC BANK BERHAD":"Commercial Banks","PUBLIC INVESTMENT BANK BERHAD":"Investment Banks",
+    "PUBLIC ISLAMIC BANK BERHAD":"Islamic Banks","RHB BANK BERHAD":"Commercial Banks",
+    "RHB INVESTMENT BANK BERHAD":"Investment Banks","RHB ISLAMIC BANK BERHAD":"Islamic Banks",
+    "SMALL MEDIUM ENTERPRISE DEVELOPMENT BANK MALAYSIA BERHAD":"DFI",
+    "STANDARD CHARTERED BANK MALAYSIA BERHAD":"Commercial Banks","STANDARD CHARTERED SAADIQ BERHAD":"Islamic Banks",
+    "SUMITOMO MITSUI BANKING CORPORATION MALAYSIA BERHAD":"Foreign Banks",
+    "THE BANK OF NOVA SCOTIA BERHAD":"Foreign Banks","THE ROYAL BANK OF SCOTLAND BERHAD":"Foreign Banks",
+    "UNITED OVERSEAS BANK (MALAYSIA) BHD.":"Commercial Banks",
+    "BOOST BANK BERHAD":"Digital Banks","AEON BANK (M) BERHAD":"Digital Banks","KAF DIGITAL BERHAD":"Digital Banks",
+    "YTL DIGITAL BANK BERHAD":"Digital Banks","GX BANK BERHAD":"Digital Banks",
+    # Insurers & Takaful (inc. reinsurers)
+    "ACR RETAKAFUL BERHAD":"Takaful Operators","AIA BHD.":"Insurers","AIA GENERAL BERHAD":"Insurers",
+    "AIA PUBLIC TAKAFUL BHD.":"Takaful Operators","AIG MALAYSIA INSURANCE BERHAD":"Insurers",
+    "ALLIANZ GENERAL INSURANCE COMPANY (MALAYSIA) BERHAD":"Insurers",
+    "ALLIANZ LIFE INSURANCE MALAYSIA BERHAD":"Insurers","AMBRA VERSICHERUNG AG":"Insurers",
+    "AMMETLIFE INSURANCE BERHAD":"Insurers","AMMETLIFE TAKAFUL BERHAD":"Takaful Operators",
+    "ASIA CAPITAL REINSURANCE MALAYSIA SDN. BHD.":"Insurers","BERJAYA SOMPO INSURANCE BERHAD":"Insurers",
+    "CHUBB INSURANCE MALAYSIA BERHAD":"Insurers","DANAJAMIN NASIONAL BERHAD":"DFI",
+    "ETIQA GENERAL INSURANCE BERHAD":"Insurers","ETIQA LIFE INSURANCE BERHAD":"Insurers",
+    "ETIQA FAMILY TAKAFUL BERHAD":"Takaful Operators","ETIQA GENERAL TAKAFUL BERHAD":"Takaful Operators",
+    "FWD INSURANCE BERHAD":"Insurers","FWD TAKAFUL BERHAD":"Takaful Operators",
+    "GENERALI INSURANCE MALAYSIA BERHAD":"Insurers","GENERALI LIFE INSURANCE MALAYSIA BERHAD":"Insurers",
+    "GREAT EASTERN GENERAL INSURANCE (MALAYSIA) BERHAD":"Insurers",
+    "GREAT EASTERN LIFE ASSURANCE (MALAYSIA) BERHAD":"Insurers","GREAT EASTERN TAKAFUL BERHAD":"Takaful Operators",
+    "HANNOVER RUECKVERSICHERUNG AG, MALAYSIAN BRANCH":"Insurers","HONG LEONG ASSURANCE BERHAD":"Insurers",
+    "HONG LEONG MSIG TAKAFUL BERHAD":"Takaful Operators","LIBERTY GENERAL INSURANCE BERHAD":"Insurers",
+    "LONPAC INSURANCE BHD.":"Insurers","MALAYSIAN LIFE REINSURANCE GROUP BERHAD":"Insurers",
+    "MALAYSIAN REINSURANCE BERHAD":"Insurers","MANULIFE INSURANCE BERHAD":"Insurers",
+    "MCIS INSURANCE BERHAD":"Insurers","MSIG INSURANCE (MALAYSIA) BHD":"Insurers",
+    "MUNCHENER RUCKVERSICHERUNGS-GESELLSCHAFT (Munich Re Retakaful)":"Takaful Operators",
+    "PACIFIC & ORIENT INSURANCE CO. BERHAD":"Insurers","PROGRESSIVE INSURANCE BHD.":"Insurers",
+    "PRUDENTIAL ASSURANCE MALAYSIA BERHAD":"Insurers","PRUDENTIAL BSN TAKAFUL BERHAD":"Takaful Operators",
+    "QBE INSURANCE (MALAYSIA) BERHAD":"Insurers","RHB INSURANCE BERHAD":"Insurers",
+    "SUN LIFE MALAYSIA ASSURANCE BERHAD":"Insurers","SUN LIFE MALAYSIA TAKAFUL BERHAD":"Takaful Operators",
+    "SWISS RE ASIA PTE LTD":"Insurers","SWISS REINSURANCE COMPANY LTD (SWISS RE RETAKAFUL)":"Takaful Operators",
+    "SYARIKAT TAKAFUL MALAYSIA AM BERHAD":"Takaful Operators","SYARIKAT TAKAFUL MALAYSIA KELUARGA BERHAD":"Takaful Operators",
+    "TAKAFUL IKHLAS FAMILY BERHAD":"Takaful Operators","TAKAFUL IKHLAS GENERAL BERHAD":"Takaful Operators",
+    "THE PACIFIC INSURANCE BERHAD":"Insurers","THE TOA REINSURANCE COMPANY LTD.":"Insurers",
+    "TOKIO MARINE INSURANS (MALAYSIA) BERHAD":"Insurers","TOKIO MARINE LIFE INSURANCE MALAYSIA BHD":"Insurers",
+    "TUNE INSURANCE MALAYSIA BERHAD":"Insurers","ZURICH GENERAL INSURANCE MALAYSIA BERHAD":"Insurers",
+    "ZURICH LIFE INSURANCE MALAYSIA BERHAD":"Insurers","ZURICH GENERAL TAKAFUL MALAYSIA BERHAD":"Takaful Operators",
+    "ZURICH TAKAFUL MALAYSIA BERHAD":"Takaful Operators",
+}
 
 def attach_entity_type(df: pd.DataFrame, entity_col: str = "entity_name") -> pd.DataFrame:
     out = df.copy()
@@ -521,28 +596,52 @@ def write_qc_sheet(args: QCArgs) -> None:
                 ws.cell(r, cp).value = f"=IF(AND({a}=0,{b}=0),0,IF({b}=0,\"N/A\",({a}-{b})/{b}))"
 
     # YoY using hidden prior sheet + hidden KEY
+    # --- Build prior qc frame with the same keys/columns (robust for Q3: no subquestion) ---
     prior_qc_df = None
     if args.prior_df is not None and not args.prior_df.empty:
-        p = attach_entity_type(args.prior_df, "entity_name")
-        p_keys = ["subquestion","worker_category"]
-        if jobfunc_mode: p_keys.append("job_function")
+        p = args.prior_df.copy()
+
+        # Ensure optional key columns exist in PRIOR too (Q3 has no subquestion)
+        for c in ["subquestion", "worker_category", "job_function"]:
+            if c not in p.columns:
+                p[c] = ""
+
+        # Ensure numeric columns expected for join exist in PRIOR as well
+        if jobfunc_mode:
+            if "value" not in p.columns:
+                p["value"] = 0.0
+        else:
+            for m in months:
+                if m not in p.columns:
+                    p[m] = 0.0
+
+        # Attach entity type and build rollups on PRIOR just like current
+        p = attach_entity_type(p, "entity_name")
+        p_keys = ["subquestion", "worker_category"]
+        if jobfunc_mode:
+            p_keys.append("job_function")
         p_nums = (["value"] if jobfunc_mode else months)
         p_roll = expand_rollups(p, keys=p_keys, numeric_cols=p_nums)
 
-        p_roll["Entity / Group"] = p_roll["Entity / Group"]
-        p_roll["Subquestion"]    = p_roll["subquestion"]
-        p_roll["Worker Category"]= p_roll["worker_category"]
+        # Map to display keys for prior sheet(s)
+        p_roll["Entity / Group"] = p_roll["Entity / Group"]  # already created by expand_rollups
+        p_roll["Subquestion"]     = p_roll["subquestion"]
+        p_roll["Worker Category"] = p_roll["worker_category"]
+
         if jobfunc_mode:
             p_roll["Job Function"] = p_roll["job_function"]
             p_roll["Q4"] = p_roll["value"]
             prior_qc_df = p_roll[["Entity / Group","Subquestion","Worker Category","Job Function","Q4"]].copy()
         else:
+            # Provide quarterly totals in prior if we’ll do YoY on quarters
             for q in ["Q1","Q2","Q3","Q4"]:
                 need = set(Q_TO_MONTHS[q])
                 if need.issubset(set(p_roll.columns)):
                     p_roll[q] = p_roll[list(need)].sum(axis=1)
+
             base_cols = ["Entity / Group","Subquestion","Worker Category"]
-            keep_cols = base_cols + [c for c in ["Q1","Q2","Q3","Q4"] if c in p_roll.columns] + [m for m in months if m in p_roll.columns]
+            keep_cols = base_cols + [c for c in ["Q1","Q2","Q3","Q4"] if c in p_roll.columns] \
+                                   + [m for m in months if m in p_roll.columns]
             prior_qc_df = p_roll[keep_cols].copy()
 
     key_cols_display = ["Entity / Group","Subquestion","Worker Category"]
