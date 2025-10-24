@@ -8,7 +8,6 @@ import plotly.express as px
 from typing import Dict, List, Tuple
 
 # --- Global Configuration ---
-# Match the sheet map from your existing App.py
 SHEET_MAP = {'Q1A: Employees': 'QC_Q1A_Main', 'Q2A: Salary': 'QC_Q2A_Main', 'Q3: Hours Worked': 'QC_Q3', 'Q4: Vacancies': 'QC_Q4', 'Q5: Separations': 'QC_Q5'}
 ALL_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 ROLLUP_KEY = "All Financial Institutions"
@@ -41,14 +40,11 @@ st.markdown("""
         border-radius: 8px;
         font-weight: 600;
     }
-    /* Attribution Table: Make negative numbers red for clarity */
-    .negative-value { color: red; font-weight: bold; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- 1. Helper Functions (Optimized and Consolidated) ---
+# --- 1. Helper Functions (Consolidated from your original App.py) ---
 
-# All cached functions remain critical for performance
 @st.cache_data
 def load_data(year: int, sheet_name: str):
     """Loads data for a specific year and sheet with necessary cleaning."""
@@ -56,7 +52,6 @@ def load_data(year: int, sheet_name: str):
     if not os.path.exists(file_path):
         return f"Error: File not found. Please ensure '{file_path}' exists in a 'submission' subfolder."
     try:
-        # Load data, header=5 (row 6) aligns with the generated QC workbook
         df = pd.read_excel(file_path, sheet_name=sheet_name, header=5)
         df.dropna(axis=1, how='all', inplace=True)
         rename_map = {'Q1.1': 'Q1_Total', 'Q2.1': 'Q2_Total', 'Q3.1': 'Q3_Total', 'Q4.1': 'Q4_Total'}
@@ -73,7 +68,6 @@ def get_reporting_quarter(year: int):
         about_df = pd.read_excel(file_path, sheet_name="_About", header=None)
         quarter_row = about_df[about_df[0] == 'Quarter']
         if not quarter_row.empty:
-            # Assuming format 'Q<digit>' e.g., Q4
             q_label = str(quarter_row.iloc[0, 1]).strip().upper()
             return int(re.search(r'\d+', q_label).group())
     except Exception:
@@ -87,13 +81,48 @@ def _row_filter(df: pd.DataFrame, entity: str, worker_cat: str, subq: str):
         cond &= (df[SUBQ_COL] == subq)
     return df[cond]
 
-def _get_change_columns(df: pd.DataFrame) -> List[str]:
-    """Returns a list of all MoM, QoQ, and YoY percentage change column names."""
-    pct_cols = [col for col in df.columns if re.match(r'(MoM|%Diff|YoY)\s', col)]
-    return sorted(pct_cols)
+# --- MODIFIED: build_quarter_series (from your original App.py logic) ---
+def build_quarter_series(data_row, year, reporting_quarter):
+    """
+    Returns a pd.Series indexed by 'Qx YYYY' using existing Qx_Total if present,
+    otherwise computes from months available. (Simplified for this full code)
+    """
+    if data_row.empty:
+        return pd.Series(dtype=float)
+
+    months_order = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+    q_to_months = {1: months_order[0:3], 2: months_order[3:6], 3: months_order[6:9], 4: months_order[9:12]}
+    series_vals, labels = [], []
+
+    for q in range(1, reporting_quarter + 1):
+        col = f'Q{q}_Total'
+        q_label = f"Q{q} {year}"
+        
+        # 1. Prefer explicit totals
+        if col in data_row.columns and not pd.isna(data_row.iloc[0][col]):
+            series_vals.append(float(pd.to_numeric(data_row.iloc[0][col], errors='coerce')))
+            labels.append(q_label)
+            continue
+            
+        # 2. Compute from months if total is missing
+        mlist = [m for m in q_to_months[q] if m in data_row.columns]
+        if mlist:
+            vals = pd.to_numeric(data_row.iloc[0][mlist], errors='coerce').astype(float)
+            if not np.all(np.isnan(vals)):
+                series_vals.append(float(np.nansum(vals)))
+                labels.append(q_label)
+
+    if not labels:
+        return pd.Series(dtype=float)
+        
+    # Keep order Q1..Qn
+    s = pd.Series(series_vals, index=labels, dtype=float)
+    order = sorted(s.index, key=lambda lab: (int(lab.split()[1]), int(lab.split()[0][1:])))
+    return s.loc[order]
+
 
 # ====================================================================
-# MODIFIED: find_outliers - Now returns a DataFrame of detected outliers
+# MODIFIED: find_outliers - FIXED THE KEYERROR AND ADDED FLAG DETAIL
 # ====================================================================
 def find_outliers(
     data_series: pd.Series, 
@@ -109,7 +138,8 @@ def find_outliers(
     """
     outliers = []
     if data_series.isnull().all() or len(data_series) < 2: 
-        return pd.DataFrame()
+        # Return an empty DataFrame with expected index if no data to analyze
+        return pd.DataFrame(columns=["Value", "Reason(s)", "MoM_Diff", "MoM_Pct"])
 
     q1, q3 = data_series.quantile(0.25), data_series.quantile(0.75)
     iqr = q3 - q1 if len(data_series) >= 4 else 0
@@ -118,6 +148,8 @@ def find_outliers(
     for i, (period_name, current_value) in enumerate(data_series.items()):
         reasons = []
         if pd.isna(current_value): continue
+        
+        abs_change, pct_change = np.nan, np.nan
         
         # --- 1. MoM Volatility + Absolute Cutoff ---
         if i > 0:
@@ -139,9 +171,9 @@ def find_outliers(
         if iqr > 0 and (current_value < iqr_lower or current_value > iqr_upper): 
             reasons.append("IQR Anomaly")
         
-        # --- 3. YoY Anomaly ---
+        # --- 3. YoY Anomaly (Simplified to use prior_year_series index) ---
         if prior_year_series is not None and period_name in prior_year_series.index:
-            prior_value = prior_year_series[period_name]
+            prior_value = prior_year_series.get(period_name)
             if not pd.isna(prior_value) and prior_value != 0:
                 yoy_change = (current_value - prior_value) / prior_value
                 if abs(yoy_change) > yoy_pct_thresh: 
@@ -149,43 +181,52 @@ def find_outliers(
         
         if reasons:
             outliers.append({
-                "Period": period_name, 
+                "Period": period_name, # Temporary column name
                 "Value": current_value, 
                 "Reason(s)": "; ".join(reasons),
-                "MoM_Diff": abs_change if 'abs_change' in locals() else np.nan,
-                "MoM_Pct": pct_change if 'pct_change' in locals() else np.nan
+                "MoM_Diff": abs_change,
+                "MoM_Pct": pct_change
             })
             
+    # FIXED: Check if the list is empty before creating DataFrame to avoid KeyError
+    if not outliers:
+        return pd.DataFrame(columns=["Value", "Reason(s)", "MoM_Diff", "MoM_Pct"])
+
     return pd.DataFrame(outliers).set_index("Period")
 
 
-# --- 2. Data Preparation for Attribution ---
+# ====================================================================
+# NEW: Data Preparation for Attribution Panel
+# ====================================================================
 def prepare_attribution_data(
     df: pd.DataFrame, 
     period_label: str, 
     time_view: str
 ) -> pd.DataFrame:
     """
-    Calculates the actual change/difference column based on the selected period
-    and returns a DataFrame ready for contribution analysis.
+    Identifies the correct difference/change columns for the selected period
+    and renames them for consistent attribution analysis.
     """
+    # Determine the columns based on the selected period
     if time_view == 'Monthly':
-        month = period_label.split(' ')[-1] # e.g., "Mar" from "Q1 Mar"
+        # Handles period_label like 'Mar' (from series index) or 'Q1 Mar' (if passed from other source)
+        month = period_label.split(' ')[-1] 
         diff_col = f"Diff {month}"
         pct_col = f"MoM {month}"
     else: # Quarterly
-        q_label = period_label.split(' ')[-1] # e.g., "Q2" from "Q2 2025"
+        # Handles period_label like 'Q2 2025' (from series index)
+        q_label = period_label.split(' ')[0] 
         diff_col = f"Diff {q_label}"
         pct_col = f"%Diff {q_label}"
 
     if diff_col not in df.columns:
-        # Data needed for attribution is not in the sheet. Cannot proceed.
         return pd.DataFrame()
         
     df_out = df[[ENTITY_COL, SUBQ_COL, WC_COL, diff_col, pct_col]].copy()
     
-    # Clean and convert the percentage column (needed for sorting/visualization)
-    df_out[pct_col] = df_out[pct_col].astype(str).str.replace('%', '', regex=False).replace("N/A", np.nan).astype(float) / 100
+    # Clean and convert the percentage column 
+    df_out[pct_col] = (df_out[pct_col].astype(str).str.replace('%', '', regex=False)
+                                     .replace("N/A", np.nan).astype(float) / 100)
     
     df_out.rename(columns={
         diff_col: "Absolute Change (Contribution)", 
@@ -194,19 +235,15 @@ def prepare_attribution_data(
 
     return df_out.dropna(subset=["Absolute Change (Contribution)"])
 
-# --- (Other helper functions like build_quarter_series, build_multi_year_monthly_series, etc., are assumed to be copied) ---
-
-
 # --- Main Dashboard Interface ---
 def main():
     
     # --- Sidebar Controls ---
     st.sidebar.title("Analysis Controls")
-    current_year = st.sidebar.selectbox("Current Year:", [2025, 2024, 2023, 2022, 2021])
+    current_year = st.sidebar.selectbox("Current Year:", [2025, 2024, 2023, 2022, 2021], index=0)
     comparison_year = st.sidebar.selectbox("Comparison Year:", [2024, 2023, 2022, 2021, 2020, None], index=0)
     st.sidebar.markdown("---")
     
-    # View selection remains the same
     analysis_view = st.sidebar.radio("Select View:", ('Interactive Analysis', 'Full Outlier Report'), label_visibility="collapsed")
     st.sidebar.markdown("---")
 
@@ -214,12 +251,10 @@ def main():
     months_to_analyze = ALL_MONTHS[:reporting_quarter * 3]
     st.sidebar.info(f"Analyzing **{current_year}** data up to **Q{reporting_quarter}**.")
     
-    # --- Interactive Analysis View ---
     if analysis_view == 'Interactive Analysis':
         
-        # --- Thresholds (Moved to Sidebar) ---
+        # --- Thresholds ---
         st.sidebar.subheader("Detection Thresholds")
-        # MoM Threshold used in find_outliers logic (now exposed)
         mom_pct_thresh_pct = st.sidebar.slider("MoM/QoQ % Threshold", 1, 100, 25, 1, format="%d%%") / 100.0 
         yoy_thresh_pct = st.sidebar.slider("YoY % Threshold", 1, 100, 30, 1, format="%d%%") / 100.0
         abs_cutoff = st.sidebar.slider("Absolute Cutoff (for RED flag)", 10, 1000, 50, 10)
@@ -231,6 +266,7 @@ def main():
         time_view = st.sidebar.radio("Frequency:", ('Monthly', 'Quarterly'), horizontal=True)
         st.sidebar.markdown("---")
         
+        # Load full data (includes all entities and rollups)
         df_full = load_data(current_year, SHEET_MAP[selected_question])
         df_prior_full = load_data(comparison_year, SHEET_MAP[selected_question]) if comparison_year else None
         
@@ -238,100 +274,85 @@ def main():
             st.error(df_full)
             return
 
-        # Find all unique categories/subquestions for selection (based on All FIs rollup)
+        # --- 1. Outlier Detection (Major View) ---
+        st.header("1. Outlier Detection (Major View) 📈")
+        st.caption(f"Showing trend for **{ROLLUP_KEY}**")
+
+        # Filters for the "Major View" (Top Aggregates)
         df_rollup = df_full[df_full[ENTITY_COL] == ROLLUP_KEY]
-        
-        # Filter for the "Major View" components
         subquestion_options = df_rollup[SUBQ_COL].unique()
         worker_cat_options = df_rollup[WC_COL].unique()
         
-        st.header("1. Outlier Detection (Major View)")
-        st.caption(f"Showing trend for **{ROLLUP_KEY}**")
-
         col_major_subq, col_major_wc = st.columns(2)
         
-        # The key major view filters (e.g., Q1A's highest aggregates)
-        major_subquestion = col_major_subq.selectbox(
-            f"Select Major Subquestion:", 
-            options=subquestion_options, 
-            index=np.where(subquestion_options == 'Employment = A+B(i)+B(ii)')[0][0] if 'Employment = A+B(i)+B(ii)' in subquestion_options else 0
-        )
-        major_worker_cat = col_major_wc.selectbox(
-            f"Select Major Worker Category:", 
-            options=worker_cat_options, 
-            index=np.where(worker_cat_options == 'Total Employment')[0][0] if 'Total Employment' in worker_cat_options else 0
-        )
+        default_subq_index = np.where(subquestion_options == 'Employment = A+B(i)+B(ii)')[0][0] if 'Employment = A+B(i)+B(ii)' in subquestion_options else 0
+        default_wc_index = np.where(worker_cat_options == 'Total Employment')[0][0] if 'Total Employment' in worker_cat_options else 0
+        
+        major_subquestion = col_major_subq.selectbox(f"Select Major Subquestion:", options=subquestion_options, index=int(default_subq_index))
+        major_worker_cat = col_major_wc.selectbox(f"Select Major Worker Category:", options=worker_cat_options, index=int(default_wc_index))
 
-        # Get the single time series for the major rollup
+        # Get the single time series for the major rollup (Current and Prior)
         data_row = _row_filter(df_full, ROLLUP_KEY, major_worker_cat, major_subquestion)
+        prior_row = _row_filter(df_prior_full, ROLLUP_KEY, major_worker_cat, major_subquestion) if df_prior_full else pd.DataFrame()
 
         # --- Series Building & Outlier Running ---
-        if data_row.empty:
-            st.warning("No data found for the selected major view.")
-            return
-
-        # Simplified for clarity: assume single-year current/prior series for the detection plot
-        current_series, prior_series = None, None
+        current_series, prior_series = pd.Series(dtype=float), None
         
         if time_view == 'Monthly':
             actual_months = [m for m in months_to_analyze if m in data_row.columns]
             current_series = pd.to_numeric(data_row[actual_months].iloc[0], errors='coerce').astype(float)
             current_series.index = actual_months
+            if not prior_row.empty:
+                 prior_series = pd.to_numeric(prior_row[[m for m in actual_months if m in prior_row.columns]].iloc[0], errors='coerce').astype(float)
+                 prior_series.index = current_series.index
+                 
         elif time_view == 'Quarterly':
             current_series = build_quarter_series(data_row, current_year, reporting_quarter)
-            
+            if not prior_row.empty:
+                prior_series = build_quarter_series(prior_row, comparison_year, get_reporting_quarter(comparison_year) if comparison_year else 4)
+                # Align prior series index keys (e.g., 'Q1 2024') with current series index keys ('Q1 2025') for YoY
+                prior_series.index = current_series.index.map(lambda x: f"{x.split()[0]} {int(x.split()[1])-1}")
+                prior_series = prior_series.loc[prior_series.index.intersection(current_series.index.map(lambda x: f"{x.split()[0]} {int(x.split()[1])-1}"))] # Keep only matching quarters
+
         # Run the detection engine
         outlier_df = find_outliers(
             current_series, prior_series, 
             mom_pct_thresh_pct, yoy_thresh_pct, 
             abs_cutoff, iqr_mult
         )
-        
+
         # --- Plotting the Detection Chart ---
         if not current_series.empty and not current_series.isnull().all():
-            
-            # --- Plotly Chart for Detection (Modified to store outliers in session state) ---
             x = list(current_series.index)
             y = current_series.values.astype(float)
-
             fig = go.Figure()
 
             # Current year trend line
-            fig.add_trace(go.Scatter(
-                x=x, y=y, mode='lines+markers', name=f'{current_year} Trend',
-                hovertemplate='Period: %{x}<br>Value: %{y:,.0f}<extra></extra>'
-            ))
+            fig.add_trace(go.Scatter(x=x, y=y, mode='lines+markers', name=f'{current_year} Trend'))
             
-            # MoM ± Threshold band (using the exposed slider value)
+            # MoM ± Threshold band
             if len(y) >= 2:
                 upper = [None] + [y[i-1] * (1 + mom_pct_thresh_pct) for i in range(1, len(y))]
                 lower = [None] + [y[i-1] * (1 - mom_pct_thresh_pct) for i in range(1, len(y))]
+                fig.add_trace(go.Scatter(x=x, y=lower, mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
+                fig.add_trace(go.Scatter(x=x, y=upper, mode='lines', line=dict(width=0), fill='tonexty', name=f'MoM/QoQ Threshold', opacity=0.15))
                 
-                fig.add_trace(go.Scatter(x=x, y=lower, mode='lines', line=dict(width=0), name=f'MoM ±{mom_pct_thresh_pct:.0%} Range', showlegend=False, hoverinfo='skip'))
-                fig.add_trace(go.Scatter(x=x, y=upper, mode='lines', line=dict(width=0), fill='tonexty', name=f'MoM ±{mom_pct_thresh_pct:.0%} Range', opacity=0.15, hoverinfo='skip'))
-                
-            # Outlier markers (color coded by RED/YELLOW)
+            # Outlier markers
             if not outlier_df.empty:
-                st.session_state['outlier_periods'] = outlier_df.index.tolist()
-                
                 o_periods = outlier_df.index
-                o_values = [current_series[p] for p in o_periods]
+                o_values = outlier_df["Value"]
                 o_reasons = outlier_df["Reason(s)"]
-                
-                # Check for "RED" in reasons to determine color
                 colors = ['red' if 'RED' in r else 'orange' for r in o_reasons]
 
                 fig.add_trace(go.Scatter(
-                    x=o_periods, y=o_values, mode='markers', name='Outlier',
+                    x=o_periods, y=o_values, mode='markers', name='Detected Outlier',
                     marker=dict(symbol='x', size=14, color=colors, line=dict(width=2, color='darkred')),
                     hovertemplate='Period: %{x}<br>Value: %{y:,.0f}<br>Reason: %{customdata}<extra></extra>',
                     customdata=o_reasons
                 ))
 
-            fig.update_layout(title=f"Trend for {ROLLUP_KEY} ({selected_question} - {major_worker_cat})",
-                              hovermode='x unified', margin=dict(l=10, r=10, t=70, b=10))
+            fig.update_layout(title=f"Trend for {ROLLUP_KEY}", hovermode='x unified')
             fig.update_xaxes(tickangle=45)
-
             st.plotly_chart(fig, use_container_width=True)
             
         else:
@@ -359,6 +380,7 @@ def main():
             if full_attribution_df.empty:
                 st.error("Could not find the necessary 'Diff' (Difference) column in the data for attribution.")
             else:
+                
                 # --- Step A: Entity/Group Contribution Table ---
                 st.subheader("A. Entity / Group Contribution")
                 st.caption(f"Contribution of **ALL** entities/rollups to the change in **{selected_outlier_period}**")
@@ -369,63 +391,60 @@ def main():
                     (full_attribution_df[WC_COL] == major_worker_cat)
                 ].copy()
                 
+                # Sort by Absolute Change
                 df_entity_contrib = df_entity_contrib.sort_values("Absolute Change (Contribution)", ascending=False).reset_index(drop=True)
                 
-                # Formatting for display
-                df_display = df_entity_contrib.style.format({
+                # Display table and determine driving entity
+                st.dataframe(df_entity_contrib.style.format({
                     "Absolute Change (Contribution)": "{:,.0f}",
                     "Percentage Change": "{:+.1%}"
-                })
-                
-                st.dataframe(df_display, use_container_width=True)
+                }), use_container_width=True)
                 
                 if not df_entity_contrib.empty:
-                    st.success(f"**Primary Driver:** {df_entity_contrib.iloc[0][ENTITY_COL]} contributed the largest absolute change.")
-                    
-                    # Store the top driver for auto-selection in the next step
                     driving_entity = df_entity_contrib.iloc[0][ENTITY_COL]
+                    st.info(f"**Primary Driver:** {driving_entity} contributed the largest absolute change.")
                     
                     # --- Step B: Sub-Metric and Category Breakdown ---
                     st.subheader("B. Sub-Metric & Worker Category Breakdown for Driving Entity")
-                    st.caption(f"Drill-down into the specific Subquestions/Categories that caused the change in **{driving_entity}**.")
+                    st.caption(f"Analyze the specific dimensions that caused the change in **{driving_entity}**.")
 
                     col_driver, col_breakdown = st.columns([1, 2])
                     
+                    # Interactive selection of the entity to break down
                     selected_driver = col_driver.selectbox(
                         "Analyze Contribution Breakdown for:",
                         options=df_entity_contrib[ENTITY_COL].unique(),
                         index=df_entity_contrib[ENTITY_COL].unique().tolist().index(driving_entity)
                     )
                     
-                    breakdown_dim = col_driver.radio("Breakdown Dimension:", options=["Worker Category", "Subquestion"], index=0)
+                    breakdown_dim = col_driver.radio("Breakdown Dimension:", options=[WC_COL, SUBQ_COL], index=0)
 
-                    # Filter B: Match Selected Entity and Period, but include all other dimensions
                     df_breakdown = None
-                    if breakdown_dim == "Worker Category":
+                    if breakdown_dim == WC_COL:
                         # Filter for the major subquestion, but all worker categories
                         df_breakdown = full_attribution_df[
                             (full_attribution_df[ENTITY_COL] == selected_driver) &
                             (full_attribution_df[SUBQ_COL] == major_subquestion)
-                        ].sort_values("Absolute Change (Contribution)", ascending=False).reset_index(drop=True)
-                        df_breakdown = df_breakdown[[WC_COL, "Absolute Change (Contribution)", "Percentage Change"]]
+                        ]
                         
-                    elif breakdown_dim == "Subquestion":
+                    elif breakdown_dim == SUBQ_COL:
                         # Filter for the major worker category, but all subquestions
                         df_breakdown = full_attribution_df[
                             (full_attribution_df[ENTITY_COL] == selected_driver) &
                             (full_attribution_df[WC_COL] == major_worker_cat)
-                        ].sort_values("Absolute Change (Contribution)", ascending=False).reset_index(drop=True)
-                        df_breakdown = df_breakdown[[SUBQ_COL, "Absolute Change (Contribution)", "Percentage Change"]]
+                        ]
+                        
+                    df_breakdown = df_breakdown.sort_values("Absolute Change (Contribution)", ascending=False).reset_index(drop=True)
+                    df_breakdown = df_breakdown[[breakdown_dim, "Absolute Change (Contribution)", "Percentage Change"]]
 
-                    if df_breakdown is not None and not df_breakdown.empty:
-                        df_breakdown_display = df_breakdown.style.format({
+                    if not df_breakdown.empty:
+                        # Display data table
+                        col_breakdown.dataframe(df_breakdown.style.format({
                             "Absolute Change (Contribution)": "{:,.0f}",
                             "Percentage Change": "{:+.1%}"
-                        })
+                        }), use_container_width=True)
                         
-                        col_breakdown.dataframe(df_breakdown_display, use_container_width=True)
-                        
-                        # Optional: Bar Chart for Visual Breakdown
+                        # Display bar chart
                         breakdown_chart = px.bar(
                             df_breakdown, 
                             x="Absolute Change (Contribution)", 
@@ -433,33 +452,21 @@ def main():
                             orientation='h', 
                             color="Absolute Change (Contribution)",
                             color_continuous_scale=px.colors.diverging.RdYlGn,
-                            title=f"{breakdown_dim} Contribution to Change in {selected_driver}"
+                            title=f"{breakdown_dim} Contribution in {selected_driver}"
                         )
                         breakdown_chart.update_yaxes(categoryorder='total ascending')
                         col_breakdown.plotly_chart(breakdown_chart, use_container_width=True)
                         
                     else:
-                        col_breakdown.warning("No breakdown data available for this selection.")
-
+                        col_breakdown.warning(f"No breakdown data available for {selected_driver} on dimension {breakdown_dim}.")
 
         else:
             st.success("✅ No significant outliers detected in the major view.")
             
-    # --- View 2: Full Outlier Report (Omitted for brevity, assume existing code) ---
+    # --- View 2: Full Outlier Report (Placeholder) ---
     elif analysis_view == 'Full Outlier Report':
-        st.write("Full Outlier Report Generation (using existing code structure...)")
-        # Include your existing 'Full Outlier Report' logic here
+        st.header("Master Outlier Report Generator")
+        st.warning("Please integrate your existing Full Outlier Report logic here.")
 
 if __name__ == "__main__":
-    # Ensure necessary helpers like build_quarter_series are defined or imported
-    # (assuming they are present in your full App.py script)
-    
-    # Placeholder definitions for missing functions to allow this snippet to run standalone
-    try:
-        if 'build_quarter_series' not in globals():
-            def build_quarter_series(*args, **kwargs): return pd.Series(dtype=float)
-        # Similarly for multi-year functions if used in the interactive view
-    except NameError:
-        pass 
-
     main()
