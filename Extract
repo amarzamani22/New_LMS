@@ -1,16 +1,10 @@
-KeyError: "None of ['Period'] are in the columns"
-Traceback:
-File "C:\Users\ttamarz\OneDrive - Bank Negara Malaysia\RLMS\QC_Dashboard\app.py", line 465, in <module>
+File "C:\Users\ttamarz\OneDrive - Bank Negara Malaysia\RLMS\QC_Dashboard\app.py", line 472, in <module>
     main()
     ~~~~^^
-File "C:\Users\ttamarz\OneDrive - Bank Negara Malaysia\RLMS\QC_Dashboard\app.py", line 284, in main
-    outlier_df = find_outliers(
-        current_series, prior_series,
-        mom_pct_thresh_pct, yoy_thresh_pct,
-        abs_cutoff, iqr_mult
+File "C:\Users\ttamarz\OneDrive - Bank Negara Malaysia\RLMS\QC_Dashboard\app.py", line 296, in main
+    prior_row = _row_filter(df_prior_full, ROLLUP_KEY, major_worker_cat, major_subquestion) if df_prior_full else pd.DataFrame()
+                                                                                               ^^^^^^^^^^^^^
+File "C:\Users\ttamarz\AppData\Roaming\Python\Python313\site-packages\pandas\core\generic.py", line 1577, in __nonzero__
+    raise ValueError(
+    ...<2 lines>...
     )
-File "C:\Users\ttamarz\OneDrive - Bank Negara Malaysia\RLMS\QC_Dashboard\app.py", line 159, in find_outliers
-    return pd.DataFrame(outliers).set_index("Period")
-           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^
-File "C:\Users\ttamarz\AppData\Roaming\Python\Python313\site-packages\pandas\core\frame.py", line 6129, in set_index
-    raise KeyError(f"None of {missing} are in the columns")
