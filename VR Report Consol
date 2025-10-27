@@ -251,18 +251,31 @@ def safe_save_xlsx(df: pd.DataFrame, final_path_str: str) -> Path:
 # MAIN
 # =========================
 def main():
-    root=Path(INPUT_FOLDER)
-    files=[p for ext in("*.xlsx","*.xlsm") for p in root.rglob(ext) if not p.name.startswith("~$")]
+    root = Path(INPUT_FOLDER)
+    files = [p for ext in ("*.xlsx", "*.xlsm") for p in root.rglob(ext) if not p.name.startswith("~$")]
     print(f"[INFO] Files found: {len(files)}")
-    t0=time.perf_counter()
-    frames=[]
+
+    t0 = time.perf_counter()
+    frames = []
     for p in files:
-        df=extract_file(p)
-        if not df.empty: frames.append(df)
-    out=pd.concat(frames,ignore_index=True) if frames else pd.DataFrame(columns=[
-        "Entity Name","Year","Quarter","Month","Question","Subquestion","Worker Category","%Growth","Justification"])
-    out_path=safe_save_xlsx(out,OUTPUT_FILE)
+        df = extract_file(p)
+        if not df.empty:
+            frames.append(df)
+
+    out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=[
+        "Entity Name", "Year", "Quarter", "Month", "Question", "Subquestion",
+        "Worker Category", "%Growth", "Justification"
+    ])
+
+    # 🔧 Round & format %Growth as whole percentages
+    if not out.empty:
+        out["%Growth"] = out["%Growth"].round(0).astype("Int64").astype(str) + "%"
+
+    # ✅ Save the Excel file
+    out_path = safe_save_xlsx(out, OUTPUT_FILE)
+
     print(f"[DONE] Rows={len(out):,}  Time={time.perf_counter()-t0:0.2f}s")
 
-if __name__=="__main__":
+
+if __name__ == "__main__":
     main()
