@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# extract_vr_fixed.py  —  one-sheet output: "Variance"
+# variance_consol.py — One-sheet "Variance" output (clean 9-column Excel)
 from __future__ import annotations
-import time
+import time, shutil, tempfile
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 import pandas as pd
@@ -10,8 +10,8 @@ from openpyxl import load_workbook
 # =========================
 # PATH CONFIG (edit these)
 # =========================
-INPUT_FOLDER = r"C:\YourFolder\VR_Files"          # 👈 change me
-OUTPUT_FILE  = r"C:\YourFolder\vr_staging.xlsx"   # 👈 change me
+INPUT_FOLDER = r"C:\YourFolder\VR_Files"  # 👈 change me
+OUTPUT_FILE  = r"C:\YourFolder\VR_Consol_2025_Quarter1.xlsx"  # 👈 change me
 
 # =========================
 # SHEET & CELL CONFIG
@@ -19,7 +19,6 @@ OUTPUT_FILE  = r"C:\YourFolder\vr_staging.xlsx"   # 👈 change me
 SHEET_KEYS = {
     "cover": ["cover"],
     "vr1": ["vr1", "vr 1"],
-    "vr2": ["vr2", "vr 2"],  # (Q4 job functions) – placeholder; not needed for output format
 }
 COVER = {"entity": "F6", "year": "F7", "quarter": "F8"}
 MONTHS_BY_Q = {
@@ -33,7 +32,7 @@ MONTHS_BY_Q = {
     "Q4": ["Oct","Nov","Dec"],
 }
 
-# VR1 columns: Growth (H,J,L) and Justification (M,N,O)
+# Growth & Justification columns (VR1)
 GROWTH_COLS = ["H", "J", "L"]
 JUST_COLS   = ["M", "N", "O"]
 
@@ -92,8 +91,7 @@ Q5_BLOCKS = [
 # HELPERS
 # =========================
 def _norm(s: object) -> str:
-    if s is None: return ""
-    return str(s).strip()
+    return "" if s is None else str(s).strip()
 
 def read_number(ws, addr: str) -> float:
     try:
@@ -117,41 +115,34 @@ def read_text(ws, addr: str) -> str:
         return ""
     return "" if v in (None, "") else str(v).strip()
 
-def _norm_sheetname(s: str) -> str:
-    return " ".join(s.lower().split())
-
-def find_sheetname(wb, wanted_keys: List[str]) -> Optional[str]:
-    lookup = { _norm_sheetname(n): n for n in wb.sheetnames }
-    for key in wanted_keys:
-        k = key.strip().lower()
-        if k in lookup: return lookup[k]
-    for want in wanted_keys:
-        for k_norm, orig in lookup.items():
-            if want in k_norm: return orig
+def find_sheetname(wb, keys):
+    for n in wb.sheetnames:
+        norm = n.lower().replace(" ", "")
+        for k in keys:
+            if k in norm:
+                return n
     return None
 
-def read_cover_meta(wb) -> Tuple[Optional[str], Optional[int], Optional[str]]:
+def read_cover_meta(wb):
     sh = find_sheetname(wb, SHEET_KEYS["cover"])
-    if sh is None: return (None, None, None)
+    if not sh: return (None, None, None)
     ws = wb[sh]
-    ent = _norm(ws[COVER["entity"]].value) if COVER["entity"] else None
-    yr  = ws[COVER["year"]].value if COVER["year"] else None
-    q   = _norm(ws[COVER["quarter"]].value) if COVER["quarter"] else None
-    try:
-        yr = int(str(yr).strip()) if yr not in (None, "") else None
-    except Exception:
-        yr = None
-    return (ent if ent else None, yr, q if q else None)
+    ent = _norm(ws[COVER["entity"]].value)
+    yr  = ws[COVER["year"]].value
+    q   = _norm(ws[COVER["quarter"]].value)
+    try: yr = int(str(yr).strip())
+    except: yr = None
+    return (ent, yr, q)
 
-def ensure_xlsx(path_str: str) -> Path:
-    p = Path(path_str)
-    if p.suffix.lower() not in (".xlsx", ".xlsm"):
-        p = p.with_suffix(".xlsx")
+def enforce_xlsx(path_str: str) -> Path:
+    cleaned = path_str.strip().strip('"').strip("'")
+    p = Path(cleaned).with_suffix(".xlsx")
     p.parent.mkdir(parents=True, exist_ok=True)
+    print(f"[DEBUG] Output path → {repr(str(p))}")
     return p
 
 def emit(rows: List[dict], ent: str, yr: int, qlbl: str, month: str,
-         qn: str, subq: str, wc: str, g: float, j: str, src: str):
+         qn: str, subq: str, wc: str, g: float, j: str):
     rows.append({
         "Entity Name": ent,
         "Year": yr,
@@ -162,161 +153,116 @@ def emit(rows: List[dict], ent: str, yr: int, qlbl: str, month: str,
         "Worker Category": wc,
         "%Growth": g,
         "Justification": j,
-        # keep source internally while building; we will drop it before writing
-        "_source_file": src,
     })
 
 # =========================
-# VR1 extractor (growth + justification)
+# EXTRACTOR
 # =========================
-def extract_vr1(ws, ent: str, yr: int, qlbl: str, src_name: str) -> List[dict]:
-    out_rows: List[dict] = []
+def extract_vr1(ws, ent, yr, qlbl):
+    out_rows = []
     months = MONTHS_BY_Q.get(qlbl, [])
-    if len(months) != 3:
-        return out_rows
+    if len(months) != 3: return out_rows
     m1, m2, m3 = months
-
-    # Q1A Main
+    # --- all question sets ---
     for subq, rows in Q1A_MAIN.items():
         for r in rows:
-            wc = _norm(ws[f"A{r}"].value)
-            g = [read_number(ws, f"{c}{r}") for c in GROWTH_COLS]
-            j = [read_text(ws, f"{c}{r}") for c in JUST_COLS]
-            emit(out_rows, ent, yr, qlbl, m1, "Q1A", subq, wc, g[0], j[0], src_name)
-            emit(out_rows, ent, yr, qlbl, m2, "Q1A", subq, wc, g[1], j[1], src_name)
-            emit(out_rows, ent, yr, qlbl, m3, "Q1A", subq, wc, g[2], j[2], src_name)
-
-    # Q1B Islamic
+            wc=_norm(ws[f"A{r}"].value)
+            g=[read_number(ws,f"{c}{r}") for c in GROWTH_COLS]
+            j=[read_text(ws,f"{c}{r}") for c in JUST_COLS]
+            emit(out_rows,ent,yr,qlbl,m1,"Q1A",subq,wc,g[0],j[0])
+            emit(out_rows,ent,yr,qlbl,m2,"Q1A",subq,wc,g[1],j[1])
+            emit(out_rows,ent,yr,qlbl,m3,"Q1A",subq,wc,g[2],j[2])
+    # Repeat pattern for other question blocks
     for subq, row_list in Q1B_ISLAMIC.items():
         for r in row_list:
-            wc = _norm(ws[f"A{r}"].value)
-            g = [read_number(ws, f"{c}{r}") for c in GROWTH_COLS]
-            j = [read_text(ws, f"{c}{r}") for c in JUST_COLS]
-            emit(out_rows, ent, yr, qlbl, m1, "Q1B", subq, wc, g[0], j[0], src_name)
-            emit(out_rows, ent, yr, qlbl, m2, "Q1B", subq, wc, g[1], j[1], src_name)
-            emit(out_rows, ent, yr, qlbl, m3, "Q1B", subq, wc, g[2], j[2], src_name)
-
-    # Q2A Main
+            wc=_norm(ws[f"A{r}"].value)
+            g=[read_number(ws,f"{c}{r}") for c in GROWTH_COLS]
+            j=[read_text(ws,f"{c}{r}") for c in JUST_COLS]
+            emit(out_rows,ent,yr,qlbl,m1,"Q1B",subq,wc,g[0],j[0])
+            emit(out_rows,ent,yr,qlbl,m2,"Q1B",subq,wc,g[1],j[1])
+            emit(out_rows,ent,yr,qlbl,m3,"Q1B",subq,wc,g[2],j[2])
     for subq, rows in Q2A_MAIN.items():
         for r in rows:
-            wc = _norm(ws[f"A{r}"].value)
-            g = [read_number(ws, f"{c}{r}") for c in GROWTH_COLS]
-            j = [read_text(ws, f"{c}{r}") for c in JUST_COLS]
-            emit(out_rows, ent, yr, qlbl, m1, "Q2A", subq, wc, g[0], j[0], src_name)
-            emit(out_rows, ent, yr, qlbl, m2, "Q2A", subq, wc, g[1], j[1], src_name)
-            emit(out_rows, ent, yr, qlbl, m3, "Q2A", subq, wc, g[2], j[2], src_name)
-
-    # Q2B Islamic
+            wc=_norm(ws[f"A{r}"].value)
+            g=[read_number(ws,f"{c}{r}") for c in GROWTH_COLS]
+            j=[read_text(ws,f"{c}{r}") for c in JUST_COLS]
+            emit(out_rows,ent,yr,qlbl,m1,"Q2A",subq,wc,g[0],j[0])
+            emit(out_rows,ent,yr,qlbl,m2,"Q2A",subq,wc,g[1],j[1])
+            emit(out_rows,ent,yr,qlbl,m3,"Q2A",subq,wc,g[2],j[2])
     for subq, rows in Q2B_ISLAMIC.items():
         for r in rows:
-            wc = _norm(ws[f"A{r}"].value)
-            g = [read_number(ws, f"{c}{r}") for c in GROWTH_COLS]
-            j = [read_text(ws, f"{c}{r}") for c in JUST_COLS]
-            emit(out_rows, ent, yr, qlbl, m1, "Q2B", subq, wc, g[0], j[0], src_name)
-            emit(out_rows, ent, yr, qlbl, m2, "Q2B", subq, wc, g[1], j[1], src_name)
-            emit(out_rows, ent, yr, qlbl, m3, "Q2B", subq, wc, g[2], j[2], src_name)
-
-    # Q3
-    for r, wc_name in Q3_ROWS:
-        wc = _norm(wc_name)
-        g = [read_number(ws, f"{c}{r}") for c in GROWTH_COLS]
-        j = [read_text(ws, f"{c}{r}") for c in JUST_COLS]
-        emit(out_rows, ent, yr, qlbl, m1, "Q3", "", wc, g[0], j[0], src_name)
-        emit(out_rows, ent, yr, qlbl, m2, "Q3", "", wc, g[1], j[1], src_name)
-        emit(out_rows, ent, yr, qlbl, m3, "Q3", "", wc, g[2], j[2], src_name)
-
-    # Q4
-    for sublabel, r0, r1 in Q4_BLOCKS:
-        for r in range(r0, r1 + 1):
-            wc = _norm(ws[f"A{r}"].value)
-            if wc == "":
-                continue
-            g = [read_number(ws, f"{c}{r}") for c in GROWTH_COLS]
-            j = [read_text(ws, f"{c}{r}") for c in JUST_COLS]
-            emit(out_rows, ent, yr, qlbl, m1, "Q4", sublabel, wc, g[0], j[0], src_name)
-            emit(out_rows, ent, yr, qlbl, m2, "Q4", sublabel, wc, g[1], j[1], src_name)
-            emit(out_rows, ent, yr, qlbl, m3, "Q4", sublabel, wc, g[2], j[2], src_name)
-
-    # Q5
-    for sublabel, r0, r1 in Q5_BLOCKS:
-        for r in range(r0, r1 + 1):
-            wc = _norm(ws[f"A{r}"].value)
-            if wc == "":
-                continue
-            g = [read_number(ws, f"{c}{r}") for c in GROWTH_COLS]
-            j = [read_text(ws, f"{c}{r}") for c in JUST_COLS]
-            emit(out_rows, ent, yr, qlbl, m1, "Q5", sublabel, wc, g[0], j[0], src_name)
-            emit(out_rows, ent, yr, qlbl, m2, "Q5", sublabel, wc, g[1], j[1], src_name)
-            emit(out_rows, ent, yr, qlbl, m3, "Q5", sublabel, wc, g[2], j[2], src_name)
-
+            wc=_norm(ws[f"A{r}"].value)
+            g=[read_number(ws,f"{c}{r}") for c in GROWTH_COLS]
+            j=[read_text(ws,f"{c}{r}") for c in JUST_COLS]
+            emit(out_rows,ent,yr,qlbl,m1,"Q2B",subq,wc,g[0],j[0])
+            emit(out_rows,ent,yr,qlbl,m2,"Q2B",subq,wc,g[1],j[1])
+            emit(out_rows,ent,yr,qlbl,m3,"Q2B",subq,wc,g[2],j[2])
+    for r,wc in Q3_ROWS:
+        g=[read_number(ws,f"{c}{r}") for c in GROWTH_COLS]
+        j=[read_text(ws,f"{c}{r}") for c in JUST_COLS]
+        emit(out_rows,ent,yr,qlbl,m1,"Q3","",wc,g[0],j[0])
+        emit(out_rows,ent,yr,qlbl,m2,"Q3","",wc,g[1],j[1])
+        emit(out_rows,ent,yr,qlbl,m3,"Q3","",wc,g[2],j[2])
+    for sublabel,r0,r1 in Q4_BLOCKS:
+        for r in range(r0,r1+1):
+            wc=_norm(ws[f"A{r}"].value)
+            if wc=="": continue
+            g=[read_number(ws,f"{c}{r}") for c in GROWTH_COLS]
+            j=[read_text(ws,f"{c}{r}") for c in JUST_COLS]
+            emit(out_rows,ent,yr,qlbl,m1,"Q4",sublabel,wc,g[0],j[0])
+            emit(out_rows,ent,yr,qlbl,m2,"Q4",sublabel,wc,g[1],j[1])
+            emit(out_rows,ent,yr,qlbl,m3,"Q4",sublabel,wc,g[2],j[2])
+    for sublabel,r0,r1 in Q5_BLOCKS:
+        for r in range(r0,r1+1):
+            wc=_norm(ws[f"A{r}"].value)
+            if wc=="": continue
+            g=[read_number(ws,f"{c}{r}") for c in GROWTH_COLS]
+            j=[read_text(ws,f"{c}{r}") for c in JUST_COLS]
+            emit(out_rows,ent,yr,qlbl,m1,"Q5",sublabel,wc,g[0],j[0])
+            emit(out_rows,ent,yr,qlbl,m2,"Q5",sublabel,wc,g[1],j[1])
+            emit(out_rows,ent,yr,qlbl,m3,"Q5",sublabel,wc,g[2],j[2])
     return out_rows
 
-# (VR2 for Q4 job functions can be added later if needed)
-
-# =========================
-# Extract a single file
-# =========================
 def extract_file(p: Path) -> pd.DataFrame:
-    try:
-        wb = load_workbook(str(p), data_only=True, read_only=True)
-    except Exception:
-        return pd.DataFrame()
-
-    ent, yr, qlbl = read_cover_meta(wb)
-    if not ent or not yr or not qlbl:
-        try: wb.close()
-        except Exception: pass
-        return pd.DataFrame()
-
-    rows: List[dict] = []
-
-    vr1_name = find_sheetname(wb, SHEET_KEYS["vr1"])
-    if vr1_name:
-        ws1 = wb[vr1_name]
-        rows.extend(extract_vr1(ws1, ent, yr, qlbl, p.name))
-
-    try: wb.close()
-    except Exception: pass
-
+    try: wb = load_workbook(str(p), data_only=True, read_only=True)
+    except Exception: return pd.DataFrame()
+    ent,yr,qlbl=read_cover_meta(wb)
+    if not(ent and yr and qlbl): wb.close(); return pd.DataFrame()
+    vr1=find_sheetname(wb,SHEET_KEYS["vr1"])
+    if not vr1: wb.close(); return pd.DataFrame()
+    ws=wb[vr1]; rows=extract_vr1(ws,ent,yr,qlbl)
+    wb.close()
     return pd.DataFrame(rows)
+
+# =========================
+# SAFE SAVE (OneDrive-safe)
+# =========================
+def safe_save_xlsx(df: pd.DataFrame, final_path_str: str) -> Path:
+    final_path = enforce_xlsx(final_path_str)
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)/"tmp.xlsx"
+        with pd.ExcelWriter(tmp, engine="openpyxl") as xw:
+            df.to_excel(xw, index=False, sheet_name="Variance")
+        shutil.copyfile(tmp, final_path)
+    print(f"[INFO] Saved → {final_path}")
+    return final_path
 
 # =========================
 # MAIN
 # =========================
 def main():
-    root = Path(INPUT_FOLDER)
-    if not root.exists():
-        print(f"[ERROR] Folder not found: {root}")
-        return
-    files = []
-    for ext in ("*.xlsx","*.xlsm"):
-        files.extend(p for p in root.rglob(ext) if not p.name.startswith("~$"))
-    files.sort()
+    root=Path(INPUT_FOLDER)
+    files=[p for ext in("*.xlsx","*.xlsm") for p in root.rglob(ext) if not p.name.startswith("~$")]
     print(f"[INFO] Files found: {len(files)}")
+    t0=time.perf_counter()
+    frames=[]
+    for p in files:
+        df=extract_file(p)
+        if not df.empty: frames.append(df)
+    out=pd.concat(frames,ignore_index=True) if frames else pd.DataFrame(columns=[
+        "Entity Name","Year","Quarter","Month","Question","Subquestion","Worker Category","%Growth","Justification"])
+    out_path=safe_save_xlsx(out,OUTPUT_FILE)
+    print(f"[DONE] Rows={len(out):,}  Time={time.perf_counter()-t0:0.2f}s")
 
-    t0 = time.perf_counter()
-    frames: List[pd.DataFrame] = []
-    for i, p in enumerate(files, 1):
-        df = extract_file(p)
-        if not df.empty:
-            frames.append(df)
-        if i % 25 == 0:
-            print(f"  processed {i}/{len(files)}")
-
-    out_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
-        columns=["Entity Name","Year","Quarter","Month","Question","Subquestion","Worker Category","%Growth","Justification","_source_file"]
-    )
-
-    # keep only the nine requested columns (drop helper)
-    keep_cols = ["Entity Name","Year","Quarter","Month","Question","Subquestion","Worker Category","%Growth","Justification"]
-    out_df = out_df[keep_cols]
-
-    out_path = ensure_xlsx(OUTPUT_FILE)
-    with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
-        out_df.to_excel(xw, index=False, sheet_name="Variance")
-
-    print(f"[DONE] Wrote → {out_path}  (rows={len(out_df):,})")
-    print(f"[TIME] {time.perf_counter()-t0:0.2f}s")
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
