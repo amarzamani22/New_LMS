@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# extract_vr_fixed.py
+# extract_vr_fixed.py  —  one-sheet output: "Variance"
 from __future__ import annotations
 import time
 from pathlib import Path
@@ -16,17 +16,12 @@ OUTPUT_FILE  = r"C:\YourFolder\vr_staging.xlsx"   # 👈 change me
 # =========================
 # SHEET & CELL CONFIG
 # =========================
-# We’ll find sheets by loose matching (case/space-insensitive)
 SHEET_KEYS = {
     "cover": ["cover"],
     "vr1": ["vr1", "vr 1"],
-    "vr2": ["vr2", "vr 2"],  # Q4 job functions (placeholder for later)
+    "vr2": ["vr2", "vr 2"],  # (Q4 job functions) – placeholder; not needed for output format
 }
-
-# Cover metadata cells
 COVER = {"entity": "F6", "year": "F7", "quarter": "F8"}
-
-# Quarter → months
 MONTHS_BY_Q = {
     "Quarter 1": ["Jan","Feb","Mar"],
     "Quarter 2": ["Apr","May","Jun"],
@@ -38,13 +33,12 @@ MONTHS_BY_Q = {
     "Q4": ["Oct","Nov","Dec"],
 }
 
-# Growth & justification columns per month (VR1)
-# Growth: M1=H, M2=J, M3=L | Justification: M1=M, M2=N, M3=O
+# VR1 columns: Growth (H,J,L) and Justification (M,N,O)
 GROWTH_COLS = ["H", "J", "L"]
 JUST_COLS   = ["M", "N", "O"]
 
 # =========================
-# FIXED ROW CONFIG (VR layout you provided)
+# FIXED ROW CONFIG (VR layout)
 # =========================
 Q1A_MAIN = {
     "Employment = A + B(i) + B(ii)": [15, 17, 19, 21, 23, 25, 27, 28],
@@ -102,7 +96,6 @@ def _norm(s: object) -> str:
     return str(s).strip()
 
 def read_number(ws, addr: str) -> float:
-    """Parse numeric, safe for %, commas, blanks, dashes."""
     try:
         v = ws[addr].value
     except Exception:
@@ -128,24 +121,18 @@ def _norm_sheetname(s: str) -> str:
     return " ".join(s.lower().split())
 
 def find_sheetname(wb, wanted_keys: List[str]) -> Optional[str]:
-    """Find a sheet name matching any of the normalized keys (exact or contains)."""
     lookup = { _norm_sheetname(n): n for n in wb.sheetnames }
-    # exact normalized
     for key in wanted_keys:
         k = key.strip().lower()
-        if k in lookup:
-            return lookup[k]
-    # contains
+        if k in lookup: return lookup[k]
     for want in wanted_keys:
         for k_norm, orig in lookup.items():
-            if want in k_norm:
-                return orig
+            if want in k_norm: return orig
     return None
 
 def read_cover_meta(wb) -> Tuple[Optional[str], Optional[int], Optional[str]]:
     sh = find_sheetname(wb, SHEET_KEYS["cover"])
-    if sh is None:
-        return (None, None, None)
+    if sh is None: return (None, None, None)
     ws = wb[sh]
     ent = _norm(ws[COVER["entity"]].value) if COVER["entity"] else None
     yr  = ws[COVER["year"]].value if COVER["year"] else None
@@ -156,12 +143,27 @@ def read_cover_meta(wb) -> Tuple[Optional[str], Optional[int], Optional[str]]:
         yr = None
     return (ent if ent else None, yr, q if q else None)
 
+def ensure_xlsx(path_str: str) -> Path:
+    p = Path(path_str)
+    if p.suffix.lower() not in (".xlsx", ".xlsm"):
+        p = p.with_suffix(".xlsx")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
 def emit(rows: List[dict], ent: str, yr: int, qlbl: str, month: str,
          qn: str, subq: str, wc: str, g: float, j: str, src: str):
     rows.append({
-        "entity_name": ent, "year": yr, "quarter": qlbl, "month": month,
-        "question": qn, "subquestion": subq, "worker_category": wc,
-        "growth_rate_pct": g, "justification": j, "source_file": src
+        "Entity Name": ent,
+        "Year": yr,
+        "Quarter": qlbl,
+        "Month": month,
+        "Question": qn,
+        "Subquestion": subq,
+        "Worker Category": wc,
+        "%Growth": g,
+        "Justification": j,
+        # keep source internally while building; we will drop it before writing
+        "_source_file": src,
     })
 
 # =========================
@@ -249,15 +251,7 @@ def extract_vr1(ws, ent: str, yr: int, qlbl: str, src_name: str) -> List[dict]:
 
     return out_rows
 
-# =========================
-# VR2 extractor (Q4 job functions) – placeholder
-# =========================
-def extract_vr2_q4_jobfunc(ws, ent: str, yr: int, qlbl: str, src_name: str) -> List[dict]:
-    """
-    Placeholder for Quarter 4 job-function variance (VR2).
-    When you're ready, give me the exact fixed row/column map and I’ll implement it.
-    """
-    return []
+# (VR2 for Q4 job functions can be added later if needed)
 
 # =========================
 # Extract a single file
@@ -276,30 +270,15 @@ def extract_file(p: Path) -> pd.DataFrame:
 
     rows: List[dict] = []
 
-    # VR1 (main)
     vr1_name = find_sheetname(wb, SHEET_KEYS["vr1"])
     if vr1_name:
         ws1 = wb[vr1_name]
         rows.extend(extract_vr1(ws1, ent, yr, qlbl, p.name))
 
-    # VR2 (Q4 only)
-    if (qlbl or "").strip().upper() in ("Q4", "QUARTER 4"):
-        vr2_name = find_sheetname(wb, SHEET_KEYS["vr2"])
-        if vr2_name:
-            ws2 = wb[vr2_name]
-            rows.extend(extract_vr2_q4_jobfunc(ws2, ent, yr, qlbl, p.name))
-
     try: wb.close()
     except Exception: pass
 
-    if not rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows).sort_values(
-        ["entity_name","year","quarter","question","subquestion","worker_category","month"],
-        kind="mergesort"
-    ).reset_index(drop=True)
-    return df
+    return pd.DataFrame(rows)
 
 # =========================
 # MAIN
@@ -325,34 +304,18 @@ def main():
             print(f"  processed {i}/{len(files)}")
 
     out_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
-        columns=["entity_name","year","quarter","month","question","subquestion","worker_category","growth_rate_pct","justification","source_file"]
+        columns=["Entity Name","Year","Quarter","Month","Question","Subquestion","Worker Category","%Growth","Justification","_source_file"]
     )
 
-    out_path = Path(OUTPUT_FILE)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # keep only the nine requested columns (drop helper)
+    keep_cols = ["Entity Name","Year","Quarter","Month","Question","Subquestion","Worker Category","%Growth","Justification"]
+    out_df = out_df[keep_cols]
+
+    out_path = ensure_xlsx(OUTPUT_FILE)
     with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
         out_df.to_excel(xw, index=False, sheet_name="Variance")
-        # Quick summary + data dictionary
-        if not out_df.empty:
-            pv = (out_df.groupby(["entity_name","year","quarter","question"], dropna=False)
-                          .agg(rows=("growth_rate_pct","size"),
-                               avg_growth=("growth_rate_pct","mean"))
-                          .reset_index())
-            pv.to_excel(xw, index=False, sheet_name="By_FI_Question")
-        dd = pd.DataFrame({
-            "column":[
-                "entity_name","year","quarter","month","question","subquestion","worker_category",
-                "growth_rate_pct","justification","source_file"
-            ],
-            "description":[
-                "FI name","Calendar year","Q1/Q2/Q3/Q4","Month (Jan..Dec)",
-                "Top-level question label","Metric/sub-question label","Occupation row label",
-                "Growth % (number, e.g., 26 means 26%)","Free-text FI justification","Original filename"
-            ]
-        })
-        dd.to_excel(xw, index=False, sheet_name="Data_Dictionary")
 
-    print(f"[DONE] VR staging → {out_path}  (rows={0 if out_df.empty else len(out_df):,})")
+    print(f"[DONE] Wrote → {out_path}  (rows={len(out_df):,})")
     print(f"[TIME] {time.perf_counter()-t0:0.2f}s")
 
 if __name__ == "__main__":
