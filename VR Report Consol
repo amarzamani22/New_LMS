@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+# extract_vr_fixed.py
+from __future__ import annotations
+import time
+from pathlib import Path
+from typing import List, Dict, Tuple, Optional
+import pandas as pd
+from openpyxl import load_workbook
+
+# =========================
+# PATH CONFIG (edit these)
+# =========================
+INPUT_FOLDER = r"C:\YourFolder\VR_Files"          # 👈 change me
+OUTPUT_FILE  = r"C:\YourFolder\vr_staging.xlsx"   # 👈 change me
+
+# =========================
+# SHEET & CELL CONFIG
+# =========================
+# We’ll find sheets by loose matching (case/space-insensitive)
+SHEET_KEYS = {
+    "cover": ["cover"],
+    "vr1": ["vr1", "vr 1"],
+    "vr2": ["vr2", "vr 2"],  # Q4 job functions (placeholder for later)
+}
+
+# Cover metadata cells
+COVER = {"entity": "F6", "year": "F7", "quarter": "F8"}
+
+# Quarter → months
+MONTHS_BY_Q = {
+    "Quarter 1": ["Jan","Feb","Mar"],
+    "Quarter 2": ["Apr","May","Jun"],
+    "Quarter 3": ["Jul","Aug","Sep"],
+    "Quarter 4": ["Oct","Nov","Dec"],
+    "Q1": ["Jan","Feb","Mar"],
+    "Q2": ["Apr","May","Jun"],
+    "Q3": ["Jul","Aug","Sep"],
+    "Q4": ["Oct","Nov","Dec"],
+}
+
+# Growth & justification columns per month (VR1)
+# Growth: M1=H, M2=J, M3=L | Justification: M1=M, M2=N, M3=O
+GROWTH_COLS = ["H", "J", "L"]
+JUST_COLS   = ["M", "N", "O"]
+
+# =========================
+# FIXED ROW CONFIG (VR layout you provided)
+# =========================
+Q1A_MAIN = {
+    "Employment = A + B(i) + B(ii)": [15, 17, 19, 21, 23, 25, 27, 28],
+    "A. Malaysian": list(range(30, 36 + 1)),
+    "B(i) Non-Malaysian: PR": list(range(38, 44 + 1)),
+    "B(ii) Non-Malaysian: NPR": list(range(46, 52 + 1)),
+}
+Q1B_ISLAMIC = {
+    "Employment = A + B(i) + B(ii)": list(range(57, 63 + 1)),
+    "A. Malaysian": list(range(65, 71 + 1)),
+    "B(i) PR": list(range(73, 79 + 1)),
+    "B(ii) NPR": list(range(81, 87 + 1)),
+}
+Q2A_MAIN = {
+    "Salary & Wages = A+B+C+D+E": list(range(93, 99 + 1)),
+    "A. Basic Salary & Wages": list(range(101, 107 + 1)),
+    "B. Arrears to Basic": [109,111,113,115,117,119,121],
+    "C. Bonus": list(range(123, 129 + 1)),
+    "D. Others (overtime, COLA, allowance, etc.)": list(range(131, 137 + 1)),
+    "E. Commissions Paid At Least Once a Month (RM)": list(range(139, 145 + 1)),
+}
+Q2B_ISLAMIC = {
+    "A. Salary & Wages": list(range(150, 156 + 1)),
+    "B. Commissions Paid At Least Once a Month (RM)": list(range(158, 164 + 1)),
+}
+Q3_ROWS = [
+    (169, "Managers"),
+    (170, "Professional"),
+    (171, "Technicians & Associate Professionals"),
+    (172, "Clerical Occupations"),
+    (173, "Operative Workers"),
+    (174, "Elementary Occupations"),
+    (175, "TOTAL Hours Worked During the Month, Including Overtime"),
+]
+Q4_BLOCKS = [
+    ("A. Number of Job Vacancies as at End of the Month", 181, 187),
+    ("B. Minimum Basic Starting Salaries of Job Vacancies during the month (RM)", 188, 195),
+    ("C(i). Number of Job Vacancies Due to New Jobs Created During the Month", 197, 203),
+    ("C(ii). Number Job Vacancies Due to Retirements, Resignations and All Reasons, other than New Jobs Created during the Month", 205, 211),
+]
+Q5_BLOCKS = [
+    ("New Hires and Recalls", 218, 224),
+    ("Separations = A + B + C", 226, 232),
+    ("A. Quits and Resignations (except retirements)", 234, 240),
+    ("B. Total Layoffs and Discharges", 242, 248),
+    ("B(i). Layoffs and Discharges: of which; VSS/MSS", 250, 256),
+    ("C. Other Separations", 258, 264),
+]
+
+# =========================
+# HELPERS
+# =========================
+def _norm(s: object) -> str:
+    if s is None: return ""
+    return str(s).strip()
+
+def read_number(ws, addr: str) -> float:
+    """Parse numeric, safe for %, commas, blanks, dashes."""
+    try:
+        v = ws[addr].value
+    except Exception:
+        return 0.0
+    if v in (None, "", "-", "–"):
+        return 0.0
+    try:
+        return float(v)
+    except Exception:
+        try:
+            return float(str(v).replace("%","").replace(",","").strip())
+        except Exception:
+            return 0.0
+
+def read_text(ws, addr: str) -> str:
+    try:
+        v = ws[addr].value
+    except Exception:
+        return ""
+    return "" if v in (None, "") else str(v).strip()
+
+def _norm_sheetname(s: str) -> str:
+    return " ".join(s.lower().split())
+
+def find_sheetname(wb, wanted_keys: List[str]) -> Optional[str]:
+    """Find a sheet name matching any of the normalized keys (exact or contains)."""
+    lookup = { _norm_sheetname(n): n for n in wb.sheetnames }
+    # exact normalized
+    for key in wanted_keys:
+        k = key.strip().lower()
+        if k in lookup:
+            return lookup[k]
+    # contains
+    for want in wanted_keys:
+        for k_norm, orig in lookup.items():
+            if want in k_norm:
+                return orig
+    return None
+
+def read_cover_meta(wb) -> Tuple[Optional[str], Optional[int], Optional[str]]:
+    sh = find_sheetname(wb, SHEET_KEYS["cover"])
+    if sh is None:
+        return (None, None, None)
+    ws = wb[sh]
+    ent = _norm(ws[COVER["entity"]].value) if COVER["entity"] else None
+    yr  = ws[COVER["year"]].value if COVER["year"] else None
+    q   = _norm(ws[COVER["quarter"]].value) if COVER["quarter"] else None
+    try:
+        yr = int(str(yr).strip()) if yr not in (None, "") else None
+    except Exception:
+        yr = None
+    return (ent if ent else None, yr, q if q else None)
+
+def emit(rows: List[dict], ent: str, yr: int, qlbl: str, month: str,
+         qn: str, subq: str, wc: str, g: float, j: str, src: str):
+    rows.append({
+        "entity_name": ent, "year": yr, "quarter": qlbl, "month": month,
+        "question": qn, "subquestion": subq, "worker_category": wc,
+        "growth_rate_pct": g, "justification": j, "source_file": src
+    })
+
+# =========================
+# VR1 extractor (growth + justification)
+# =========================
+def extract_vr1(ws, ent: str, yr: int, qlbl: str, src_name: str) -> List[dict]:
+    out_rows: List[dict] = []
+    months = MONTHS_BY_Q.get(qlbl, [])
+    if len(months) != 3:
+        return out_rows
+    m1, m2, m3 = months
+
+    # Q1A Main
+    for subq, rows in Q1A_MAIN.items():
+        for r in rows:
+            wc = _norm(ws[f"A{r}"].value)
+            g = [read_number(ws, f"{c}{r}") for c in GROWTH_COLS]
+            j = [read_text(ws, f"{c}{r}") for c in JUST_COLS]
+            emit(out_rows, ent, yr, qlbl, m1, "Q1A", subq, wc, g[0], j[0], src_name)
+            emit(out_rows, ent, yr, qlbl, m2, "Q1A", subq, wc, g[1], j[1], src_name)
+            emit(out_rows, ent, yr, qlbl, m3, "Q1A", subq, wc, g[2], j[2], src_name)
+
+    # Q1B Islamic
+    for subq, row_list in Q1B_ISLAMIC.items():
+        for r in row_list:
+            wc = _norm(ws[f"A{r}"].value)
+            g = [read_number(ws, f"{c}{r}") for c in GROWTH_COLS]
+            j = [read_text(ws, f"{c}{r}") for c in JUST_COLS]
+            emit(out_rows, ent, yr, qlbl, m1, "Q1B", subq, wc, g[0], j[0], src_name)
+            emit(out_rows, ent, yr, qlbl, m2, "Q1B", subq, wc, g[1], j[1], src_name)
+            emit(out_rows, ent, yr, qlbl, m3, "Q1B", subq, wc, g[2], j[2], src_name)
+
+    # Q2A Main
+    for subq, rows in Q2A_MAIN.items():
+        for r in rows:
+            wc = _norm(ws[f"A{r}"].value)
+            g = [read_number(ws, f"{c}{r}") for c in GROWTH_COLS]
+            j = [read_text(ws, f"{c}{r}") for c in JUST_COLS]
+            emit(out_rows, ent, yr, qlbl, m1, "Q2A", subq, wc, g[0], j[0], src_name)
+            emit(out_rows, ent, yr, qlbl, m2, "Q2A", subq, wc, g[1], j[1], src_name)
+            emit(out_rows, ent, yr, qlbl, m3, "Q2A", subq, wc, g[2], j[2], src_name)
+
+    # Q2B Islamic
+    for subq, rows in Q2B_ISLAMIC.items():
+        for r in rows:
+            wc = _norm(ws[f"A{r}"].value)
+            g = [read_number(ws, f"{c}{r}") for c in GROWTH_COLS]
+            j = [read_text(ws, f"{c}{r}") for c in JUST_COLS]
+            emit(out_rows, ent, yr, qlbl, m1, "Q2B", subq, wc, g[0], j[0], src_name)
+            emit(out_rows, ent, yr, qlbl, m2, "Q2B", subq, wc, g[1], j[1], src_name)
+            emit(out_rows, ent, yr, qlbl, m3, "Q2B", subq, wc, g[2], j[2], src_name)
+
+    # Q3
+    for r, wc_name in Q3_ROWS:
+        wc = _norm(wc_name)
+        g = [read_number(ws, f"{c}{r}") for c in GROWTH_COLS]
+        j = [read_text(ws, f"{c}{r}") for c in JUST_COLS]
+        emit(out_rows, ent, yr, qlbl, m1, "Q3", "", wc, g[0], j[0], src_name)
+        emit(out_rows, ent, yr, qlbl, m2, "Q3", "", wc, g[1], j[1], src_name)
+        emit(out_rows, ent, yr, qlbl, m3, "Q3", "", wc, g[2], j[2], src_name)
+
+    # Q4
+    for sublabel, r0, r1 in Q4_BLOCKS:
+        for r in range(r0, r1 + 1):
+            wc = _norm(ws[f"A{r}"].value)
+            if wc == "":
+                continue
+            g = [read_number(ws, f"{c}{r}") for c in GROWTH_COLS]
+            j = [read_text(ws, f"{c}{r}") for c in JUST_COLS]
+            emit(out_rows, ent, yr, qlbl, m1, "Q4", sublabel, wc, g[0], j[0], src_name)
+            emit(out_rows, ent, yr, qlbl, m2, "Q4", sublabel, wc, g[1], j[1], src_name)
+            emit(out_rows, ent, yr, qlbl, m3, "Q4", sublabel, wc, g[2], j[2], src_name)
+
+    # Q5
+    for sublabel, r0, r1 in Q5_BLOCKS:
+        for r in range(r0, r1 + 1):
+            wc = _norm(ws[f"A{r}"].value)
+            if wc == "":
+                continue
+            g = [read_number(ws, f"{c}{r}") for c in GROWTH_COLS]
+            j = [read_text(ws, f"{c}{r}") for c in JUST_COLS]
+            emit(out_rows, ent, yr, qlbl, m1, "Q5", sublabel, wc, g[0], j[0], src_name)
+            emit(out_rows, ent, yr, qlbl, m2, "Q5", sublabel, wc, g[1], j[1], src_name)
+            emit(out_rows, ent, yr, qlbl, m3, "Q5", sublabel, wc, g[2], j[2], src_name)
+
+    return out_rows
+
+# =========================
+# VR2 extractor (Q4 job functions) – placeholder
+# =========================
+def extract_vr2_q4_jobfunc(ws, ent: str, yr: int, qlbl: str, src_name: str) -> List[dict]:
+    """
+    Placeholder for Quarter 4 job-function variance (VR2).
+    When you're ready, give me the exact fixed row/column map and I’ll implement it.
+    """
+    return []
+
+# =========================
+# Extract a single file
+# =========================
+def extract_file(p: Path) -> pd.DataFrame:
+    try:
+        wb = load_workbook(str(p), data_only=True, read_only=True)
+    except Exception:
+        return pd.DataFrame()
+
+    ent, yr, qlbl = read_cover_meta(wb)
+    if not ent or not yr or not qlbl:
+        try: wb.close()
+        except Exception: pass
+        return pd.DataFrame()
+
+    rows: List[dict] = []
+
+    # VR1 (main)
+    vr1_name = find_sheetname(wb, SHEET_KEYS["vr1"])
+    if vr1_name:
+        ws1 = wb[vr1_name]
+        rows.extend(extract_vr1(ws1, ent, yr, qlbl, p.name))
+
+    # VR2 (Q4 only)
+    if (qlbl or "").strip().upper() in ("Q4", "QUARTER 4"):
+        vr2_name = find_sheetname(wb, SHEET_KEYS["vr2"])
+        if vr2_name:
+            ws2 = wb[vr2_name]
+            rows.extend(extract_vr2_q4_jobfunc(ws2, ent, yr, qlbl, p.name))
+
+    try: wb.close()
+    except Exception: pass
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows).sort_values(
+        ["entity_name","year","quarter","question","subquestion","worker_category","month"],
+        kind="mergesort"
+    ).reset_index(drop=True)
+    return df
+
+# =========================
+# MAIN
+# =========================
+def main():
+    root = Path(INPUT_FOLDER)
+    if not root.exists():
+        print(f"[ERROR] Folder not found: {root}")
+        return
+    files = []
+    for ext in ("*.xlsx","*.xlsm"):
+        files.extend(p for p in root.rglob(ext) if not p.name.startswith("~$"))
+    files.sort()
+    print(f"[INFO] Files found: {len(files)}")
+
+    t0 = time.perf_counter()
+    frames: List[pd.DataFrame] = []
+    for i, p in enumerate(files, 1):
+        df = extract_file(p)
+        if not df.empty:
+            frames.append(df)
+        if i % 25 == 0:
+            print(f"  processed {i}/{len(files)}")
+
+    out_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
+        columns=["entity_name","year","quarter","month","question","subquestion","worker_category","growth_rate_pct","justification","source_file"]
+    )
+
+    out_path = Path(OUTPUT_FILE)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
+        out_df.to_excel(xw, index=False, sheet_name="Variance")
+        # Quick summary + data dictionary
+        if not out_df.empty:
+            pv = (out_df.groupby(["entity_name","year","quarter","question"], dropna=False)
+                          .agg(rows=("growth_rate_pct","size"),
+                               avg_growth=("growth_rate_pct","mean"))
+                          .reset_index())
+            pv.to_excel(xw, index=False, sheet_name="By_FI_Question")
+        dd = pd.DataFrame({
+            "column":[
+                "entity_name","year","quarter","month","question","subquestion","worker_category",
+                "growth_rate_pct","justification","source_file"
+            ],
+            "description":[
+                "FI name","Calendar year","Q1/Q2/Q3/Q4","Month (Jan..Dec)",
+                "Top-level question label","Metric/sub-question label","Occupation row label",
+                "Growth % (number, e.g., 26 means 26%)","Free-text FI justification","Original filename"
+            ]
+        })
+        dd.to_excel(xw, index=False, sheet_name="Data_Dictionary")
+
+    print(f"[DONE] VR staging → {out_path}  (rows={0 if out_df.empty else len(out_df):,})")
+    print(f"[TIME] {time.perf_counter()-t0:0.2f}s")
+
+if __name__ == "__main__":
+    main()
