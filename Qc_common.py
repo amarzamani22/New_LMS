@@ -621,19 +621,18 @@ if not jobfunc_mode:
                 b = ws.cell(r, col_index["Dec"]).coordinate
                 ws.cell(r, col_index["Q4"]).value = f"=SUM({a}:{b})"
 
-
-
-        for i in range(1, len(q_sums_present)):
-            q = q_sums_present[i]; pq = q_sums_present[i-1]
-            cd = col_index[f"Diff {q}"]
-            cp = col_index[f"%Diff {q}"]
-            cq = col_index[q]
-            pp = col_index[pq]
-            for r in range(first_data_row, last_data_row + 1):
-                a = ws.cell(r, cq).coordinate
-                b = ws.cell(r, pp).coordinate
-                ws.cell(r, cd).value = f"={a}-{b}"
-                ws.cell(r, cp).value = f"=IF(AND({a}=0,{b}=0),0,IF({b}=0,\"N/A\",({a}-{b})/{b}))"
+    # --- quarter differences (%Diff) ---
+    for i in range(1, len(q_sums_present)):
+        q = q_sums_present[i]; pq = q_sums_present[i-1]
+        cd = col_index[f"Diff {q}"]
+        cp = col_index[f"%Diff {q}"]
+        cq = col_index[q]
+        pp = col_index[pq]
+        for r in range(first_data_row, last_data_row + 1):
+            a = ws.cell(r, cq).coordinate
+            b = ws.cell(r, pp).coordinate
+            ws.cell(r, cd).value = f"={a}-{b}"
+            ws.cell(r, cp).value = f"=IF(AND({a}=0,{b}=0),0,IF({b}=0,\"N/A\",({a}-{b})/{b}))"
 
     # YoY using hidden prior sheet + hidden KEY
     # --- Build prior qc frame with the same keys/columns (robust for Q3: no subquestion) ---
