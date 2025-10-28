@@ -46,6 +46,93 @@ ENTITY_COL = "Entity / Group"
 SUBQ_COL = "Subquestion"
 WC_COL = "Worker Category"
 
+# ========= NEW: VR config & helpers (ADD-ONLY; no change to your logic) =========
+VR_PATH  = "submission/vr_staging.xlsx"   # <-- put your VR consolidated file path here
+VR_SHEET = "Variance"
+_VR_MONTH_END = {"Q1":"Mar","Q2":"Jun","Q3":"Sep","Q4":"Dec"}
+VR_THRESHOLD_PCT = 25  # ±25% for "Required justification"
+
+@st.cache_data(ttl=3600)
+def _vr_load_variance(vr_path: str = VR_PATH, sheet_name: str = VR_SHEET) -> pd.DataFrame:
+    """Load VR Variance and build a JOIN_KEY."""
+    if not os.path.exists(vr_path):
+        return pd.DataFrame(columns=["JOIN_KEY","%Growth","Justification"])
+    df = pd.read_excel(vr_path, sheet_name=sheet_name)
+    if df.empty:
+        return pd.DataFrame(columns=["JOIN_KEY","%Growth","Justification"])
+    for c in ["Entity Name","Question","Subquestion","Worker Category","Month"]:
+        if c in df.columns:
+            df[c] = df[c].astype(str).str.strip().str.upper()
+        else:
+            df[c] = ""
+    df["JOIN_KEY"] = (
+        df["Entity Name"] + "|" +
+        df["Year"].astype(str) + "|" +
+        df["Month"] + "|" +
+        df["Question"] + "|" +
+        df["Subquestion"] + "|" +
+        df["Worker Category"]
+    )
+    # keep last per JOIN_KEY (latest)
+    keep = ["JOIN_KEY","%Growth","Justification","Year","Month"]
+    df = (df[keep]
+          .sort_values(["JOIN_KEY","Year","Month"])
+          .groupby("JOIN_KEY", as_index=False)
+          .tail(1))
+    return df[["JOIN_KEY","%Growth","Justification"]]
+
+def _vr_infer_year_month_from_period(period_label: str, default_year: int) -> tuple[int, str]:
+    """
+    Accepts: 'Mar 2025', '2025-Mar', 'Q2 2025', 'Q2' (uses default_year), '2025-Mar', 'Mar', '2025-Mar'
+    Returns: (year:int, month_abbr:'Jan'..'Dec')
+    """
+    s = str(period_label).strip()
+    # 2025-Mar or 2025-March
+    if "-" in s and s.split("-")[0].isdigit():
+        yr, mon = s.split("-")[0], s.split("-")[1][:3].title()
+        return int(yr), mon
+    # Mar 2025 or March 2025
+    parts = s.split()
+    if len(parts) == 2 and parts[1].isdigit():
+        return int(parts[1]), parts[0][:3].title()
+    # Qx 2025
+    if s.startswith("Q") and " " in s and s.split()[1].isdigit():
+        q, yr = s.split()
+        return int(yr), _VR_MONTH_END.get(q, "Mar")
+    # Qx (no year)
+    if s.startswith("Q") and s[:2] in _VR_MONTH_END:
+        return int(default_year), _VR_MONTH_END.get(s[:2], "Mar")
+    # YYYY-Mon was handled above; else just month string
+    if len(s) >= 3:
+        return int(default_year), s[:3].title()
+    return int(default_year), "Mar"
+
+def _vr_build_join_key(entity, year, month, question, subq, wc) -> str:
+    return (
+        str(entity).upper().strip() + "|" +
+        str(int(year)) + "|" +
+        str(month).upper().strip() + "|" +
+        str(question).upper().strip() + "|" +
+        str(subq).upper().strip() + "|" +
+        str(wc).upper().strip()
+    )
+
+def _vr_to_percent_number(x):
+    """Return numeric percent (e.g., '41%' -> 41.0, '41' -> 41.0, 0.41 -> 41.0)."""
+    if pd.isna(x): return np.nan
+    s = str(x).strip()
+    try:
+        if s.endswith("%"): return float(s[:-1])
+        v = float(s)
+        return v * 100 if 0 <= v <= 1 else v
+    except Exception:
+        return np.nan
+
+def _vr_is_blank_just(s):
+    if s is None: return True
+    t = str(s).strip().upper()
+    return t in {"", "-", "N/A"}
+
 # --- 1. Helper Functions (Preserved from your original code) ---
 @st.cache_data
 def load_data(year, sheet_name):
@@ -611,6 +698,64 @@ def main():
                 if not outlier_df.empty:
                     st.error("🚨 True Outlier(s) Detected!")
                     st.dataframe(outlier_df, use_container_width=True)
+
+                    # ===== NEW: VR merge for Interactive Analysis (MoM only) =====
+                    # Only meaningful in Monthly view (VR is MoM). For multi-year, Period looks like 'YYYY-MMM'.
+                    try:
+                        vr_df = _vr_load_variance()  # cached
+                        # Build JOIN_KEY for each outlier row
+                        keys = []
+                        for per in outlier_df.index.tolist():
+                            if enable_multi:
+                                # per like '2024-Mar'
+                                yr, mon = _vr_infer_year_month_from_period(per, default_year=current_year)
+                            else:
+                                # per like 'Jan'..'Dec' or 'Qx YYYY' (skip QoQ)
+                                if time_view == 'Monthly':
+                                    yr, mon = _vr_infer_year_month_from_period(per, default_year=current_year)
+                                else:
+                                    # Quarterly view: VR is MoM → skip
+                                    continue
+                            k = _vr_build_join_key(
+                                entity=entity,
+                                year=yr,
+                                month=mon,
+                                question=selected_question,
+                                subq=subquestion if subquestion else "N/A",
+                                wc=worker_cat
+                            )
+                            keys.append((per, k))
+
+                        if keys:
+                            out_vr = outlier_df.copy().reset_index()
+                            out_vr.rename(columns={"index":"Period"}, inplace=True)
+                            out_vr["JOIN_KEY"] = [k for (_, k) in keys]
+                            merged = out_vr.merge(vr_df, on="JOIN_KEY", how="left")
+
+                            # statuses
+                            merged["growth_pct_num"] = merged["%Growth"].apply(_vr_to_percent_number)
+                            merged["vr_submitted"]   = merged["%Growth"].notna() | merged["Justification"].notna()
+                            merged["breaches"]       = merged["growth_pct_num"].abs() >= VR_THRESHOLD_PCT
+
+                            def _status(r):
+                                if not r["vr_submitted"]:
+                                    return "⌛ Pending"
+                                if r["breaches"] and _vr_is_blank_just(r["Justification"]):
+                                    return "⚠️ Required justification"
+                                return "✅ Matched" if not _vr_is_blank_just(r["Justification"]) else "—"
+
+                            merged["Status"] = merged.apply(_status, axis=1)
+
+                            st.subheader("VR Justification (MoM) — Matched to Outliers")
+                            st.caption("Legend: ✅ Matched · ⚠️ Required justification · ⌛ Pending")
+                            st.dataframe(
+                                merged[["Period","Value","Reason(s)","%Growth","Status","Justification"]],
+                                use_container_width=True
+                            )
+                    except Exception as e:
+                        st.warning(f"VR merge skipped: {e}")
+                    # ===== END VR merge =====
+
                 else:
                     st.success("✅ No significant outliers detected.")
                 
@@ -797,6 +942,57 @@ def main():
                         mime="text/csv",
                         use_container_width=True
                     )
+
+                    # ===== NEW: Full Report with VR merge (Monthly MoM) =====
+                    try:
+                        vr_df = _vr_load_variance()  # cached
+                        fr = final_report.copy()
+
+                        # Build JOIN_KEY from Period (monthly or YYYY-MMM). Skip quarterly.
+                        def _fr_key(r):
+                            per = r.get("Period","")
+                            yr, mon = _vr_infer_year_month_from_period(per, default_year=current_year)
+                            return _vr_build_join_key(
+                                entity=r.get("Entity / Group",""),
+                                year=yr, month=mon,
+                                question=r.get("Question",""),
+                                subq=r.get("Subquestion","") or "N/A",
+                                wc=r.get("Worker Category","")
+                            )
+
+                        # Only consider Monthly view rows for VR (your generator uses 'Monthly' in View)
+                        fr_m = fr[fr["View"].astype(str).str.upper() == "MONTHLY"].copy()
+                        if not fr_m.empty:
+                            fr_m["JOIN_KEY"] = fr_m.apply(_fr_key, axis=1)
+                            fr_m = fr_m.merge(vr_df, on="JOIN_KEY", how="left")
+
+                            fr_m["growth_pct_num"] = fr_m["%Growth"].apply(_vr_to_percent_number)
+                            fr_m["vr_submitted"]   = fr_m["%Growth"].notna() | fr_m["Justification"].notna()
+                            fr_m["breaches"]       = fr_m["growth_pct_num"].abs() >= VR_THRESHOLD_PCT
+                            fr_m["Status"]         = fr_m.apply(
+                                lambda r: "⌛ Pending" if not r["vr_submitted"]
+                                else ("⚠️ Required justification" if r["breaches"] and _vr_is_blank_just(r["Justification"])
+                                      else ("✅ Matched" if not _vr_is_blank_just(r["Justification"]) else "—")),
+                                axis=1
+                            )
+
+                            st.subheader("Master Outlier Report (with VR)")
+                            st.caption("Legend: ✅ Matched · ⚠️ Required justification · ⌛ Pending")
+                            cols = ["Question","Entity / Group","Subquestion","Worker Category","View","Period","Value","Reason(s)","%Growth","Status","Justification"]
+                            show_cols = [c for c in cols if c in fr_m.columns]
+                            st.dataframe(fr_m[show_cols], use_container_width=True)
+
+                            csv_vr = fr_m[show_cols].to_csv(index=False).encode("utf-8")
+                            st.download_button(
+                                label="📥 Download Report (with VR)",
+                                data=csv_vr,
+                                file_name="master_outlier_report_with_vr.csv",
+                                mime="text/csv",
+                                use_container_width=True
+                            )
+                    except Exception as e:
+                        st.warning(f"VR merge skipped: {e}")
+                    # ===== END VR for full report =====
 
 if __name__ == "__main__":
     main()
