@@ -77,6 +77,109 @@ def qc_row_slice(df: pd.DataFrame, entity: str, wc: str, subq: str) -> pd.DataFr
         cond &= (df[SUBQ_COL] == subq)
     return df[cond]
 
+# -------------------- VR loader & matching helpers (NEW) --------------------
+def _norm(s) -> str:
+    return re.sub(r"\s+", " ", str(s).strip().lower())
+
+@st.cache_data
+def load_vr_variance(vr_path: str) -> pd.DataFrame | str:
+    """Load VR staging (sheet 'Variance') and normalize key columns."""
+    if not vr_path or not os.path.exists(vr_path):
+        return "PENDING"  # special marker to show 'Pending submission'
+    try:
+        df = pd.read_excel(vr_path, sheet_name="Variance")
+        needed = ["Entity Name","Year","Quarter","Month","Question","Subquestion","Worker Category","%Growth","Justification"]
+        missing = [c for c in needed if c not in df.columns]
+        if missing:
+            return f"VR file missing columns: {missing}"
+        # normalize helper cols
+        df["_ent"]  = df["Entity Name"].map(_norm)
+        df["_subq"] = df["Subquestion"].map(_norm)
+        df["_wc"]   = df["Worker Category"].map(_norm)
+        df["_qnum"] = df["Quarter"].astype(str).str.extract(r"(\d)").astype(float)
+        df["_month"]= df["Month"].astype(str).str[:3]  # Jan/Feb/...
+        return df
+    except Exception as e:
+        return f"Error reading VR file: {e}"
+
+def _question_code_from_dataset(dataset_key: str) -> str:
+    # 'Q1A: Employees' -> 'Q1A'
+    return dataset_key.split(":")[0].replace(" ", "")
+
+def find_vr_just_for_periods(
+    vr_df: pd.DataFrame | str,
+    dataset_key: str,
+    entity_name: str,
+    subq: str,
+    wc: str,
+    periods: List[str],  # e.g. ["2025-Feb", "2025-Mar"] or ["Q1 2025"]
+) -> str:
+    """Return concatenated justification(s) for given periods."""
+    if isinstance(vr_df, str):
+        # "PENDING" or error string
+        return "Pending submission" if vr_df == "PENDING" else vr_df
+
+    # prepare filters
+    qcode = _question_code_from_dataset(dataset_key)
+    ent_norm = _norm(entity_name)
+    subq_norm = _norm(subq)
+    wc_norm = _norm(wc)
+
+    justs = []
+
+    for p in periods:
+        # monthly label: "YYYY-Mmm"
+        if "-" in p and "Q" not in p:
+            yr_str, mon = p.split("-")
+            try:
+                yr = int(yr_str)
+            except:
+                continue
+            # derive quarter number for robustness
+            q_from_mon = {"Jan":1,"Feb":1,"Mar":1,"Apr":2,"May":2,"Jun":2,"Jul":3,"Aug":3,"Sep":3,"Oct":4,"Nov":4,"Dec":4}.get(mon, None)
+
+            sub = vr_df[
+                (vr_df["Year"] == yr) &
+                ((vr_df["_month"] == mon) | (vr_df["_qnum"] == q_from_mon)) &  # prefer month; fallback quarter match
+                (vr_df["Question"].astype(str).str.upper() == qcode.upper()) &
+                (vr_df["_ent"] == ent_norm) &
+                (vr_df["_wc"] == wc_norm)
+            ]
+            # Subquestion sometimes formatted slightly different; allow contains either way
+            if not subq_norm or subq_norm == _norm("N/A"):
+                pass
+            else:
+                sub = sub[(sub["_subq"] == subq_norm) | (sub["_subq"].str.contains(subq_norm, na=False)) | (subq_norm in sub["_subq"].unique())]
+
+        else:
+            # quarterly label: "Qx YYYY"
+            try:
+                qlab, yr_str = p.split()
+                qn = int(qlab[1:])
+                yr = int(yr_str)
+            except:
+                continue
+            sub = vr_df[
+                (vr_df["Year"] == yr) &
+                (vr_df["_qnum"] == qn) &
+                (vr_df["Question"].astype(str).str.upper() == qcode.upper()) &
+                (vr_df["_ent"] == ent_norm) &
+                (vr_df["_wc"] == wc_norm)
+            ]
+            if not subq_norm or subq_norm == _norm("N/A"):
+                pass
+            else:
+                sub = sub[(sub["_subq"] == subq_norm) | (sub["_subq"].str.contains(subq_norm, na=False)) | (subq_norm in sub["_subq"].unique())]
+
+        js = [j for j in sub["Justification"].astype(str).tolist() if str(j).strip()]
+        if js:
+            justs.append(" | ".join(sorted(set(js))))
+
+    if not justs:
+        return "—"
+    # collapse duplicates across multiple months
+    return " | ".join(sorted(set(justs)))
+
 # -------------------- Multi-year Series Builders --------------------
 def build_multi_year_monthly_series(
     entity: str, wc: str, subq: str, sheet_key: str,
@@ -265,7 +368,7 @@ def plot_dual_axis_with_outliers(
         yaxis=dict(title=left_title, side='left'),
         yaxis2=dict(
             title=right_title, overlaying='y', side='right', showgrid=False,
-            tickformat=".0f"  # already % units in trace hover; axis shows integers (±20, ±40 …)
+            tickformat=".0f"
         )
     )
     st.plotly_chart(fig, use_container_width=True)
@@ -295,7 +398,7 @@ def sidebar_controls():
     time_view = st.sidebar.radio("Frequency:", options=['Monthly','Quarterly'], horizontal=True)
     dataset = st.sidebar.selectbox("Dataset:", options=list(SHEET_MAP.keys()))
 
-    # --- Outlier focus window (NEW) ---
+    # Outlier focus window
     st.sidebar.markdown("---")
     st.sidebar.subheader("Outlier Focus")
     focus_mode = st.sidebar.radio(
@@ -314,6 +417,14 @@ def sidebar_controls():
         )
         focus_quarter = st.sidebar.selectbox("Focus Quarter:", options=[1, 2, 3, 4], index=0)
 
+    # VR staging file path (NEW)
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("VR Staging")
+    vr_path = st.sidebar.text_input(
+        "Full path to VR staging Excel (sheet 'Variance'):",
+        value="", placeholder=r"C:\...\VR_Consol_2025_Quarter1.xlsx"
+    )
+
     return {
         "current_year": int(current_year),
         "start_year": int(start_year),
@@ -328,6 +439,7 @@ def sidebar_controls():
         "focus_mode": focus_mode,
         "focus_year": int(focus_year) if focus_year is not None else None,
         "focus_quarter": int(focus_quarter) if focus_quarter is not None else None,
+        "vr_path": vr_path.strip()
     }
 
 # -------------------- Main Interactive View --------------------
@@ -338,7 +450,7 @@ def main_view():
     rq = get_reporting_quarter(cfg["current_year"])
     st.sidebar.info(f"Analyzing **{cfg['start_year']}–{cfg['end_year']}** (excl: {', '.join(map(str,cfg['exclude_years'])) or 'none'}) • Current workbook: **{cfg['current_year']} Q{rq}**")
 
-    # Decide which period's outliers to show (NEW)
+    # Decide which period's outliers to show
     if cfg["focus_mode"] == "Current quarter":
         focus_q = rq
         focus_year = cfg["current_year"]
@@ -348,7 +460,7 @@ def main_view():
     focus_month_labels = set([f"{focus_year}-{m}" for m in months_for_q(focus_q)])
     focus_quarter_label = f"Q{focus_q} {focus_year}"
 
-    # Badge (NEW)
+    # Badge
     month_str = "–".join(months_for_q(focus_q))
     st.markdown(f'<div class="badge">Outlier focus: <b>Q{focus_q} {focus_year}</b> <span style="opacity:.7">({month_str})</span></div>', unsafe_allow_html=True)
 
@@ -377,6 +489,9 @@ def main_view():
 
     st.caption(f"Displaying: {entity} | {subq} | {wc}")
 
+    # Load VR (once)
+    vr_df = load_vr_variance(cfg["vr_path"])
+
     # Build multi-year series
     if cfg["time_view"] == "Monthly":
         series, yoy_series = build_multi_year_monthly_series(
@@ -390,11 +505,36 @@ def main_view():
         # Detection on full multi-year series
         out_all = find_outliers_v2(series, yoy_series, cfg["mom_pct"], cfg["abs_cut"], cfg["iqr_k"], cfg["yoy_pct"])
 
-        # Focus markers: selected quarter (default = current quarter)  (NEW)
+        # Focus markers: selected quarter (default = current quarter)
         out_focus = out_all.loc[out_all.index.intersection(focus_month_labels)]
 
-        # Growth line (%MoM), rounded like VR for display (unchanged)
-        growth_pct = (series.pct_change() * 100).round()  # integers like +41, -8, …
+        # Add FI Justification (NEW)
+        if not out_focus.empty:
+            periods_list = out_focus.index.tolist()
+            just = find_vr_just_for_periods(
+                vr_df=vr_df,
+                dataset_key=cfg["dataset"],
+                entity_name=entity,
+                subq=subq,
+                wc=wc,
+                periods=periods_list
+            )
+            # If multiple rows (multiple months), map per row:
+            per_row_just = []
+            if isinstance(vr_df, str):
+                # pending / error for all rows
+                per_row_just = [just] * len(out_focus)
+            else:
+                # compute month-by-month
+                for p in periods_list:
+                    per_row_just.append(find_vr_just_for_periods(vr_df, cfg["dataset"], entity, subq, wc, [p]))
+            out_focus = out_focus.copy()
+            out_focus["FI Justification"] = per_row_just
+
+        # Growth line (%MoM), rounded like VR for display
+        growth_pct = series.pct_change()
+        growth_pct = growth_pct.replace([np.inf, -np.inf], np.nan)
+        growth_pct = (growth_pct * 100).round().fillna(0)
         plot_dual_axis_with_outliers(
             series=series,
             growth_pct=growth_pct,
@@ -414,11 +554,35 @@ def main_view():
         # Detection on full multi-year series
         out_all = find_outliers_v2(series, yoy_series, cfg["mom_pct"], cfg["abs_cut"], cfg["iqr_k"], cfg["yoy_pct"])
 
-        # Focus markers: selected quarter (default = current quarter) (NEW)
+        # Focus markers: selected quarter (default = current quarter)
         out_focus = out_all.loc[out_all.index.intersection({focus_quarter_label})]
 
+        # Add FI Justification (NEW) — use all months within that quarter
+        if not out_focus.empty:
+            q_months = [f"{focus_year}-{m}" for m in months_for_q(int(focus_quarter_label.split()[0][1:]))]
+            # But ensure year inside label is used
+            qy = int(focus_quarter_label.split()[1])
+            qn = int(focus_quarter_label.split()[0][1:])
+            q_months = [f"{qy}-{m}" for m in months_for_q(qn)]
+            per_row_just = []
+            for _ in out_focus.index.tolist():  # usually single row
+                per_row_just.append(
+                    find_vr_just_for_periods(
+                        vr_df=vr_df,
+                        dataset_key=cfg["dataset"],
+                        entity_name=entity,
+                        subq=subq,
+                        wc=wc,
+                        periods=q_months
+                    )
+                )
+            out_focus = out_focus.copy()
+            out_focus["FI Justification"] = per_row_just
+
         # %QoQ growth line (same logic)
-        growth_pct = (series.pct_change() * 100).round()
+        growth_pct = series.pct_change()
+        growth_pct = growth_pct.replace([np.inf, -np.inf], np.nan)
+        growth_pct = (growth_pct * 100).round().fillna(0)
         plot_dual_axis_with_outliers(
             series=series,
             growth_pct=growth_pct,
