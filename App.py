@@ -15,6 +15,11 @@ st.markdown("""
 .stApp { background-color:#F0F2F6; }
 .stMetric { border-radius:10px;padding:20px;background:#FFF;border:1px solid #E0E0E0;box-shadow:0 4px 6px rgba(0,0,0,0.04); }
 .stButton>button { border-radius:8px;font-weight:600; }
+.badge {
+  display:inline-block; padding:4px 10px; border-radius:12px;
+  background:#EEF5FF; border:1px solid #CFE2FF; color:#003366; font-weight:600;
+  margin: 6px 0 10px 0;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -290,6 +295,25 @@ def sidebar_controls():
     time_view = st.sidebar.radio("Frequency:", options=['Monthly','Quarterly'], horizontal=True)
     dataset = st.sidebar.selectbox("Dataset:", options=list(SHEET_MAP.keys()))
 
+    # --- Outlier focus window (NEW) ---
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Outlier Focus")
+    focus_mode = st.sidebar.radio(
+        "Show outliers for:",
+        options=["Current quarter", "Pick year & quarter"],
+        index=0,
+        horizontal=False
+    )
+    focus_year = None
+    focus_quarter = None
+    if focus_mode == "Pick year & quarter":
+        focus_year = st.sidebar.selectbox(
+            "Focus Year:",
+            options=list(range(start_year, end_year + 1)),
+            index=list(range(start_year, end_year + 1)).index(min(end_year, int(current_year)))
+        )
+        focus_quarter = st.sidebar.selectbox("Focus Quarter:", options=[1, 2, 3, 4], index=0)
+
     return {
         "current_year": int(current_year),
         "start_year": int(start_year),
@@ -300,7 +324,10 @@ def sidebar_controls():
         "iqr_k": float(iqr_k),
         "yoy_pct": float(yoy_pct),
         "time_view": time_view,
-        "dataset": dataset
+        "dataset": dataset,
+        "focus_mode": focus_mode,
+        "focus_year": int(focus_year) if focus_year is not None else None,
+        "focus_quarter": int(focus_quarter) if focus_quarter is not None else None,
     }
 
 # -------------------- Main Interactive View --------------------
@@ -310,6 +337,20 @@ def main_view():
     cfg = sidebar_controls()
     rq = get_reporting_quarter(cfg["current_year"])
     st.sidebar.info(f"Analyzing **{cfg['start_year']}–{cfg['end_year']}** (excl: {', '.join(map(str,cfg['exclude_years'])) or 'none'}) • Current workbook: **{cfg['current_year']} Q{rq}**")
+
+    # Decide which period's outliers to show (NEW)
+    if cfg["focus_mode"] == "Current quarter":
+        focus_q = rq
+        focus_year = cfg["current_year"]
+    else:
+        focus_q = cfg["focus_quarter"] or rq
+        focus_year = cfg["focus_year"] or cfg["current_year"]
+    focus_month_labels = set([f"{focus_year}-{m}" for m in months_for_q(focus_q)])
+    focus_quarter_label = f"Q{focus_q} {focus_year}"
+
+    # Badge (NEW)
+    month_str = "–".join(months_for_q(focus_q))
+    st.markdown(f'<div class="badge">Outlier focus: <b>Q{focus_q} {focus_year}</b> <span style="opacity:.7">({month_str})</span></div>', unsafe_allow_html=True)
 
     df_cur = load_qc_sheet(cfg["current_year"], SHEET_MAP[cfg["dataset"]])
     if isinstance(df_cur, str):
@@ -349,11 +390,10 @@ def main_view():
         # Detection on full multi-year series
         out_all = find_outliers_v2(series, yoy_series, cfg["mom_pct"], cfg["abs_cut"], cfg["iqr_k"], cfg["yoy_pct"])
 
-        # Focus markers: current quarter only (from current year's workbook)
-        focus_labels = set(current_q_month_labels(cfg["current_year"], rq))
-        out_focus = out_all.loc[out_all.index.intersection(focus_labels)]
+        # Focus markers: selected quarter (default = current quarter)  (NEW)
+        out_focus = out_all.loc[out_all.index.intersection(focus_month_labels)]
 
-        # Growth line (%MoM), rounded like VR for display
+        # Growth line (%MoM), rounded like VR for display (unchanged)
         growth_pct = (series.pct_change() * 100).round()  # integers like +41, -8, …
         plot_dual_axis_with_outliers(
             series=series,
@@ -374,9 +414,8 @@ def main_view():
         # Detection on full multi-year series
         out_all = find_outliers_v2(series, yoy_series, cfg["mom_pct"], cfg["abs_cut"], cfg["iqr_k"], cfg["yoy_pct"])
 
-        # Focus markers: current quarter only (Q{rq} current_year)
-        focus_label = f"Q{rq} {cfg['current_year']}"
-        out_focus = out_all.loc[out_all.index.intersection({focus_label})]
+        # Focus markers: selected quarter (default = current quarter) (NEW)
+        out_focus = out_all.loc[out_all.index.intersection({focus_quarter_label})]
 
         # %QoQ growth line (same logic)
         growth_pct = (series.pct_change() * 100).round()
@@ -404,5 +443,3 @@ def main_view():
 # -------------------- Run --------------------
 if __name__ == "__main__":
     main_view()
-
-
