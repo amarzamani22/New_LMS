@@ -1,4 +1,3 @@
-# App.py — Multi-year outlier detection with dual-axis chart and current-quarter focus
 import os
 import re
 from typing import Dict, List, Optional, Tuple
@@ -36,7 +35,7 @@ ROLLUP_KEY = "All Financial Institutions"
 # -------------------- Data Access --------------------
 @st.cache_data
 def load_qc_sheet(year: int, sheet_name: str) -> pd.DataFrame | str:
-    path = f"submission/qc_workbook_{year}.xlsx"
+    path = fr"C:\Users\ttamarz\OneDrive - Bank Negara Malaysia\RLMS\Output\QC Template\qc_workbook_{year}.xlsx"
     if not os.path.exists(path):
         return f"Error: File not found → {path}"
     try:
@@ -50,7 +49,7 @@ def load_qc_sheet(year: int, sheet_name: str) -> pd.DataFrame | str:
 @st.cache_data
 def get_reporting_quarter(year: int) -> int:
     """Read _About sheet to know the current quarter in that workbook."""
-    path = f"submission/qc_workbook_{year}.xlsx"
+    path = fr"C:\Users\ttamarz\OneDrive - Bank Negara Malaysia\RLMS\Output\QC Template\qc_workbook_{year}.xlsx"
     try:
         about = pd.read_excel(path, sheet_name="_About", header=None)
         row = about[about[0] == "Quarter"]
@@ -148,67 +147,68 @@ def build_multi_year_quarterly_series(
     yoy_series = pd.Series(yoy_vals, index=yoy_idx, dtype=float) if yoy_idx else None
     return series, yoy_series
 
-# -------------------- Outlier Engine (Gate → Significance) --------------------
+# -------------------- Outlier Engine --------------------
 def find_outliers_v2(
     series: pd.Series,
     yoy_series: Optional[pd.Series],
-    pct_thresh: float,      # gate
-    abs_cutoff: float,      # significance option 1
-    iqr_k: float,           # significance option 2
-    yoy_thresh: float       # significance option 3
+    pct_thresh: float,      # MoM % threshold
+    abs_cutoff: float,      # absolute change threshold
+    iqr_k: float,           # IQR multiplier
+    yoy_thresh: float       # YoY % threshold
 ) -> pd.DataFrame:
     """
-    Gate: |MoM| >= pct_thresh (and prev != 0)
-    Significant if Gate AND (|Δ| >= abs_cutoff OR IQR anomaly OR |YoY| >= yoy_thresh)
-    MoM in reasons rounded like VR (+41%).
+    Outlier logic:
+    1. High MoM% if |MoM| >= pct_thresh AND |Δ| >= abs_cutoff
+    2. Outlier flagged only if (High MoM%) AND (YoY >= yoy_thresh OR IQR anomaly)
+    Reasons include High MoM%, High YoY%, IQR Detect Outlier.
     """
+
     out = []
     clean = series.dropna()
     if clean.size < 2:
-        return pd.DataFrame(columns=["Period","Value","Reason(s)"]).set_index("Period")
+        return pd.DataFrame(columns=["Period", "Value", "Statistical Reasons"]).set_index("Period")
 
-    # IQR from whole series (trend-aware)
+    # Compute IQR bounds
     q1, q3 = clean.quantile(0.25), clean.quantile(0.75)
     iqr = q3 - q1
-    lb, ub = ((q1 - iqr_k*iqr, q3 + iqr_k*iqr) if iqr > 0 else (None, None))
+    lb, ub = ((q1 - iqr_k * iqr, q3 + iqr_k * iqr) if iqr > 0 else (None, None))
 
     for i, (period, cur) in enumerate(series.items()):
         if pd.isna(cur) or i == 0:
             continue
-        prev = series.iloc[i-1]
+        prev = series.iloc[i - 1]
         if pd.isna(prev) or prev == 0:
             continue
 
         abs_chg = cur - prev
         mom = abs_chg / prev
 
-        # --- Gate ---
-        if abs(mom) < pct_thresh:
-            continue
+        # Step 1: High MoM check
+        if abs(mom) >= pct_thresh and abs(abs_chg) >= abs_cutoff:
+            reasons = [f"High MoM% ({mom:+.0%})"]
+            extra_reason = False
+            # Step 2: Additional significance
+            if iqr > 0 and (cur < lb or cur > ub):
+                reasons.append("IQR Detect Outlier")
+                extra_reason = True
 
-        # --- Significance tests ---
-        reasons = [f"High Volatility ({mom:+.0%})"]  # rounded like VR
-        significant = False
+            if yoy_series is not None and period in yoy_series.index:
+                py = yoy_series.get(period)
+                if not pd.isna(py) and py != 0:
+                    yoy = (cur - py) / py
+                    if abs(yoy) >= yoy_thresh:
+                        reasons.append(f"High YoY% ({yoy:+.0%})")
+                        extra_reason = True
 
-        if abs(abs_chg) >= abs_cutoff:
-            significant = True
+            # Only flag if extra_reason is True
+            if extra_reason:
+                out.append({
+                    "Period": period,
+                    "Value": f"{cur:,.2f}",
+                    "Statistical Reasons": ", ".join(reasons)
+                })
 
-        if iqr > 0 and (cur < lb or cur > ub):
-            significant = True
-            reasons.append("IQR Anomaly")
-
-        if yoy_series is not None and period in yoy_series.index:
-            py = yoy_series.get(period)
-            if not pd.isna(py) and py != 0:
-                yoy = (cur - py) / py
-                if abs(yoy) >= yoy_thresh:
-                    significant = True
-                    reasons.append(f"YoY Anomaly ({yoy:+.0%})")  # rounded too
-
-        if significant:
-            out.append({"Period": period, "Value": f"{cur:,.2f}", "Reason(s)": ", ".join(reasons)})
-
-    return pd.DataFrame(out).set_index("Period") if out else pd.DataFrame(columns=["Period","Value","Reason(s)"]).set_index("Period")
+    return pd.DataFrame(out).set_index("Period") if out else pd.DataFrame(columns=["Period", "Value", "Statistical Reasons"]).set_index("Period")
 
 # -------------------- Chart (Dual-axis: Bar + Line + Outliers) --------------------
 def plot_dual_axis_with_outliers(
@@ -234,7 +234,7 @@ def plot_dual_axis_with_outliers(
     # Line for % growth (right axis)
     fig.add_trace(go.Scatter(
         x=x, y=g.values, name=right_title, yaxis="y2",
-        mode="lines+markers", line=dict(width=2, dash="dot"),
+        mode="lines+markers", line=dict(width=2, dash="dot", color="#003366"),
         hovertemplate='Period: %{x}<br>% Growth: %{y:+.0f}%<extra></extra>'
     ))
 
@@ -242,7 +242,7 @@ def plot_dual_axis_with_outliers(
     if not outliers_focus.empty:
         ox = [p for p in outliers_focus.index if p in series.index]
         oy = [series[p] for p in ox]
-        oreason = [outliers_focus.loc[p, "Reason(s)"] for p in ox]
+        oreason = [outliers_focus.loc[p, "Statistical Reasons"] for p in ox]
         fig.add_trace(go.Scatter(
             x=ox, y=oy, mode='markers', name='True Outlier',
             yaxis="y1",
@@ -391,8 +391,8 @@ def main_view():
     # Metrics & Table
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("Latest Value", f"{series.iloc[-1]:,.0f}")
-    c2.metric("Average (window)", f"{series.mean():,.0f}")
-    c3.metric("High (window)", f"{np.nanmax(series):,.0f}")
+    c2.metric("Average", f"{series.mean():,.0f}")
+    c3.metric("Highest Value", f"{np.nanmax(series):,.0f}")
     c4.metric("Current-Q Outliers", len(out_focus))
 
     if not out_focus.empty:
@@ -404,3 +404,5 @@ def main_view():
 # -------------------- Run --------------------
 if __name__ == "__main__":
     main_view()
+
+
