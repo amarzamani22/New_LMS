@@ -128,63 +128,62 @@ def find_vr_just_for_periods(
     justs = []
 
     for p in periods:
-       # monthly label: "YYYY-Mmm"
-       if "-" in p and "Q" not in p:
-           yr_str, mon = p.split("-")
-           try:
-               yr = int(yr_str)
-           except:
-               continue
-           # 1) STRICT month match first
-           sub = vr_df[
-               (vr_df["Year"] == yr) &
-               (vr_df["_month"] == mon) &  # <-- strict month only
-               (vr_df["Question"].astype(str).str.upper() == qcode.upper()) &
-               (vr_df["_ent"] == ent_norm) &
-               (vr_df["_wc"] == wc_norm)
-           ]
-           if subq_norm and subq_norm != _norm("N/A"):
-               sub = sub[sub["_subq"] == subq_norm]  # exact after normalization
-           # 2) Optional fallback: if no exact month row exists, try same-quarter rows
-           if sub.empty:
-               q_from_mon = {"Jan":1,"Feb":1,"Mar":1,"Apr":2,"May":2,"Jun":2,
-                             "Jul":3,"Aug":3,"Sep":3,"Oct":4,"Nov":4,"Dec":4}.get(mon, None)
-               if q_from_mon is not None:
-                   sub = vr_df[
-                       (vr_df["Year"] == yr) &
-                       (vr_df["_qnum"] == q_from_mon) &
-                       (vr_df["Question"].astype(str).str.upper() == qcode.upper()) &
-                       (vr_df["_ent"] == ent_norm) &
-                       (vr_df["_wc"] == wc_norm)
-                   ]
-                   if subq_norm and subq_norm != _norm("N/A"):
-                       sub = sub[sub["_subq"] == subq_norm]
-       else:
-           # quarterly label: "Qx YYYY" (unchanged)
-           try:
-               qlab, yr_str = p.split()
-               qn = int(qlab[1:])
-               yr = int(yr_str)
-           except:
-               continue
-           sub = vr_df[
-               (vr_df["Year"] == yr) &
-               (vr_df["_qnum"] == qn) &
-               (vr_df["Question"].astype(str).str.upper() == qcode.upper()) &
-               (vr_df["_ent"] == ent_norm) &
-               (vr_df["_wc"] == wc_norm)
-           ]
-           if subq_norm and subq_norm != _norm("N/A"):
-               sub = sub[sub["_subq"] == subq_norm]
-       # collect clean justifications
-       js = [j for j in sub["Justification"].astype(str).tolist()
-             if str(j).strip() and str(j).strip().lower() != "nan"]
-       if js:
-           justs.append(" | ".join(sorted(set(js))))
+        # monthly label: "YYYY-Mmm"
+        if "-" in p and "Q" not in p:
+            yr_str, mon = p.split("-")
+            try:
+                yr = int(yr_str)
+            except:
+                continue
+            # 1) STRICT month match first
+            sub = vr_df[
+                (vr_df["Year"] == yr) &
+                (vr_df["_month"] == mon) &
+                (vr_df["Question"].astype(str).str.upper() == qcode.upper()) &
+                (vr_df["_ent"] == ent_norm) &
+                (vr_df["_wc"] == wc_norm)
+            ]
+            if subq_norm and subq_norm != _norm("N/A"):
+                sub = sub[sub["_subq"] == subq_norm]
+            # 2) Fallback to quarter if no exact month
+            if sub.empty:
+                q_from_mon = {"Jan":1,"Feb":1,"Mar":1,"Apr":2,"May":2,"Jun":2,
+                              "Jul":3,"Aug":3,"Sep":3,"Oct":4,"Nov":4,"Dec":4}.get(mon, None)
+                if q_from_mon is not None:
+                    sub = vr_df[
+                        (vr_df["Year"] == yr) &
+                        (vr_df["_qnum"] == q_from_mon) &
+                        (vr_df["Question"].astype(str).str.upper() == qcode.upper()) &
+                        (vr_df["_ent"] == ent_norm) &
+                        (vr_df["_wc"] == wc_norm)
+                    ]
+                    if subq_norm and subq_norm != _norm("N/A"):
+                        sub = sub[sub["_subq"] == subq_norm]
+        else:
+            # quarterly label: "Qx YYYY"
+            try:
+                qlab, yr_str = p.split()
+                qn = int(qlab[1:])
+                yr = int(yr_str)
+            except:
+                continue
+            sub = vr_df[
+                (vr_df["Year"] == yr) &
+                (vr_df["_qnum"] == qn) &
+                (vr_df["Question"].astype(str).str.upper() == qcode.upper()) &
+                (vr_df["_ent"] == ent_norm) &
+                (vr_df["_wc"] == wc_norm)
+            ]
+            if subq_norm and subq_norm != _norm("N/A"):
+                sub = sub[sub["_subq"] == subq_norm]
+
+        js = [j for j in sub["Justification"].astype(str).tolist()
+              if str(j).strip() and str(j).strip().lower() != "nan"]
+        if js:
+            justs.append(" | ".join(sorted(set(js))))
 
     if not justs:
         return "—"
-    # collapse duplicates across multiple months
     return " | ".join(sorted(set(justs)))
 
 # -------------------- Multi-year Series Builders --------------------
@@ -477,23 +476,23 @@ def main_view():
         return
     
     # --- Normalize entity / subquestion / worker category casing ---
-    def _norm(s: str) -> str:
+    def _norm_local(s: str) -> str:
         return re.sub(r"\s+", " ", str(s).strip()).casefold()
     def _canonical(series: pd.Series) -> pd.Series:
         tmp = series.dropna().astype(str)
-        norm = tmp.map(_norm)
+        norm = tmp.map(_norm_local)
         canon_map = (
             pd.DataFrame({"orig": tmp, "norm": norm})
             .groupby("norm")["orig"]
             .agg(lambda s: s.value_counts().idxmax())
         )
         return norm.map(canon_map)
-    df_cur["_ent_norm"]  = df_cur[ENTITY_COL].map(_norm)
+    df_cur["_ent_norm"]  = df_cur[ENTITY_COL].map(_norm_local)
     df_cur["_ent_disp"]  = _canonical(df_cur[ENTITY_COL])
     if SUBQ_COL in df_cur.columns:
-        df_cur["_subq_norm"] = df_cur[SUBQ_COL].map(_norm)
+        df_cur["_subq_norm"] = df_cur[SUBQ_COL].map(_norm_local)
         df_cur["_subq_disp"] = _canonical(df_cur[SUBQ_COL])
-    df_cur["_wc_norm"]   = df_cur[WC_COL].map(_norm)
+    df_cur["_wc_norm"]   = df_cur[WC_COL].map(_norm_local)
     df_cur["_wc_disp"]   = _canonical(df_cur[WC_COL])
 
     # Entity/Subquestion/Worker Category selection
@@ -501,13 +500,13 @@ def main_view():
     entity_options = sorted(df_cur["_ent_disp"].dropna().unique().tolist())
     entity_disp = st.selectbox("Entity / Group:", options=entity_options,
         index=entity_options.index(ROLLUP_KEY) if ROLLUP_KEY in entity_options else 0)
-    entity_norm = _norm(entity_disp)
+    entity_norm = _norm_local(entity_disp)
 
     if SUBQ_COL in df_cur.columns and \
         df_cur[df_cur["_ent_norm"]==entity_norm]["_subq_disp"].nunique() > 1:
         subq_options = sorted(df_cur.loc[df_cur["_ent_norm"]==entity_norm, "_subq_disp"].dropna().unique().tolist())
         subq_disp = st.selectbox("Subquestion:", options=subq_options, index=0)
-        subq_norm = _norm(subq_disp)
+        subq_norm = _norm_local(subq_disp)
 
         wc_options = sorted(
             df_cur.loc[
@@ -517,24 +516,27 @@ def main_view():
         )
 
         wc_disp = st.selectbox("Worker Category:", options=wc_options, index=0)
-        wc_norm = _norm(wc_disp)
+        wc_norm = _norm_local(wc_disp)
         data_row = df_cur[
             (df_cur["_ent_norm"]==entity_norm) &
             (df_cur["_subq_norm"]==subq_norm) &
             (df_cur["_wc_norm"]==wc_norm)
         ]
     else:
-        subq_disp = "N/A"; subq_norm = _norm(subq_disp)
+        subq_disp = "N/A"; subq_norm = _norm_local(subq_disp)
         wc_options = sorted(
             df_cur.loc[df_cur["_ent_norm"]==entity_norm, "_wc_disp"].dropna().unique().tolist()
         )
         wc_disp = st.selectbox("Worker Category:", options=wc_options, index=0)
-        wc_norm = _norm(wc_disp)
+        wc_norm = _norm_local(wc_disp)
         data_row = df_cur[
             (df_cur["_ent_norm"]==entity_norm) &
             (df_cur["_wc_norm"]==wc_norm)
         ]
     st.caption(f"Displaying: {entity_disp} | {subq_disp} | {wc_disp}")
+
+    # >>> keep original variable names so the rest of the app works unchanged
+    entity, subq, wc = entity_disp, subq_disp, wc_disp
 
     # Load VR (once)
     vr_df = load_vr_variance(cfg["vr_path"])
@@ -606,8 +608,6 @@ def main_view():
 
         # Add FI Justification (NEW) — use all months within that quarter
         if not out_focus.empty:
-            q_months = [f"{focus_year}-{m}" for m in months_for_q(int(focus_quarter_label.split()[0][1:]))]
-            # But ensure year inside label is used
             qy = int(focus_quarter_label.split()[1])
             qn = int(focus_quarter_label.split()[0][1:])
             q_months = [f"{qy}-{m}" for m in months_for_q(qn)]
