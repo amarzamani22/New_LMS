@@ -128,62 +128,63 @@ def find_vr_just_for_periods(
     justs = []
 
     for p in periods:
-        # monthly label: "YYYY-Mmm"
-        if "-" in p and "Q" not in p:
-            yr_str, mon = p.split("-")
-            try:
-                yr = int(yr_str)
-            except:
-                continue
-            # 1) STRICT month match first
-            sub = vr_df[
-                (vr_df["Year"] == yr) &
-                (vr_df["_month"] == mon) &
-                (vr_df["Question"].astype(str).str.upper() == qcode.upper()) &
-                (vr_df["_ent"] == ent_norm) &
-                (vr_df["_wc"] == wc_norm)
-            ]
-            if subq_norm and subq_norm != _norm("N/A"):
-                sub = sub[sub["_subq"] == subq_norm]
-            # 2) Fallback to quarter if no exact month
-            if sub.empty:
-                q_from_mon = {"Jan":1,"Feb":1,"Mar":1,"Apr":2,"May":2,"Jun":2,
-                              "Jul":3,"Aug":3,"Sep":3,"Oct":4,"Nov":4,"Dec":4}.get(mon, None)
-                if q_from_mon is not None:
-                    sub = vr_df[
-                        (vr_df["Year"] == yr) &
-                        (vr_df["_qnum"] == q_from_mon) &
-                        (vr_df["Question"].astype(str).str.upper() == qcode.upper()) &
-                        (vr_df["_ent"] == ent_norm) &
-                        (vr_df["_wc"] == wc_norm)
-                    ]
-                    if subq_norm and subq_norm != _norm("N/A"):
-                        sub = sub[sub["_subq"] == subq_norm]
-        else:
-            # quarterly label: "Qx YYYY"
-            try:
-                qlab, yr_str = p.split()
-                qn = int(qlab[1:])
-                yr = int(yr_str)
-            except:
-                continue
-            sub = vr_df[
-                (vr_df["Year"] == yr) &
-                (vr_df["_qnum"] == qn) &
-                (vr_df["Question"].astype(str).str.upper() == qcode.upper()) &
-                (vr_df["_ent"] == ent_norm) &
-                (vr_df["_wc"] == wc_norm)
-            ]
-            if subq_norm and subq_norm != _norm("N/A"):
-                sub = sub[sub["_subq"] == subq_norm]
-
-        js = [j for j in sub["Justification"].astype(str).tolist()
-              if str(j).strip() and str(j).strip().lower() != "nan"]
-        if js:
-            justs.append(" | ".join(sorted(set(js))))
+       # monthly label: "YYYY-Mmm"
+       if "-" in p and "Q" not in p:
+           yr_str, mon = p.split("-")
+           try:
+               yr = int(yr_str)
+           except:
+               continue
+           # 1) STRICT month match first
+           sub = vr_df[
+               (vr_df["Year"] == yr) &
+               (vr_df["_month"] == mon) &  # <-- strict month only
+               (vr_df["Question"].astype(str).str.upper() == qcode.upper()) &
+               (vr_df["_ent"] == ent_norm) &
+               (vr_df["_wc"] == wc_norm)
+           ]
+           if subq_norm and subq_norm != _norm("N/A"):
+               sub = sub[sub["_subq"] == subq_norm]  # exact after normalization
+           # 2) Optional fallback: if no exact month row exists, try same-quarter rows
+           if sub.empty:
+               q_from_mon = {"Jan":1,"Feb":1,"Mar":1,"Apr":2,"May":2,"Jun":2,
+                             "Jul":3,"Aug":3,"Sep":3,"Oct":4,"Nov":4,"Dec":4}.get(mon, None)
+               if q_from_mon is not None:
+                   sub = vr_df[
+                       (vr_df["Year"] == yr) &
+                       (vr_df["_qnum"] == q_from_mon) &
+                       (vr_df["Question"].astype(str).str.upper() == qcode.upper()) &
+                       (vr_df["_ent"] == ent_norm) &
+                       (vr_df["_wc"] == wc_norm)
+                   ]
+                   if subq_norm and subq_norm != _norm("N/A"):
+                       sub = sub[sub["_subq"] == subq_norm]
+       else:
+           # quarterly label: "Qx YYYY" (unchanged)
+           try:
+               qlab, yr_str = p.split()
+               qn = int(qlab[1:])
+               yr = int(yr_str)
+           except:
+               continue
+           sub = vr_df[
+               (vr_df["Year"] == yr) &
+               (vr_df["_qnum"] == qn) &
+               (vr_df["Question"].astype(str).str.upper() == qcode.upper()) &
+               (vr_df["_ent"] == ent_norm) &
+               (vr_df["_wc"] == wc_norm)
+           ]
+           if subq_norm and subq_norm != _norm("N/A"):
+               sub = sub[sub["_subq"] == subq_norm]
+       # collect clean justifications
+       js = [j for j in sub["Justification"].astype(str).tolist()
+             if str(j).strip() and str(j).strip().lower() != "nan"]
+       if js:
+           justs.append(" | ".join(sorted(set(js))))
 
     if not justs:
         return "—"
+    # collapse duplicates across multiple months
     return " | ".join(sorted(set(justs)))
 
 # -------------------- Multi-year Series Builders --------------------
@@ -352,16 +353,17 @@ def plot_dual_axis_with_outliers(
         hovertemplate='Period: %{x}<br>% Growth: %{y:+.0f}%<extra></extra>'
     ))
 
-    # Outlier markers (red X) over the bars (left axis)
+    # Outlier markers (red X) on the MoM line (right axis)
     if not outliers_focus.empty:
         ox = [p for p in outliers_focus.index if p in series.index]
-        oy = [series[p] for p in ox]
+        # 'g' is the growth series aligned to 'series.index' earlier
+        oy = [float(g.loc[p]) for p in ox]  # % growth values for those periods
         oreason = [outliers_focus.loc[p, "Statistical Reasons"] for p in ox]
+
         fig.add_trace(go.Scatter(
-            x=ox, y=oy, mode='markers', name='True Outlier',
-            yaxis="y1",
+            x=ox, y=oy, mode='markers', name='True Outlier', yaxis="y2",
             marker=dict(symbol='x', size=14, color='red', line_width=2),
-            hovertemplate='Period: %{x}<br>Value: %{y:,.0f}<br>%{customdata}<extra></extra>',
+            hovertemplate='Period: %{x}<br>% Growth: %{y:+.0f}%<br>%{customdata}',
             customdata=oreason
         ))
 
@@ -476,67 +478,44 @@ def main_view():
         return
     
     # --- Normalize entity / subquestion / worker category casing ---
-    def _norm_local(s: str) -> str:
+    def _norm(s: str) -> str:
         return re.sub(r"\s+", " ", str(s).strip()).casefold()
     def _canonical(series: pd.Series) -> pd.Series:
         tmp = series.dropna().astype(str)
-        norm = tmp.map(_norm_local)
+        norm = tmp.map(_norm)
         canon_map = (
             pd.DataFrame({"orig": tmp, "norm": norm})
             .groupby("norm")["orig"]
             .agg(lambda s: s.value_counts().idxmax())
         )
         return norm.map(canon_map)
-    df_cur["_ent_norm"]  = df_cur[ENTITY_COL].map(_norm_local)
+    df_cur["_ent_norm"]  = df_cur[ENTITY_COL].map(_norm)
     df_cur["_ent_disp"]  = _canonical(df_cur[ENTITY_COL])
     if SUBQ_COL in df_cur.columns:
-        df_cur["_subq_norm"] = df_cur[SUBQ_COL].map(_norm_local)
+        df_cur["_subq_norm"] = df_cur[SUBQ_COL].map(_norm)
         df_cur["_subq_disp"] = _canonical(df_cur[SUBQ_COL])
-    df_cur["_wc_norm"]   = df_cur[WC_COL].map(_norm_local)
+    df_cur["_wc_norm"]   = df_cur[WC_COL].map(_norm)
     df_cur["_wc_disp"]   = _canonical(df_cur[WC_COL])
 
     # Entity/Subquestion/Worker Category selection
     st.header(f"Outlier Detection: {cfg['dataset']}")
-    entity_options = sorted(df_cur["_ent_disp"].dropna().unique().tolist())
-    entity_disp = st.selectbox("Entity / Group:", options=entity_options,
-        index=entity_options.index(ROLLUP_KEY) if ROLLUP_KEY in entity_options else 0)
-    entity_norm = _norm_local(entity_disp)
+    entity = st.selectbox("Entity / Group:", options=df_cur[ENTITY_COL].unique(),
+                          index=list(df_cur[ENTITY_COL].unique()).index(ROLLUP_KEY) if ROLLUP_KEY in df_cur[ENTITY_COL].unique() else 0)
 
-    if SUBQ_COL in df_cur.columns and \
-        df_cur[df_cur["_ent_norm"]==entity_norm]["_subq_disp"].nunique() > 1:
-        subq_options = sorted(df_cur.loc[df_cur["_ent_norm"]==entity_norm, "_subq_disp"].dropna().unique().tolist())
-        subq_disp = st.selectbox("Subquestion:", options=subq_options, index=0)
-        subq_norm = _norm_local(subq_disp)
-
-        wc_options = sorted(
-            df_cur.loc[
-                (df_cur["_ent_norm"]==entity_norm) & (df_cur["_subq_norm"]==subq_norm),
-                "_wc_disp"
-            ].dropna().unique().tolist()
-        )
-
-        wc_disp = st.selectbox("Worker Category:", options=wc_options, index=0)
-        wc_norm = _norm_local(wc_disp)
-        data_row = df_cur[
-            (df_cur["_ent_norm"]==entity_norm) &
-            (df_cur["_subq_norm"]==subq_norm) &
-            (df_cur["_wc_norm"]==wc_norm)
-        ]
+    if SUBQ_COL in df_cur.columns and df_cur[df_cur[ENTITY_COL]==entity][SUBQ_COL].nunique() > 1:
+        u_subq = df_cur[df_cur[ENTITY_COL]==entity][SUBQ_COL].unique()
+        subq_default = np.where(u_subq == 'Employment = A+B(i)+B(ii)')[0][0] if 'Employment = A+B(i)+B(ii)' in u_subq else 0
+        subq = st.selectbox("Subquestion:", options=u_subq, index=int(subq_default))
+        u_wc = df_cur[(df_cur[ENTITY_COL]==entity) & (df_cur[SUBQ_COL]==subq)][WC_COL].unique()
+        wc_default = np.where(u_wc == 'Total Employment')[0][0] if 'Total Employment' in u_wc else 0
+        wc = st.selectbox("Worker Category:", options=u_wc, index=int(wc_default))
     else:
-        subq_disp = "N/A"; subq_norm = _norm_local(subq_disp)
-        wc_options = sorted(
-            df_cur.loc[df_cur["_ent_norm"]==entity_norm, "_wc_disp"].dropna().unique().tolist()
-        )
-        wc_disp = st.selectbox("Worker Category:", options=wc_options, index=0)
-        wc_norm = _norm_local(wc_disp)
-        data_row = df_cur[
-            (df_cur["_ent_norm"]==entity_norm) &
-            (df_cur["_wc_norm"]==wc_norm)
-        ]
-    st.caption(f"Displaying: {entity_disp} | {subq_disp} | {wc_disp}")
+        subq = "N/A"
+        u_wc = df_cur[df_cur[ENTITY_COL]==entity][WC_COL].unique()
+        wc_default = np.where(u_wc == 'Total Employment')[0][0] if 'Total Employment' in u_wc else 0
+        wc = st.selectbox("Worker Category:", options=u_wc, index=int(wc_default))
 
-    # >>> keep original variable names so the rest of the app works unchanged
-    entity, subq, wc = entity_disp, subq_disp, wc_disp
+    st.caption(f"Displaying: {entity} | {subq} | {wc}")
 
     # Load VR (once)
     vr_df = load_vr_variance(cfg["vr_path"])
@@ -608,6 +587,8 @@ def main_view():
 
         # Add FI Justification (NEW) — use all months within that quarter
         if not out_focus.empty:
+            q_months = [f"{focus_year}-{m}" for m in months_for_q(int(focus_quarter_label.split()[0][1:]))]
+            # But ensure year inside label is used
             qy = int(focus_quarter_label.split()[1])
             qn = int(focus_quarter_label.split()[0][1:])
             q_months = [f"{qy}-{m}" for m in months_for_q(qn)]
