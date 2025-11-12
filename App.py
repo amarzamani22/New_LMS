@@ -1,3 +1,11 @@
+#----------------------------------------------------
+# LMS Analysis Dashboard (Streamlit)
+#----------------------------------------------------
+# 1)This code loads QC workbooks for the LMS
+# 2)Detects statistically significant outliers, and links them to Variance Report
+# 3)Show list of FI that contribute to the detected outliers
+#-----------------------------------------------------
+
 import os
 import re
 from typing import Dict, List, Optional, Tuple
@@ -7,11 +15,13 @@ import plotly.graph_objects as go
 import plotly.express as px
 import streamlit as st
 
-# -------------------- Page & Styles --------------------
+# ================ Page & Styles in CSS =================
 st.set_page_config(page_title="LMS Analysis Dashboard", page_icon="🏦", layout="wide")
 st.markdown("""""", unsafe_allow_html=True)
 
-# -------------------- Constants --------------------
+# ================ Constants / Configuration ================
+
+# Mapping datasets name to specific QC sheet names in Excel workbook
 SHEET_MAP: Dict[str, str] = {
     'Q1A: Employees': 'QC_Q1A_Main',
     'Q2A: Salary': 'QC_Q2A_Main',
@@ -20,10 +30,10 @@ SHEET_MAP: Dict[str, str] = {
     'Q5: Separations': 'QC_Q5'
 }
 ALL_MONTHS: List[str] = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
-ENTITY_COL = "Entity / Group"
-SUBQ_COL = "Subquestion"
-WC_COL = "Worker Category"
-ROLLUP_KEY = "All Financial Institutions"
+ENTITY_COL = "Entity / Group"                 #Column name used to identify entities or groups in QC sheet
+SUBQ_COL = "Subquestion"                      #Column name for subquestion (except for Question 3(Hours Worked))
+WC_COL = "Worker Category"                    #Column name for worker category
+ROLLUP_KEY = "All Financial Institutions"     #Roll-up label
 
 # ---- Minimal fallback hierarchy (used only if no CSV is provided) ----
 HIERARCHY_MAP: Dict[str, List[str]] = {
@@ -32,19 +42,28 @@ HIERARCHY_MAP: Dict[str, List[str]] = {
         "Commercial Banks", "Digital Banks", "Foreign Banks",
         "Islamic Banks", "Investment Banks", "International Islamic Banks"
     ],
-    "DFI": [],  # DFI will map directly to leaf entities when using real CSV
+    "DFI": [],  # Actual DFI list will come from CSV when available
     "Insurans/Takaful Operators": ["Insurers", "Takaful Operators"],
 }
 
-# -------------------- Data Access --------------------
+# ====================== Data Access (QC Workbook) ======================
 @st.cache_data
 def load_qc_sheet(year: int, sheet_name: str) -> pd.DataFrame | str:
+    #Load a QC sheet for a give year and sheet name
+    #Returns a DataFrame on success, or an error string on failure
+    #Caches results to avoid re-reading repeatedly
     path = fr"C:\Users\ttamarz\OneDrive - Bank Negara Malaysia\RLMS\Output\QC Template\qc_workbook_{year}.xlsx"
+
     if not os.path.exists(path):
         return f"Error: File not found → {path}"
     try:
+        # QC sheets have 5 header rows above the data header
         df = pd.read_excel(path, sheet_name=sheet_name, header=5)
+
+        # Remove empty columns
         df.dropna(axis=1, how='all', inplace=True)
+
+        # Normalize quarter total column names
         df.rename(columns={'Q1.1':'Q1_Total','Q2.1':'Q2_Total','Q3.1':'Q3_Total','Q4.1':'Q4_Total'}, inplace=True)
         return df
     except Exception as e:
@@ -52,37 +71,44 @@ def load_qc_sheet(year: int, sheet_name: str) -> pd.DataFrame | str:
 
 @st.cache_data
 def get_reporting_quarter(year: int) -> int:
-    """Read _About sheet to know the current quarter in that workbook."""
+
+    #Read _About sheet to know the current quarter in that workbook.
     path = fr"C:\Users\ttamarz\OneDrive - Bank Negara Malaysia\RLMS\Output\QC Template\qc_workbook_{year}.xlsx"
     try:
         about = pd.read_excel(path, sheet_name="_About", header=None)
         row = about[about[0] == "Quarter"]
         if not row.empty:
+            # Extract the integer form something like "Q2" or "Quarter: Q3"
             qn = int(re.search(r'\d+', str(row.iloc[0,1])).group())
             return max(1, min(4, qn))
     except Exception:
         pass
-    return 4
+    return 4 
 
 def months_for_q(q: int) -> List[str]:
+    # Return month labels for a given quarter number
     return {1:['Jan','Feb','Mar'], 2:['Apr','May','Jun'], 3:['Jul','Aug','Sep'], 4:['Oct','Nov','Dec']}[int(q)]
 
 def current_q_month_labels(current_year: int, reporting_q: int) -> List[str]:
+    #Return labels like '2025-Feb' for months in the current reporting quarter
     return [f"{current_year}-{m}" for m in months_for_q(reporting_q)]
 
 def qc_row_slice(df: pd.DataFrame, entity: str, wc: str, subq: str) -> pd.DataFrame:
+    #Return the row for a (Entity, Worker Category, Subquestion)
     cond = (df[ENTITY_COL] == entity) & (df[WC_COL] == wc)
     if SUBQ_COL in df.columns and subq != "N/A":
         cond &= (df[SUBQ_COL] == subq)
     return df[cond]
 
-# -------------------- VR loader & matching helpers --------------------
+# ================== VR loader & matching helpers (to fetch FI justifications) =====================
 def _norm(s) -> str:
+    # Normalize strings: trim, collapse spaces, lowercase
     return re.sub(r"\s+", " ", str(s).strip().lower())
 
 @st.cache_data
 def load_vr_variance(vr_path: str) -> pd.DataFrame | str:
-    """Load VR staging (sheet 'Variance') and normalize key columns."""
+    # Load the VR (staging) Excel and prepare helper columns for matching
+    # Returns DataFrame if available, 'PENDING' if path is blank/missing, or error message on failure
     if not vr_path or not os.path.exists(vr_path):
         return "PENDING"  # special marker to show 'Pending submission'
     try:
@@ -91,18 +117,21 @@ def load_vr_variance(vr_path: str) -> pd.DataFrame | str:
         missing = [c for c in needed if c not in df.columns]
         if missing:
             return f"VR file missing columns: {missing}"
-        # normalize helper cols
+        
+        # Normalize key matching columns
         df["_ent"] = df["Entity Name"].map(_norm)
         df["_subq"] = df["Subquestion"].map(_norm)
         df["_wc"] = df["Worker Category"].map(_norm)
+        # Extract quarter number as numeric from a value like "Q1" "Q2"
         df["_qnum"] = df["Quarter"].astype(str).str.extract(r"\((\d)\)").astype(float)
-        df["_month"]= df["Month"].astype(str).str[:3]  # Jan/Feb/...
+        # Normalize month to Jan/Feb/... (first 3 letters)
+        df["_month"]= df["Month"].astype(str).str[:3]
         return df
     except Exception as e:
         return f"Error reading VR file: {e}"
 
 def _question_code_from_dataset(dataset_key: str) -> str:
-    # 'Q1A: Employees' -> 'Q1A'
+    # Map Q1A: Employees -> Q1A for matching against VR's 'Question'
     return dataset_key.split(":")[0].replace(" ", "")
 
 def find_vr_just_for_periods(
@@ -113,23 +142,29 @@ def find_vr_just_for_periods(
     wc: str,
     periods: List[str],   # e.g. ["2025-Feb"] or ["Q1 2025"]
 ) -> str:
-    """Return concatenated justification(s) for given periods."""
+    # Look up FI 'Justification' text in the VR file for the specified (entity/subquestion/worker category) and periods.
+    # Accept either monthly labels "YYY-Mmm" or quarterly labels "Qx YYYY"
+    # If multiple justifications match, deduplicate and join them with newlines.
+
+    # Handle error / pending states cleanly
     if isinstance(vr_df, str):
         return "Pending submission" if vr_df == "PENDING" else vr_df
+    
     qcode = _question_code_from_dataset(dataset_key)
     ent_norm = _norm(entity_name)
     subq_norm = _norm(subq)
     wc_norm = _norm(wc)
     justs = []
+
     for p in periods:
-        # monthly label: "YYYY-Mmm"
+        # Monthly label "YYYY-Mmm"
         if "-" in p and "Q" not in p:
             yr_str, mon = p.split("-")
             try:
                 yr = int(yr_str)
             except:
                 continue
-            # 1) strict month match
+            # Strict month match
             sub = vr_df[
                 (vr_df["Year"] == yr) &
                 (vr_df["_month"] == mon) &
@@ -139,7 +174,8 @@ def find_vr_just_for_periods(
             ]
             if subq_norm and subq_norm != _norm("N/A"):
                 sub = sub[sub["_subq"] == subq_norm]
-            # 2) fallback to quarter rows
+            
+            # Fallback: use quarter row if monthly row missing
             if sub.empty:
                 q_from_mon = {"Jan":1,"Feb":1,"Mar":1,"Apr":2,"May":2,"Jun":2,
                               "Jul":3,"Aug":3,"Sep":3,"Oct":4,"Nov":4,"Dec":4}.get(mon, None)
@@ -154,7 +190,7 @@ def find_vr_just_for_periods(
                     if subq_norm and subq_norm != _norm("N/A"):
                         sub = sub[sub["_subq"] == subq_norm]
         else:
-            # quarterly label: "Qx YYYY"
+            # Quarterly label "Qx YYYY"
             try:
                 qlab, yr_str = p.split()
                 qn = int(qlab[1:])
@@ -170,42 +206,62 @@ def find_vr_just_for_periods(
             ]
             if subq_norm and subq_norm != _norm("N/A"):
                 sub = sub[sub["_subq"] == subq_norm]
-        # collect clean justifications
+
+        # Collect non-empty justifications and dedupe
         js = [j for j in sub["Justification"].astype(str).tolist()
               if str(j).strip() and str(j).strip().lower() != "nan"]
         if js:
             justs.append(" \n".join(sorted(set(js))))
+
     if not justs:
         return "—"
     return " \n".join(sorted(set(justs)))
 
-# -------------------- Multi-year Series Builders --------------------
+# ===================== Multi-year Series Builders (monthly/quarterly) ========================
 def build_multi_year_monthly_series(
     entity: str, wc: str, subq: str, sheet_key: str,
     start_year: int, end_year: int, excluded_years: set[int]
 ) -> Tuple[pd.Series, Optional[pd.Series]]:
+    
+    # Build a monthly time series from start_year..end_year (exlcuding excluded_years)
+    # Index like 'YYY-Mmm'
+    # Also returns a "YoY alignment series" (previous year's same month values aligned on current index) for YoY% calculations 
     vals, idx = [], []
+
     for yr in range(int(start_year), int(end_year)+1):
-        if yr in excluded_years: continue
+        if yr in excluded_years: 
+            continue
+
         df = load_qc_sheet(yr, SHEET_MAP[sheet_key])
-        if isinstance(df, str): continue
+        if isinstance(df, str): 
+            continue
+
         row = qc_row_slice(df, entity, wc, subq)
-        if row.empty: continue
+        if row.empty: 
+            continue
+
         rq = get_reporting_quarter(yr)
         months = [m for m in ALL_MONTHS[:rq*3] if m in row.columns]
-        if not months: continue
+        if not months: 
+            continue
+
         s = pd.to_numeric(row[months].iloc[0], errors="coerce").astype(float)
+
         for m in months:
             idx.append(f"{yr}-{m}")
             vals.append(s.get(m, np.nan))
+
     series = pd.Series(vals, index=idx, dtype=float)
-    # Align YoY
+
+    # Build YoY alignment for each YYYY-Mmm, pick value from (YYYY-1)-Mmm if available
     yoy_vals, yoy_idx = [], []
+
     for lab in series.index:
         yr, mon = lab.split('-')
         prev = f"{int(yr)-1}-{mon}"
         if prev in series.index and not pd.isna(series[prev]):
             yoy_idx.append(lab); yoy_vals.append(series[prev])
+
     yoy_series = pd.Series(yoy_vals, index=yoy_idx, dtype=float) if yoy_idx else None
     return series, yoy_series
 
@@ -213,74 +269,100 @@ def build_multi_year_quarterly_series(
     entity: str, wc: str, subq: str, sheet_key: str,
     start_year: int, end_year: int, excluded_years: set[int]
 ) -> Tuple[pd.Series, Optional[pd.Series]]:
+    # Build a quarterly time series. Uses Qx_Total if present; otherwise sums the months of each quarter
+    # Index like 'Qx YYYY'
+    # Also constructs a YoY alignment series for YoY% calculations
     labels, values = [], []
+
     for yr in range(int(start_year), int(end_year)+1):
-        if yr in excluded_years: continue
+        if yr in excluded_years: 
+            continue
+
         df = load_qc_sheet(yr, SHEET_MAP[sheet_key])
-        if isinstance(df, str): continue
+        if isinstance(df, str): 
+            continue
+
         row = qc_row_slice(df, entity, wc, subq)
-        if row.empty: continue
+        if row.empty: 
+            continue
+
         rq = get_reporting_quarter(yr)
-        # prefer Qx_Total; otherwise sum months for that quarter
+        
         for q in range(1, rq+1):
             col = f"Q{q}_Total"
             if col in row.columns and not pd.isna(row.iloc[0][col]):
                 v = float(pd.to_numeric(row.iloc[0][col], errors="coerce"))
             else:
+                # Sum months if Qx_Total is missing
                 mlist = [m for m in months_for_q(q) if m in row.columns]
                 v = float(pd.to_numeric(row[mlist].iloc[0], errors="coerce").astype(float).sum()) if mlist else np.nan
+
             if not np.isnan(v):
                 labels.append(f"Q{q} {yr}")
                 values.append(v)
+
     series = pd.Series(values, index=labels, dtype=float)
-    # Align YoY for quarters
+
+    # Build YoY alignment for quarters
     yoy_vals, yoy_idx = [], []
+
     for lab in series.index:
         q, yr_str = lab.split()
         prev = f"{q} {int(yr_str)-1}"
         if prev in series.index and not pd.isna(series[prev]):
             yoy_idx.append(lab); yoy_vals.append(series[prev])
+
     yoy_series = pd.Series(yoy_vals, index=yoy_idx, dtype=float) if yoy_idx else None
     return series, yoy_series
 
-# -------------------- Outlier Engine --------------------
+# ===================== Outlier detection engine ====================
+
 def find_outliers_v2(
     series: pd.Series,
     yoy_series: Optional[pd.Series],
-    pct_thresh: float,   # MoM % threshold
-    abs_cutoff: float,   # absolute change threshold
-    iqr_k: float,        # IQR multiplier
-    yoy_thresh: float    # YoY % threshold
+    pct_thresh: float,   # MoM/QoQ % threshold (gate)
+    abs_cutoff: float,   # absolute change threshold (significance)
+    iqr_k: float,        # IQR multiplier (significance)
+    yoy_thresh: float    # YoY % threshold (significance)
 ) -> pd.DataFrame:
-    """
-    Outlier logic:
-    1. High MoM% if |MoM| >= pct_thresh AND |Δ| >= abs_cutoff
-    2. Outlier flagged only if (High MoM%) AND (YoY >= yoy_thresh OR IQR anomaly)
-    Reasons include High MoM%, High YoY%, IQR Detect Outlier.
-    """
+    
+    # Outlier logic (two-stage):
+    # 1) Gate: High MoM%/QoQ% if |MoM| >= pct_thresh AND |Δ| >= abs_cutoff
+    # 2) Only then flag if (YoY >= yoy_thresh OR value is IQR outlier)
+    # Reasons include: "High MoM%", "High YoY%", "IQR Detect Outlier"
+    # Returns a DataFrame with index=Period and columns: Value, Statistical Reasons.
+    
     out = []
     clean = series.dropna()
     if clean.size < 2:
         return pd.DataFrame(columns=["Period", "Value", "Statistical Reasons"]).set_index("Period")
+    
     # IQR bounds
     q1, q3 = clean.quantile(0.25), clean.quantile(0.75)
     iqr = q3 - q1
     lb, ub = ((q1 - iqr_k * iqr, q3 + iqr_k * iqr) if iqr > 0 else (None, None))
+
     for i, (period, cur) in enumerate(series.items()):
-        if pd.isna(cur) or i == 0: continue
+        if pd.isna(cur) or i == 0: 
+            continue
         prev = series.iloc[i - 1]
-        if pd.isna(prev) or prev == 0: continue
+        if pd.isna(prev) or prev == 0: 
+            continue
+
         abs_chg = cur - prev
         mom = abs_chg / prev
-        # Step 1: High MoM check
+
+        # Stage 1: Gate on MoM/QOQ % AND absolute change
         if abs(mom) >= pct_thresh and abs(abs_chg) >= abs_cutoff:
             reasons = [f"High MoM% ({mom:+.0%})"]
             extra_reason = False
-            # IQR anomaly
+
+            # IQR anomaly on level
             if iqr > 0 and (cur < lb or cur > ub):
                 reasons.append("IQR Detect Outlier")
                 extra_reason = True
-            # YoY significance
+
+            # YoY significance if aligned previous year's period exists
             if yoy_series is not None and period in yoy_series.index:
                 py = yoy_series.get(period)
                 if not pd.isna(py) and py != 0:
@@ -288,7 +370,8 @@ def find_outliers_v2(
                     if abs(yoy) >= yoy_thresh:
                         reasons.append(f"High YoY% ({yoy:+.0%})")
                         extra_reason = True
-            # Only flag if extra_reason is True
+
+            # Only flag if at least one significance reason exists
             if extra_reason:
                 out.append({
                     "Period": period,
@@ -297,7 +380,7 @@ def find_outliers_v2(
                 })
     return pd.DataFrame(out).set_index("Period") if out else pd.DataFrame(columns=["Period", "Value", "Statistical Reasons"]).set_index("Period")
 
-# -------------------- Chart (Dual-axis: Bar + Line + Outliers) --------------------
+# ============= Charting: dual axis bar (levels) + line (% change) + outlier markers
 def plot_dual_axis_with_outliers(
     series: pd.Series,
     growth_pct: pd.Series,
@@ -306,17 +389,24 @@ def plot_dual_axis_with_outliers(
     left_title: str = "Value",
     right_title: str = "% Change (MoM)"
 ):
+    # Render a Plotly Chart:
+    # - Left axis (bars): level values
+    # - Right axis (line): % change vs previous period
+    # - Red X markers for 'true outliers' within the focus window
+
     x = list(series.index)
     y = series.values.astype(float)
     g = growth_pct.reindex(series.index).fillna(0)
 
     fig = go.Figure()
+
     # Bars for values (left axis)
     fig.add_trace(go.Bar(
         x=x, y=y, name=left_title, yaxis="y1", opacity=0.75,
         hovertemplate='Period: %{x}<br>Value: %{y:,.0f}'
     ))
-    # Line for % growth (right axis)
+
+    # Line for % change (right axis)
     fig.add_trace(go.Scatter(
         x=x, y=g.values, name=right_title, yaxis="y2",
         mode="lines+markers", line=dict(width=2, dash="dot", color="#003366"),
@@ -345,19 +435,19 @@ def plot_dual_axis_with_outliers(
     )
     st.plotly_chart(fig, use_container_width=True)
 
-# -------------------- (NEW) Universal hierarchy loader --------------------
+# ==================== Hierarchy Loader (Parent-Child OR Institution/Sector/Subsector)
 @st.cache_data
 def load_hierarchy_any(path: str) -> Dict[str, List[str]]:
-    """
-    Accepts either:
-      - Parent,Child CSV (used directly), or
-      - Institution,Sector,Subsector CSV (auto-builds AFI tree):
-           AFI -> Banking Institution / DFI / Insurans-Takaful
-           Banking Institution -> (Commercial, Investment, Foreign, Islamic, Digital, IIB) -> entities
-           DFI -> entities directly
-           Insurans/Takaful -> (Insurers, Takaful Operators) -> entities
-    Removes self-child edges.
-    """
+    
+    # Accepts either:
+    #  - Parent,Child CSV (used directly), or
+    #  - Institution,Sector,Subsector CSV (auto-builds AFI tree):
+    #       AFI -> Banking Institution / DFI / Insurans-Takaful
+    #       Banking Institution -> (Commercial, Investment, Foreign, Islamic, Digital, IIB) -> entities
+    #       DFI -> entities directly
+    #       Insurans/Takaful -> (Insurers, Takaful Operators) -> entities
+    # Removes self-child edges.
+
     import pandas as pd, os
     if not path or not os.path.exists(path):
         return {}
@@ -365,14 +455,14 @@ def load_hierarchy_any(path: str) -> Dict[str, List[str]]:
     df = pd.read_csv(path)
     df.columns = [c.strip() for c in df.columns]
 
-    # Case A: Parent-Child
+    # Case A: Parent-Child edges provided directly
     if {"Parent","Child"} <= set(df.columns):
         df["Parent"] = df["Parent"].astype(str).str.strip()
         df["Child"]  = df["Child"].astype(str).str.strip()
         df = df[df["Parent"].str.lower() != df["Child"].str.lower()]
         return df.groupby("Parent")["Child"].apply(list).to_dict()
 
-    # Case B: Institution,Sector,Subsector
+    # Case B: Institution,Sector,Subsector (build All FI tree)
     if {"Institution","Sector","Subsector"} <= set(df.columns):
         AFI  = "All Financial Institutions"
         BI   = "Banking Institution"
@@ -388,12 +478,16 @@ def load_hierarchy_any(path: str) -> Dict[str, List[str]]:
         present_subs = set(df["Subsector"].unique())
 
         edges = []
+
+        # All FI layer
         if (banking_subs & present_subs): edges.append({"Parent": AFI, "Child": BI})
         if ("DFI" in present_subs):      edges.append({"Parent": AFI, "Child": DFI})
         if (ins_tak_subs & present_subs):edges.append({"Parent": AFI, "Child": ITOP})
 
+        # Banking branches
         for s in sorted(banking_subs & present_subs):
             edges.append({"Parent": BI, "Child": s})
+        # Ins/Takaful branches
         for s in sorted(ins_tak_subs & present_subs):
             edges.append({"Parent": ITOP, "Child": s})
 
@@ -416,15 +510,19 @@ def load_hierarchy_any(path: str) -> Dict[str, List[str]]:
         hier_df = hier_df[hier_df["Parent"].str.lower() != hier_df["Child"].str.lower()]
         return hier_df.groupby("Parent")["Child"].apply(list).to_dict()
 
+    # If neither schema matches, warn and return empty
     st.warning("Hierarchy CSV must have either (Parent,Child) or (Institution,Sector,Subsector) columns.")
     return {}
 
-# -------------------- (NEW) Attribution helpers: leaf entities --------------------
+# ================ Attribution helpers: discover leaf entities present in QC =======================
+
 def _norm2(s: str) -> str:
+    # Normalize but keep casefold (better for non-english) and preserve space a single spaces
     return re.sub(r"\s+", " ", str(s).strip()).casefold()
 
 def _canonical_map(series: pd.Series) -> Dict[str, str]:
-    """Return norm->display mapping using the most frequent variant."""
+    # Build a map 'normalized name' -> 'most frequent display variant' observed in QC.
+    # This avoids display mismatches when the same entity appears with minor naming differences.
     tmp = series.dropna().astype(str)
     norm = tmp.map(_norm2)
     canon_map = (
@@ -436,15 +534,16 @@ def _canonical_map(series: pd.Series) -> Dict[str, str]:
     return canon_map
 
 def get_children_in_data(df: pd.DataFrame, parent: str, hier: Dict[str, List[str]]) -> List[str]:
-    """Return immediate children of 'parent' that actually appear in QC.
-       - Ignores self-child edges (e.g., 'DFI' -> 'DFI').
-       - If a child group doesn't appear as a QC row but exists in the hierarchy,
-         we still keep it (we'll recurse down)."""
+    
+    # Return immediate children of 'parent' that actually appear in QC (or exist as groups to recurse into).
+    # - Ignores self-child edges.
+    # - If a child group exists in the hierarchy but has no direct QC row, we keep it to recurse down later.
     if parent not in hier:
         return []
+    
     candidates = [c for c in hier[parent] if _norm2(c) != _norm2(parent)]
 
-    # QC canonical (norm -> display)
+    # Build canonical map for QC entities to ensure display names match QC variants
     canon = _canonical_map(df[ENTITY_COL])
     present_norms = set(canon.keys())
 
@@ -458,15 +557,16 @@ def get_children_in_data(df: pd.DataFrame, parent: str, hier: Dict[str, List[str
     return list(dict.fromkeys(matched))
 
 def flatten_leaves_in_qc(df: pd.DataFrame, root: str, hier: Dict[str, List[str]]) -> List[str]:
-    """
-    Recursively collect leaf entities under 'root' that actually exist in QC.
-    A leaf = child that is not a parent in 'hier' (no further children).
-    """
+    
+    # Recursively collect leaf entities under 'root' that actually exist in QC.
+    # A leaf is a child that is not a parent in 'hier' (i.e., no further children).
+    
     leaves = set()
 
     def _recurse(node: str):
         kids = get_children_in_data(df, node, hier)
         if not kids:
+            #If node is a real entity row in QC, mark as leaf
             if node in df[ENTITY_COL].unique():
                 leaves.add(node)
             return
@@ -477,7 +577,8 @@ def flatten_leaves_in_qc(df: pd.DataFrame, root: str, hier: Dict[str, List[str]]
                 leaves.add(k)
 
     _recurse(root)
-    # Exclude well-known group labels if they slipped in
+
+    # Remove known group labels if they slipped in
     groups_to_exclude = {
         "All Financial Institutions", "Banking Institution", "DFI",
         "Insurans/Takaful Operators", "Commercial Banks", "Investment Banks",
@@ -497,8 +598,14 @@ def compute_entity_contributions(
     period_label: str,     # "YYYY-Mmm" or "Qx YYYY"
     time_view: str         # "Monthly" or "Quarterly"
 ) -> pd.DataFrame:
-    """Build Prev, Curr, Δ per leaf entity for the selected outlier period."""
+    
+    # For a chosen outlier period, compute per-entity:
+    #  - Prev (previous period value), Curr (current period), Δ (Curr-Prev)
+    #  - Contribution % relative to the total Δ across entities
+    # Sorted by |Δ| descending to surface top movers.
+
     rows = []
+
     for ent in entities:
         if time_view == "Monthly":
             s, _ = build_multi_year_monthly_series(ent, wc, subq, sheet_key, start_year, end_year, exclude_years)
@@ -522,18 +629,23 @@ def compute_entity_contributions(
 
     total_delta = dfe["Delta"].sum()
     dfe["Contribution %"] = np.where(total_delta != 0, dfe["Delta"] / total_delta * 100.0, np.nan)
+
+    # Sort by magnitude of movement
     dfe.sort_values(by="Delta", key=np.abs, ascending=False, inplace=True)  # rank biggest movers
     dfe.reset_index(drop=True, inplace=True)
     return dfe
 
 def plot_top_contributors_bar(dfe: pd.DataFrame, title: str = "Top Contributors (Δ vs previous)"):
-    """Horizontal bar chart for Δ (positive/negative)."""
+    # Horizontal bar chart highlighting which entities contributed most 
+    # Positive = increase, Negative = decrease
     if dfe.empty:
         st.info("No entity-level data available.")
         return
+    
     show = dfe.copy()
     show["sign"] = np.where(show["Delta"] >= 0, "Increase", "Decrease")
     colors = {"Increase": "#2ca02c", "Decrease": "#d62728"}
+
     fig = go.Figure(go.Bar(
         x=show["Delta"],
         y=show["Entity"],
@@ -541,19 +653,22 @@ def plot_top_contributors_bar(dfe: pd.DataFrame, title: str = "Top Contributors 
         marker=dict(color=[colors[s] for s in show["sign"]]),
         hovertemplate="Entity: %{y}<br>Δ: %{x:+,.0f}<extra></extra>"
     ))
+
     fig.update_layout(
         title=title,
         xaxis_title="Δ vs previous period",
         yaxis_title=None,
         margin=dict(l=10, r=10, t=50, b=10)
     )
+
     st.plotly_chart(fig, use_container_width=True)
 
-# -------------------- UI Helpers --------------------
+# ==================== Sidebar UI Controls ==================
+
 def sidebar_controls():
     st.sidebar.title("Analysis Controls")
 
-    # years
+    # Years / timeline selection
     years_available = list(range(2019, 2031))
     current_year = st.sidebar.selectbox(
         "Current Year (detect current quarter from this workbook):",
@@ -578,7 +693,7 @@ def sidebar_controls():
         default=[]
     )
 
-    # thresholds
+    # Threshold for outlier detection
     st.sidebar.markdown("---")
     st.sidebar.subheader("Thresholds")
     mom_pct = st.sidebar.slider("MoM/QoQ % Threshold (Gate)", 0, 100, 25, 5, format="%d%%") / 100.0
@@ -586,12 +701,12 @@ def sidebar_controls():
     iqr_k = st.sidebar.slider("IQR Sensitivity (Significance)", 1.0, 3.0, 1.5, 0.1)
     yoy_pct = st.sidebar.slider("YoY % Threshold (Significance)", 0, 100, 30, 5, format="%d%%") / 100.0
 
-    # view & dataset
+    # Frequency & dataset
     st.sidebar.markdown("---")
     time_view = st.sidebar.radio("Frequency:", options=['Monthly','Quarterly'], horizontal=True)
     dataset = st.sidebar.selectbox("Dataset:", options=list(SHEET_MAP.keys()))
 
-    # Outlier focus window
+    # Outlier focus window selection
     st.sidebar.markdown("---")
     st.sidebar.subheader("Outlier Focus")
     focus_mode = st.sidebar.radio(
@@ -618,7 +733,7 @@ def sidebar_controls():
         placeholder=r"C:\...\VR_Consol_2025_Quarter1.xlsx"
     )
 
-    # (NEW) Hierarchy CSV path
+    # Hierarchy CSV path 
     st.sidebar.markdown("---")
     st.sidebar.subheader("Hierarchy (optional)")
     hier_path = st.sidebar.text_input(
@@ -645,14 +760,16 @@ def sidebar_controls():
         "hier_path": hier_path.strip(),
     }
 
-# -------------------- Main Interactive View --------------------
+# ==================== Main Interactive View ==================
 def main_view():
     st.title("🏦 LMS Analysis Dashboard")
+
+    # Read sidebar configuration and show a summary 
     cfg = sidebar_controls()
     rq = get_reporting_quarter(cfg["current_year"])
     st.sidebar.info(f"Analyzing **{cfg['start_year']}–{cfg['end_year']}** (excl: {', '.join(map(str,cfg['exclude_years'])) or 'none'}) • Current workbook: **{cfg['current_year']} Q{rq}**")
 
-    # Decide which period's outliers to show
+    # Decide which period's outliers to highlight (current quarter or user-picked)
     if cfg["focus_mode"] == "Current quarter":
         focus_q = rq
         focus_year = cfg["current_year"]
@@ -663,22 +780,30 @@ def main_view():
     focus_month_labels = set([f"{focus_year}-{m}" for m in months_for_q(focus_q)])
     focus_quarter_label = f"Q{focus_q} {focus_year}"
 
-    # Badge
+    # Badge display
     month_str = "–".join(months_for_q(focus_q))
     st.markdown(
         f'Outlier focus: **Q{focus_q} {focus_year}** ({month_str})',
         unsafe_allow_html=True
     )
 
+    # Load the current-year QC sheet for the choosen dataset
     df_cur = load_qc_sheet(cfg["current_year"], SHEET_MAP[cfg["dataset"]])
     if isinstance(df_cur, str):
         st.error(df_cur)
         return
+    
+    def _is_total_wc(name: str) -> bool:
+    # Consider anything that contains 'total' (case-insensitive) as a Total WC
+        return "total" in str(name).casefold()
 
-    # --- Normalize entity / subquestion / worker category casing ---
+    # Normalize display variations for Entity/Subquestion/Worker Category to keep UI clean
     def _norm_local(s: str) -> str:
         return re.sub(r"\s+", " ", str(s).strip()).casefold()
+    
     def _canonical(series: pd.Series) -> pd.Series:
+
+        # Convert each value to its most frequent 'display' variant based on its normalized form
         tmp = series.dropna().astype(str)
         norm = tmp.map(_norm_local)
         canon_map = (
@@ -696,7 +821,7 @@ def main_view():
     df_cur["_wc_norm"] = df_cur[WC_COL].map(_norm_local)
     df_cur["_wc_disp"] = _canonical(df_cur[WC_COL])
 
-    # Entity/Subquestion/Worker Category selection
+    # Entity/Subquestion/Worker Category selection widget
     st.header(f"Outlier Detection: {cfg['dataset']}")
     entity = st.selectbox(
         "Entity / Group:",
@@ -718,10 +843,11 @@ def main_view():
 
     st.caption(f"Displaying: {entity}  \n{subq}  \n{wc}")
 
-    # Load VR (once)
+    # Load VR staging once
+    # String indicates "PENDING" or error
     vr_df = load_vr_variance(cfg["vr_path"])
 
-    # Build multi-year series
+    # Build the selected frequency series and run detection
     if cfg["time_view"] == "Monthly":
         series, yoy_series = build_multi_year_monthly_series(
             entity, wc, subq, cfg["dataset"],
@@ -731,11 +857,14 @@ def main_view():
         if series.empty or series.isnull().all():
             st.warning("No data found for the selected timeline/filters.")
             return
-        # Detection on full series
+        
+        # Detection outliers across the whole timeline
         out_all = find_outliers_v2(series, yoy_series, cfg["mom_pct"], cfg["abs_cut"], cfg["iqr_k"], cfg["yoy_pct"])
-        # Focus markers: selected quarter months
+
+        # Keep only outliers within focused quarter's months
         out_focus = out_all.loc[out_all.index.intersection(focus_month_labels)]
-        # Add FI Justification per row
+
+        # Attach VR justifications per outlier period
         if not out_focus.empty:
             periods_list = out_focus.index.tolist()
             per_row_just = []
@@ -744,17 +873,65 @@ def main_view():
             else:
                 for p in periods_list:
                     per_row_just.append(find_vr_just_for_periods(vr_df, cfg["dataset"], entity, subq, wc, [p]))
+
             out_focus = out_focus.copy()
             out_focus["FI Justification"] = per_row_just
-        # Growth line (%MoM), rounded like VR
+
+        # %MoM growth for plotting (rounded to match VR)
         growth_pct = series.pct_change()
         growth_pct = growth_pct.replace([np.inf, -np.inf], np.nan)
         growth_pct = (growth_pct * 100).round().fillna(0)
+
+        # --- (NEW) VR justification summary across all WCs when WC is Total ---
+        if not out_focus.empty and _is_total_wc(wc):
+            with st.expander("VR Justifications by All Worker Category", expanded=False):
+                # Collect WC list that exist for the selected entity + subquestion (in ANY year, current df is enough to enumerate)
+                wc_list = df_cur[(df_cur[ENTITY_COL] == entity) & ((df_cur[SUBQ_COL] == subq) if SUBQ_COL in df_cur.columns else True)][WC_COL].unique().tolist()
+
+                # Focus periods: outlier months within the selected quarter
+                periods_list = out_focus.index.tolist()  # e.g., ['2025-Jan', '2025-Feb']
+                if not periods_list:
+                    st.info("No outlier months in focus window.")
+                else:
+                    # Build a table: one row per WC, agg justification across focused months
+                    rows = []
+                    for wc_any in wc_list:
+                        # Skip if this WC isn't meaningful (empty or duplicated)
+                        if not str(wc_any).strip():
+                            continue
+
+                        # Gather justifications across all focused months for this WC
+                        if isinstance(vr_df, str):
+                            # VR pending or error string
+                            just_text = ("Pending submission" if vr_df == "PENDING" else vr_df)
+                        else:
+                            just_text = find_vr_just_for_periods(
+                                vr_df=vr_df,
+                                dataset_key=cfg["dataset"],
+                                entity_name=entity,
+                                subq=subq,
+                                wc=wc_any,
+                                periods=periods_list
+                            )
+
+                        rows.append({"Worker Category": wc_any, "FI Justification (focus months)": just_text})
+
+                    # Present the table (sorted with Total near top)
+                    show_wc = pd.DataFrame(rows)
+                    # Optional: put 'Total' rows first for convenience
+                    show_wc["__is_total"] = show_wc["Worker Category"].map(lambda x: 0 if _is_total_wc(x) else 1)
+                    show_wc.sort_values(["__is_total", "Worker Category"], inplace=True)
+                    show_wc.drop(columns="__is_total", inplace=True)
+                    st.dataframe(show_wc, use_container_width=True)
+
+        # Plot monthly chart
         plot_dual_axis_with_outliers(
             series=series, growth_pct=growth_pct, outliers_focus=out_focus,
             title=f"Monthly Trend ({cfg['start_year']}–{cfg['end_year']})"
         )
+
     else:
+        # Quarterly path
         series, yoy_series = build_multi_year_quarterly_series(
             entity, wc, subq, cfg["dataset"],
             cfg["start_year"], cfg["end_year"],
@@ -763,11 +940,14 @@ def main_view():
         if series.empty or series.isnull().all():
             st.warning("No data found for the selected timeline/filters.")
             return
-        # Detection on full series
+        
+        # Detect outliers across the whole timeline
         out_all = find_outliers_v2(series, yoy_series, cfg["mom_pct"], cfg["abs_cut"], cfg["iqr_k"], cfg["yoy_pct"])
-        # Focus markers: selected quarter
+
+        # Keep only the focused quarter outlier
         out_focus = out_all.loc[out_all.index.intersection({focus_quarter_label})]
-        # Add FI Justification (use all months in that quarter)
+
+        # Attach VR justifications combining all months in that quarter
         if not out_focus.empty:
             qy = int(focus_quarter_label.split()[1])
             qn = int(focus_quarter_label.split()[0][1:])
@@ -782,17 +962,20 @@ def main_view():
                 )
             out_focus = out_focus.copy()
             out_focus["FI Justification"] = per_row_just
-        # %QoQ
+
+        # %QoQ growth for plotting
         growth_pct = series.pct_change()
         growth_pct = growth_pct.replace([np.inf, -np.inf], np.nan)
         growth_pct = (growth_pct * 100).round().fillna(0)
+
+        # Plot quarterly chart
         plot_dual_axis_with_outliers(
             series=series, growth_pct=growth_pct, outliers_focus=out_focus,
             title=f"Quarterly Trend ({cfg['start_year']}–{cfg['end_year']})",
             right_title="% Change (QoQ)"
         )
 
-    # Metrics & Table (existing)
+    # KPI cards + outlier table for current focus
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("Latest Value", f"{series.iloc[-1]:,.0f}")
     c2.metric("Average", f"{series.mean():,.0f}")
@@ -804,24 +987,26 @@ def main_view():
     else:
         st.success("✅ No current-quarter outliers")
 
-    # -------------------- (NEW) Direct leaf-entity attribution --------------------
+    # Attribution: which leaf entities contributed to the outlier?
+    # Only shown when (a) there is at least one outlier in focus
+    # (b) selected entity is the root roll-up "All Financial Institution"
     hier = load_hierarchy_any(cfg.get("hier_path","")) or HIERARCHY_MAP
 
     if not out_focus.empty and entity == ROLLUP_KEY:
-        with st.expander("🔎 Entity-level attribution — Who moved All FI?", expanded=True):
-            # Choose a flagged period within the focus window
+        with st.expander("🔎 Contribution by FI", expanded=True):
+            # Let the user pick which flagged period (within focus) to attribute
             attrib_period = st.selectbox(
                 "Outlier period:",
                 options=list(out_focus.index),
                 index=0
             )
 
-            # Collect all leaf entities under All FI (mapped to QC display names)
+            # Resolve all leaves under All FI that actually exist in QC
             leaf_entities = flatten_leaves_in_qc(df_cur, ROLLUP_KEY, hier)
             if not leaf_entities:
                 st.warning("No leaf entities found under All FI. Check the hierarchy path or mapping.")
             else:
-                # Compute contributions for the selected period
+                # Calculate contributions (Prev, Curr, Delta, Contributions %) per leaf for that period
                 dfe = compute_entity_contributions(
                     entities=leaf_entities,
                     subq=subq,
@@ -837,7 +1022,7 @@ def main_view():
                 if dfe.empty:
                     st.info("No entity had usable values in the selected period (or previous period).")
                 else:
-                    # Quick search and top-N filter
+                    # Quick filtering and top-N selection
                     col_s, col_n = st.columns([2,1])
                     search_text = col_s.text_input("Filter entities (optional):", value="", placeholder="Type part of a name, e.g., 'MAYBANK'")
                     top_n = col_n.slider("Top N by |Δ|", min_value=5, max_value=50, value=15, step=5)
@@ -866,7 +1051,7 @@ def main_view():
                             )
                         dfe_view["FI Justification"] = j_list
 
-                    # Present table
+                    # Present a clean table
                     show = dfe_view.copy()
                     show["Prev"] = show["Prev"].map(lambda v: f"{v:,.0f}")
                     show["Curr"] = show["Curr"].map(lambda v: f"{v:,.0f}")
@@ -874,12 +1059,12 @@ def main_view():
                     show["Contribution %"] = show["Contribution %"].map(lambda p: f"{p:+.1f}%" if pd.notna(p) else "–")
                     st.dataframe(show, use_container_width=True)
 
-                    # Bar chart
+                    # Visualize contributions
                     plot_top_contributors_bar(dfe_view, title=f"Top Contributors (All FI — {attrib_period})")
     else:
-        # If no outlier or not at All FI, keep UI clean
+        # Keep UI minimal if not applicable
         pass
 
-# -------------------- Run --------------------
+# ============ Run ================
 if __name__ == "__main__":
     main_view()
