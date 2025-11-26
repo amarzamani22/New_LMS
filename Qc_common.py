@@ -327,6 +327,8 @@ class QCArgs:
     qoq_pct_threshold: float = 0.25
     yoy_pct_threshold: float = 0.25
     abs_cutoff: float = 50.0
+    quarter_eom_for_all : bool = False
+    eom_subquestion_contains: str | None = None
 
 def write_qc_sheet(args: QCArgs) -> None:
     df = args.df.copy()
@@ -560,80 +562,80 @@ def write_qc_sheet(args: QCArgs) -> None:
                 ws.cell(r, cd).value = f"={a}-{b}"
                 ws.cell(r, cp).value = f"=IF(AND({a}=0,{b}=0),0,IF({b}=0,\"N/A\",({a}-{b})/{b}))"
 
-# --- quarter totals ---
-if not jobfunc_mode:
-    q_sums_present = [q for q in ["Q1","Q2","Q3","Q4"] if set(Q_TO_MONTHS[q]).issubset(set(months))]
+    # --- quarter totals ---
+    if not jobfunc_mode:
+        q_sums_present = [q for q in ["Q1","Q2","Q3","Q4"] if set(Q_TO_MONTHS[q]).issubset(set(months))]
 
-    for r in range(first_data_row, last_data_row + 1):
-        # read Subquestion cell text once (for Q4 check)
-        sub_val = str(ws.cell(r, col_index.get("Subquestion", 0)).value or "").strip()
-
-        # === Q1 ===
-        if "Q1" in q_sums_present:
-            if ws.title == "QC_Q1A_Main" or (
-                ws.title == "QC_Q4"
-                and "A. Number of Job Vacancies as at End of the Month" in sub_val
-            ):
-                # use end-month value (Mar)
-                ref = ws.cell(r, col_index["Mar"]).coordinate
-                ws.cell(r, col_index["Q1"]).value = f"={ref}"
-            else:
-                a = ws.cell(r, col_index["Jan"]).coordinate
-                b = ws.cell(r, col_index["Mar"]).coordinate
-                ws.cell(r, col_index["Q1"]).value = f"=SUM({a}:{b})"
-
-        # === Q2 ===
-        if "Q2" in q_sums_present:
-            if ws.title == "QC_Q1A_Main" or (
-                ws.title == "QC_Q4"
-                and "A. Number of Job Vacancies as at End of the Month" in sub_val
-            ):
-                ref = ws.cell(r, col_index["Jun"]).coordinate
-                ws.cell(r, col_index["Q2"]).value = f"={ref}"
-            else:
-                a = ws.cell(r, col_index["Apr"]).coordinate
-                b = ws.cell(r, col_index["Jun"]).coordinate
-                ws.cell(r, col_index["Q2"]).value = f"=SUM({a}:{b})"
-
-        # === Q3 ===
-        if "Q3" in q_sums_present:
-            if ws.title == "QC_Q1A_Main" or (
-                ws.title == "QC_Q4"
-                and "A. Number of Job Vacancies as at End of the Month" in sub_val
-            ):
-                ref = ws.cell(r, col_index["Sep"]).coordinate
-                ws.cell(r, col_index["Q3"]).value = f"={ref}"
-            else:
-                a = ws.cell(r, col_index["Jul"]).coordinate
-                b = ws.cell(r, col_index["Sep"]).coordinate
-                ws.cell(r, col_index["Q3"]).value = f"=SUM({a}:{b})"
-
-        # === Q4 ===
-        if "Q4" in q_sums_present:
-            if ws.title == "QC_Q1A_Main" or (
-                ws.title == "QC_Q4"
-                and "A. Number of Job Vacancies as at End of the Month" in sub_val
-            ):
-                ref = ws.cell(r, col_index["Dec"]).coordinate
-                ws.cell(r, col_index["Q4"]).value = f"={ref}"
-            else:
-                a = ws.cell(r, col_index["Oct"]).coordinate
-                b = ws.cell(r, col_index["Dec"]).coordinate
-                ws.cell(r, col_index["Q4"]).value = f"=SUM({a}:{b})"
-
-    # --- quarter differences (%Diff) ---
-    for i in range(1, len(q_sums_present)):
-        q = q_sums_present[i]; pq = q_sums_present[i-1]
-        cd = col_index[f"Diff {q}"]
-        cp = col_index[f"%Diff {q}"]
-        cq = col_index[q]
-        pp = col_index[pq]
         for r in range(first_data_row, last_data_row + 1):
-            a = ws.cell(r, cq).coordinate
-            b = ws.cell(r, pp).coordinate
-            ws.cell(r, cd).value = f"={a}-{b}"
-            ws.cell(r, cp).value = f"=IF(AND({a}=0,{b}=0),0,IF({b}=0,\"N/A\",({a}-{b})/{b}))"
+            # read Subquestion cell text once (for Q4 check)
+            sub_val = str(ws.cell(r, col_index.get("Subquestion", 0)).value or "").strip()
 
+            # === Q1 ===
+            if "Q1" in q_sums_present:
+                if ws.title == "QC_Q1A_Main" or (
+                    ws.title == "QC_Q4"
+                    and "A. Number of Job Vacancies as at End of the Month" in sub_val
+                ):
+                    # use end-month value (Mar)
+                    ref = ws.cell(r, col_index["Mar"]).coordinate
+                    ws.cell(r, col_index["Q1"]).value = f"={ref}"
+                else:
+                    a = ws.cell(r, col_index["Jan"]).coordinate
+                    b = ws.cell(r, col_index["Mar"]).coordinate
+                    ws.cell(r, col_index["Q1"]).value = f"=SUM({a}:{b})"
+
+            # === Q2 ===
+            if "Q2" in q_sums_present:
+                if ws.title == "QC_Q1A_Main" or (
+                    ws.title == "QC_Q4"
+                    and "A. Number of Job Vacancies as at End of the Month" in sub_val
+                ):
+                    ref = ws.cell(r, col_index["Jun"]).coordinate
+                    ws.cell(r, col_index["Q2"]).value = f"={ref}"
+                else:
+                    a = ws.cell(r, col_index["Apr"]).coordinate
+                    b = ws.cell(r, col_index["Jun"]).coordinate
+                    ws.cell(r, col_index["Q2"]).value = f"=SUM({a}:{b})"
+
+            # === Q3 ===
+            if "Q3" in q_sums_present:
+                if ws.title == "QC_Q1A_Main" or (
+                    ws.title == "QC_Q4"
+                    and "A. Number of Job Vacancies as at End of the Month" in sub_val
+                ):
+                    ref = ws.cell(r, col_index["Sep"]).coordinate
+                    ws.cell(r, col_index["Q3"]).value = f"={ref}"
+                else:
+                    a = ws.cell(r, col_index["Jul"]).coordinate
+                    b = ws.cell(r, col_index["Sep"]).coordinate
+                    ws.cell(r, col_index["Q3"]).value = f"=SUM({a}:{b})"
+
+            # === Q4 ===
+            if "Q4" in q_sums_present:
+                if ws.title == "QC_Q1A_Main" or (
+                    ws.title == "QC_Q4"
+                    and "A. Number of Job Vacancies as at End of the Month" in sub_val
+                ):
+                    ref = ws.cell(r, col_index["Dec"]).coordinate
+                    ws.cell(r, col_index["Q4"]).value = f"={ref}"
+                else:
+                    a = ws.cell(r, col_index["Oct"]).coordinate
+                    b = ws.cell(r, col_index["Dec"]).coordinate
+                    ws.cell(r, col_index["Q4"]).value = f"=SUM({a}:{b})"
+
+        # --- quarter differences (%Diff) ---
+        for i in range(1, len(q_sums_present)):
+            q = q_sums_present[i]; pq = q_sums_present[i-1]
+            cd = col_index[f"Diff {q}"]
+            cp = col_index[f"%Diff {q}"]
+            cq = col_index[q]
+            pp = col_index[pq]
+            for r in range(first_data_row, last_data_row + 1):
+                a = ws.cell(r, cq).coordinate
+                b = ws.cell(r, pp).coordinate
+                ws.cell(r, cd).value = f"={a}-{b}"
+                ws.cell(r, cp).value = f"=IF(AND({a}=0,{b}=0),0,IF({b}=0,\"N/A\",({a}-{b})/{b}))"
+            
     # YoY using hidden prior sheet + hidden KEY
     # --- Build prior qc frame with the same keys/columns (robust for Q3: no subquestion) ---
     prior_qc_df = None
