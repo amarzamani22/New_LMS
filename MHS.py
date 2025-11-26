@@ -41,7 +41,7 @@ def mhs_page():
         "quarter_block": 55,     # C55
         "month_block": 165       # C165
     }
-    start_col = 4  # Column D
+    start_col = 5  # Column D
 
     # ---- LOAD TEMPLATE ----
     wb = openpyxl.load_workbook(mhs_file)
@@ -85,15 +85,13 @@ def mhs_page():
 
     # ---- SUBQUESTION LABELS ----
     SUB = {
-        "A": "A. Number of Employees",
-        "B1": "B(i). Malaysian Employees",
-        "B2": "B(ii). Non-Malaysian Employees",
+        "A": "Employment = A + B(i) + B(ii)",
         "VAC": "A. Number of Job Vacancies as at End of the Month",
-        "NEWJOB": "Number of Job Vacancies Due to New Jobs Created During the Month",
+        "NEWJOB": "C(i). Number of Job Vacancies Due to New Jobs Created During the Month",
         "HIRE": "New Hires and Recalls",
-        "QUIT": "A. Quits and resignation (except retirement)",
+        "QUIT": "A. Quits and Resignations (except retirements)",
         "LAYOFF": "B. Total Layoffs and Discharges",
-        "OTHER": "C. Other Separation"
+        "OTHER": "C. Other Separations"
     }
 
     # HELPER: extract QC monthly
@@ -109,9 +107,7 @@ def mhs_page():
     month_rows = []
     for m in q_months:
         A = qc(df_q1, SUB["A"], m)
-        B1 = qc(df_q1, SUB["B1"], m)
-        B2 = qc(df_q1, SUB["B2"], m)
-        EMP = A + B1 + B2
+        EMP = A
 
         VAC = qc(df_q4, SUB["VAC"], m)
         NEWJ = qc(df_q4, SUB["NEWJOB"], m)
