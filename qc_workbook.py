@@ -91,7 +91,7 @@ def qc_make_all(
     q5    = _load_sheet(stage, "Q5")
 
     if all(d.empty for d in [q1a,q1jf,q1b,q2a,q2jf,q2b,q3,q4,q5]):
-        print("[WARN] No QC-able sheets in the staging workbook.")
+        print("[WARN] No QC-able sheets in the consolidated workbook.")
         return
 
     # current quarter from whatever is present
@@ -238,8 +238,8 @@ def qc_make_all(
 def main() -> int:
     print("=== RLMS QC – Build ALL Questions (Interactive) ===")
 
-    stage = _ask_path("Path to CURRENT staging workbook (.xlsx): ", required=True)
-    out   = Path(input("Path to OUTPUT QC workbook (.xlsx): ").strip() or "QC_All_Output.xlsx")
+    stage = _ask_path("Path to CURRENT consolidated RLMS (.xlsx): ", required=True)
+    out   = Path(input("Path to OUTPUT QC template (.xlsx): ").strip() or "QC_All_Output.xlsx")
 
     # prior staging (optional, press Enter to skip)
     print("\n--- Optional: prior staging workbooks (used for YoY) ---")
